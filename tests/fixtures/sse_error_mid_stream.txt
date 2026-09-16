@@ -1,0 +1,12 @@
+: 录制夹具 · sse_error_mid_stream
+: 形态：非流式错误 —— HTTP 状态码 200，但流中途返回 {"error": {...}} 对象（部分网关用 200 包错误）。
+: 预期：正确行为是识别为上游错误 / 协议错误，绝不能当成成功。
+: 现状风险：解析器只找 choices/delta/content，{"error":...} 对象既无正文也无 finish_reason，
+:       会被 _parse_sse_line 判为「无效事件」而静默丢弃，最终按空响应处理。
+:       该夹具用于固定「中途错误是否被识别」这一断言（见 test 注释）。
+data: {"id":"chatcmpl-err-1","object":"chat.completion.chunk","created":1730000008,"model":"gpt-4o","choices":[{"index":0,"delta":{"role":"assistant","content":"开始"},"finish_reason":null}]}
+
+data: {"error":{"message":"upstream provider returned 500: internal error","type":"server_error","code":"upstream_error"}}
+
+data: [DONE]
+

@@ -1,0 +1,11 @@
+: 录制夹具 · sse_role_in_later_chunk
+: 形态：非标准实现 —— 首块直接给 content，role 字段出现在第二块（部分自研/代理网关如此）。
+: 预期：解析为成功完成；正文按出现顺序拼接为"第一段第二段"。
+data: {"id":"chatcmpl-rolelater-1","object":"chat.completion.chunk","created":1730000002,"model":"qwen2.5-72b","choices":[{"index":0,"delta":{"content":"第一段"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-rolelater-1","object":"chat.completion.chunk","created":1730000002,"model":"qwen2.5-72b","choices":[{"index":0,"delta":{"role":"assistant","content":"第二段"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-rolelater-1","object":"chat.completion.chunk","created":1730000002,"model":"qwen2.5-72b","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
+
+data: [DONE]
+

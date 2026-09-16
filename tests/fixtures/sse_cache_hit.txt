@@ -1,0 +1,15 @@
+: 录制夹具 · sse_cache_hit
+: 形态：OpenAI 官方 stream_options.include_usage=true，且本请求命中了提示缓存 ——
+:       usage.prompt_tokens_details.cached_tokens > 0（这里是 1024 / 1536）。
+: 预期：解析为成功完成；usage 被采集；cached_tokens=1024；命中判定为真（HIT_ONLY）。
+:       注意 usage 块必须在 finish_reason 之后、[DONE] 之前 —— 看到 finish 就断开
+:       连接会正好丢掉它，这正是本夹具要盯住的回归点。
+data: {"id":"chatcmpl-cache-1","object":"chat.completion.chunk","created":1730000010,"model":"gpt-4o","choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-cache-1","object":"chat.completion.chunk","created":1730000010,"model":"gpt-4o","choices":[{"index":0,"delta":{"content":"命中缓存的回答。"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-cache-1","object":"chat.completion.chunk","created":1730000010,"model":"gpt-4o","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
+
+data: {"id":"chatcmpl-cache-1","object":"chat.completion.chunk","created":1730000010,"model":"gpt-4o","choices":[],"usage":{"prompt_tokens":1536,"completion_tokens":9,"total_tokens":1545,"prompt_tokens_details":{"cached_tokens":1024}}}
+
+data: [DONE]

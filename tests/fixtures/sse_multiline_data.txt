@@ -1,0 +1,15 @@
+: 录制夹具 · sse_multiline_data
+: 形态：厂商差异 —— (1) "data:" 冒号后没有空格；(2) 一个 SSE 事件用多行 data: 拼成，
+:       严格按 SSE 规范应把多行 data 用 "\n" 连接后再解析。
+: 预期（现状）：当前解析器逐行调用 _parse_sse_line，不理解多行 data 的拼接语义，
+:       因此 JSON 分片行会解析失败（静默跳过）。本夹具用于固定这一行为；
+:       只有能独立成 JSON 的单行事件才会被计入正文（见 test 注释）。
+data:{"id":"chatcmpl-multiline-1","object":"chat.completion.chunk","created":1730000007,"model":"mimo-7b","choices":[{"index":0,"delta":{"role":"assistant","content":"紧凑前缀"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-multiline-1","object":"chat.completion.chunk","created":1730000007,"model":"mimo-7b","choices":[{"index":0,"delta":{"content":"、换行
+data: 拼接正文"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-multiline-1","object":"chat.completion.chunk","created":1730000007,"model":"mimo-7b","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
+
+data: [DONE]
+

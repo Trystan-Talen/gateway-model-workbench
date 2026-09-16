@@ -1,0 +1,10 @@
+: 录制夹具 · sse_minimal
+: 来源：某 OpenAI 兼容网关
+: 形态：最主流实现 —— 首块 delta 同时带 role+content，尾块带 finish_reason 且正文仅 1 个 token。
+: 预期：解析为成功完成（ok）；response_text 含 role+content 两块正文；有 TTFT。
+data: {"id":"chatcmpl-min-1","object":"chat.completion.chunk","created":1730000000,"model":"gpt-4o-mini","choices":[{"index":0,"delta":{"role":"assistant","content":"好"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-min-1","object":"chat.completion.chunk","created":1730000000,"model":"gpt-4o-mini","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
+
+data: [DONE]
+

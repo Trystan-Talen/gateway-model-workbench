@@ -1,0 +1,10 @@
+: 录制夹具 · sse_truncated
+: 形态：连接在正文下发中途被对端掐断 —— 最后一行不是完整的 `data: {...}` 事件，
+:       也没有 [DONE]，也没有任何 finish_reason。
+: 预期：应归类为 protocol（响应不完整），而不是成功。
+: 说明：夹具正文最后一行故意不以换行结尾，模拟截断时残留的半条缓冲。
+data: {"id":"chatcmpl-trunc-1","object":"chat.completion.chunk","created":1730000009,"model":"gpt-4o","choices":[{"index":0,"delta":{"role":"assistant","content":"这是一段本应"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-trunc-1","object":"chat.completion.chunk","created":1730000009,"model":"gpt-4o","choices":[{"index":0,"delta":{"content":"继续但被掐断"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-trunc-1","object":"chat.completion.chunk","created":1730000

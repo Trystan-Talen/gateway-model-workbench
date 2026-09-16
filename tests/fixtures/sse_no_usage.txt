@@ -1,0 +1,9 @@
+: 录制夹具 · sse_no_usage
+: 形态：完全没有 usage 统计块（默认流式响应）。
+: 预期：解析为成功完成；缺少 usage 不应被判为协议错误。
+data: {"id":"chatcmpl-nousage-1","object":"chat.completion.chunk","created":1730000005,"model":"gpt-3.5-turbo","choices":[{"index":0,"delta":{"role":"assistant","content":"没有用量块"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-nousage-1","object":"chat.completion.chunk","created":1730000005,"model":"gpt-3.5-turbo","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
+
+data: [DONE]
+

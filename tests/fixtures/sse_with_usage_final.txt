@@ -1,0 +1,14 @@
+: 录制夹具 · sse_with_usage_final
+: 形态：OpenAI 的 stream_options.include_usage=true —— 正文块之后，finish_reason 块带空 choices，
+:       再追加一个 choices:[] 且带 usage 统计的尾块，最后才是 [DONE]。
+: 预期：解析为成功完成；usage 尾块不是正文，不能污染 response_text，也不能重置 TTFT。
+data: {"id":"chatcmpl-usage-1","object":"chat.completion.chunk","created":1730000004,"model":"gpt-4o","choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-usage-1","object":"chat.completion.chunk","created":1730000004,"model":"gpt-4o","choices":[{"index":0,"delta":{"content":"答案是 42。"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-usage-1","object":"chat.completion.chunk","created":1730000004,"model":"gpt-4o","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
+
+data: {"id":"chatcmpl-usage-1","object":"chat.completion.chunk","created":1730000004,"model":"gpt-4o","choices":[],"usage":{"prompt_tokens":18,"completion_tokens":5,"total_tokens":23}}
+
+data: [DONE]
+

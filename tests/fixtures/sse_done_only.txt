@@ -1,0 +1,8 @@
+: 录制夹具 · sse_done_only
+: 形态：网关只发了 [DONE] 哨兵，没有任何正文块（异常/空补全，或纯心跳后断流）。
+: 预期（现状风险）：[DONE] 会被解析为 finish（saw_finish=True），
+:       于是 completed=True、error_type 保持 None —— 该请求被计为「成功完成」，
+:       但 response_text 为空。这是一个应当被固定的行为基线：
+:       空补全不计为协议错误（见 test 注释）。
+data: [DONE]
+

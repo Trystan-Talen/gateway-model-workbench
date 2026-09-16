@@ -1,0 +1,17 @@
+: 录制夹具 · sse_empty_content_chunks
+: 形态：正文块之间夹杂 content:"" 的占位空块（心跳/分片实现常见）。
+: 预期：解析为成功完成；空块不能被当作首字，TTFT 必须落在第一个非空 content 块上。
+data: {"id":"chatcmpl-empty-1","object":"chat.completion.chunk","created":1730000003,"model":"deepseek-chat","choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-empty-1","object":"chat.completion.chunk","created":1730000003,"model":"deepseek-chat","choices":[{"index":0,"delta":{"content":""},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-empty-1","object":"chat.completion.chunk","created":1730000003,"model":"deepseek-chat","choices":[{"index":0,"delta":{"content":"A"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-empty-1","object":"chat.completion.chunk","created":1730000003,"model":"deepseek-chat","choices":[{"index":0,"delta":{"content":""},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-empty-1","object":"chat.completion.chunk","created":1730000003,"model":"deepseek-chat","choices":[{"index":0,"delta":{"content":"B"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-empty-1","object":"chat.completion.chunk","created":1730000003,"model":"deepseek-chat","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
+
+data: [DONE]
+

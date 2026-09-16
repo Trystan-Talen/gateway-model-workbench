@@ -1,0 +1,14 @@
+: 录制夹具 · sse_role_in_first_chunk
+: 形态：OpenAI 官方风格 —— 首块只有 {"role":"assistant"}（无 content），正文在后续块。
+: 预期：解析为成功完成；首字延迟（TTFT）必须落在第一块带正文的 chunk 上，
+:       不能被只有 role 的块触发（role 块 content 为空，不计入正文）。
+data: {"id":"chatcmpl-rolefirst-1","object":"chat.completion.chunk","created":1730000001,"model":"gpt-4o","choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-rolefirst-1","object":"chat.completion.chunk","created":1730000001,"model":"gpt-4o","choices":[{"index":0,"delta":{"content":"你好"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-rolefirst-1","object":"chat.completion.chunk","created":1730000001,"model":"gpt-4o","choices":[{"index":0,"delta":{"content":"，世界"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-rolefirst-1","object":"chat.completion.chunk","created":1730000001,"model":"gpt-4o","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
+
+data: [DONE]
+

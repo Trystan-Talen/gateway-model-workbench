@@ -1,0 +1,17 @@
+: 录制夹具 · sse_tool_call_chunks
+: 形态：函数调用（function calling）—— delta 只有 tool_calls，没有 content；
+:       正文以 tool_calls 的 function.arguments 分片增量下发，最后 finish_reason 为 "tool_calls"。
+: 预期（现状）：当前解析器只识别 delta.content / message.content / choice.text，
+:       完全忽略 tool_calls。正文块无 content 会被 _parse_sse_line 判为「无效事件」，
+:       但尾块 finish_reason="tool_calls" 仍能置位，因此整体会被判为成功完成，
+:       且 response_text 为空串。这是本夹具要固定的行为基线（见 test 注释）。
+data: {"id":"chatcmpl-tool-1","object":"chat.completion.chunk","created":1730000006,"model":"gpt-4o","choices":[{"index":0,"delta":{"role":"assistant","content":null,"tool_calls":[{"index":0,"id":"call_abc123","type":"function","function":{"name":"get_weather","arguments":""}}]},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-tool-1","object":"chat.completion.chunk","created":1730000006,"model":"gpt-4o","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"city\":"}}]},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-tool-1","object":"chat.completion.chunk","created":1730000006,"model":"gpt-4o","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"北京\"}"}}]},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-tool-1","object":"chat.completion.chunk","created":1730000006,"model":"gpt-4o","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}
+
+data: [DONE]
+

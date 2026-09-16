@@ -1,0 +1,12 @@
+: 录制夹具 · sse_cache_miss
+: 形态：adapter 风格的 usage —— 顶层 cache_read_input_tokens 且为 0（未命中缓存），
+:       没有 prompt_tokens_details 嵌套块。
+: 预期：解析为成功完成；usage 被采集；cached_tokens=0（是「真的 0」，不是「没数据」）；
+:       命中判定为假，用量级别为 NONE。这一条专门用来证明「0」与「无字段」被区分开。
+data: {"id":"chatcmpl-miss-1","object":"chat.completion.chunk","created":1730000011,"model":"claude-3-5-sonnet","choices":[{"index":0,"delta":{"content":"没有命中缓存。"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-miss-1","object":"chat.completion.chunk","created":1730000011,"model":"claude-3-5-sonnet","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
+
+data: {"id":"chatcmpl-miss-1","object":"chat.completion.chunk","created":1730000011,"model":"claude-3-5-sonnet","choices":[],"usage":{"input_tokens":900,"output_tokens":7,"cache_read_input_tokens":0,"cache_creation_tokens":900}}
+
+data: [DONE]
