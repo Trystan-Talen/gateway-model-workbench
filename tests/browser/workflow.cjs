@@ -16,7 +16,7 @@ async function start(){
 async function eventually(fn,message){const until=Date.now()+20000;while(Date.now()<until){if(await fn())return;await new Promise(r=>setTimeout(r,40))}throw Error(message)}
 (async()=>{
  let server=await start();
- const browser=await chromium.launch({headless:true,executablePath:process.env.CHROME_PATH||'/Applications/Google Chrome.app/Contents/MacOS/Google Chrome'});
+ const browser=await chromium.launch({headless:true,executablePath:process.env.CHROME_PATH||undefined});
  try{
  const context=await browser.newContext({viewport:{width:1440,height:1000}});
  // Explicitly block any non-loopback network in browser validation.
@@ -32,7 +32,7 @@ async function eventually(fn,message){const until=Date.now()+20000;while(Date.no
  await page.evaluate(()=>clearInterval(refreshTimer));
  const resource={name:'资源 A',url:server.upstream+'/v1',api_key:'synthetic-key-only',model:'quality-pass'};
  const {quality_test_id:id}=await call('/quality-tests',{suite_path:server.suite,name:'逐题进度回归 · 本地模拟上游',capture_raw:true,resources:[resource,{...resource,name:'资源 B'}]});
- await page.evaluate(async id=>{await refresh();setModule('quality');setRecordFilter('compare');selectQuality(id)},id);
+ await page.evaluate(async id=>{await refresh();setModule('quality');setRecordFilter('compare');await selectQuality(id)},id);
  let q=await call('/quality-test/'+id);
  assert.equal(q.planned_cases,10);assert.equal(q.completed_cases,0);assert.equal(q.resources.length,2);
  for(let count=1;count<=10;count++){
@@ -66,13 +66,13 @@ async function eventually(fn,message){const until=Date.now()+20000;while(Date.no
  let failed;
  await eventually(async()=>{failed=await call('/quality-test/'+bad);return failed.status==='finished_with_errors'},'error task final state');
  assert.equal(failed.progress,1);assert.equal(failed.failed_cases,5);assert.equal(failed.successful_responses,0);assert.equal(failed.report.level,'risk');
- await page.evaluate(async id=>{await refresh();selectQuality(id)},bad);
+ await page.evaluate(async id=>{await refresh();await selectQuality(id)},bad);
  assert.match(await page.locator('#modulePlaceholder').innerText(),/请求链路错误/);
  await page.locator('#modulePlaceholder .report-tab').nth(1).click();
  assert.match(await page.locator('.group-detail-head .group-badge').innerText(),/错误/);
  const {comparison_id:comparison}=await call('/comparisons',{name:'原始记录入口回归',shared_config:{...resource,name:'本地模拟网关',model:'comparison',mode:'smoke',stream:false,capture_raw:true},groups:[{id:'base',name:'基准组',role:'baseline',concurrency:1,rpm:6000,iterations:2},{id:'other',name:'对比组',role:'comparison',concurrency:2,rpm:6000,iterations:2}]});
  let c;await eventually(async()=>{c=await call('/comparison/'+comparison);return c.status==='finished'},'comparison final state');
- await page.evaluate(async id=>{await refresh();setModule('gateway');setRecordFilter('compare');selectComparison(id)},comparison);
+ await page.evaluate(async id=>{await refresh();setModule('gateway');setRecordFilter('compare');await selectComparison(id)},comparison);
  for(let i=0;i<2;i++){
   await page.locator('#modulePlaceholder .report-tab').nth(i+1).click();
   assert.equal(await page.locator('#modulePlaceholder .raw-link').count(),2);
@@ -86,14 +86,14 @@ async function eventually(fn,message){const until=Date.now()+20000;while(Date.no
   await page.evaluate(()=>closeRaw());
  }
  const markup=await page.evaluate(()=>({off:comparisonGroupHtml({config:{capture_raw:false}},{summary:{recent:[{id:0}]}}),missing:comparisonGroupHtml({config:{capture_raw:true}},{summary:{recent:[{id:0}]}})}));
- assert.ok(!markup.off.includes('raw-link'));assert.ok(markup.missing.includes('暂不可用'));assert.ok(!markup.missing.includes('onclick="showRaw'));
+ assert.ok(!markup.off.includes('raw-link'));assert.ok(markup.missing.includes('暂不可用'));assert.ok(!markup.missing.includes('data-click-action="showRaw'));
  // Restart the isolated server, then read disk-backed task evidence through HTTP and UI.
  server.child.kill('SIGTERM');server=await start();
  await call('/auth/login',{username:'regression',password:'local-test-888@'});
  await page.goto(server.base);await page.waitForFunction(()=>qualityTests.length===2&&!refreshing);await page.evaluate(()=>clearInterval(refreshTimer));
  assert.equal((await call('/tasks')).tasks.length,0,'comparison children must stay out of standalone list after restart');
  q=await call('/quality-test/'+id);assert.equal(q.progress,1);assert.equal(q.resources[0].case_results[0].response,'PONG');
- await page.evaluate(id=>{setModule('quality');setRecordFilter('compare');selectQuality(id)},id);
+ await page.evaluate(async id=>{setModule('quality');setRecordFilter('compare');await selectQuality(id)},id);
  await page.locator('#modulePlaceholder .report-tab').nth(1).click();await page.locator('#modulePlaceholder .raw-link').first().click();
  assert.match(await page.locator('#qualityEvidenceModal').innerText(),/PONG/);await page.evaluate(()=>closeQualityEvidence());
  await page.setViewportSize({width:390,height:844});

@@ -12,7 +12,7 @@ const password = 'local-focus-888@';
 let server, browser;
 
 async function start() {
-  server = spawn('python3', ['-u', path.join(__dirname, 'workflow_server.py'), output]);
+  server = spawn(process.env.PYTHON||'python3', ['-u', path.join(__dirname, 'workflow_server.py'), output]);
   server.stderr.on('data', data => fs.appendFileSync(path.join(output, 'server.log'), data));
   return new Promise((resolve, reject) => {
     let text = '';
@@ -31,7 +31,7 @@ async function start() {
   const { base } = await start();
   browser = await chromium.launch({
     headless: true,
-    executablePath: process.env.BROWSER_PATH || '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
+    executablePath: process.env.BROWSER_PATH || process.env.CHROME_PATH || undefined,
   });
   const context = await browser.newContext();
   const page = await context.newPage();
@@ -55,6 +55,7 @@ async function start() {
 
   // Invalidate the server session without changing the page: reproduces a server restart/expired login.
   assert.ok((await context.request.post(base + '/auth/logout')).ok());
+  await page.evaluate(()=>refresh());
   await page.locator('#authGate').waitFor({ state: 'visible' });
   assert.equal(await page.locator('#qualityMethodologyModal').isVisible(), false);
   assert.equal(await page.locator('#qualitySuiteModal').isVisible(), false);
@@ -74,7 +75,7 @@ async function start() {
   await page.evaluate(() => { authGate(true, false); authGate(true, false); });
   await page.waitForTimeout(100);
   assert.equal(await page.evaluate(() => document.activeElement.id), 'authPassword');
-  const eye = page.locator('button[onclick*="authPassword"]');
+  const eye = page.locator('button[data-click-action="togglePasswordVisibility"][data-arg0="authPassword"]');
   await eye.click();
   assert.equal(await page.locator('#authPassword').getAttribute('type'), 'text');
   await eye.click();
@@ -97,7 +98,7 @@ async function start() {
 
   // An old in-flight 401 must not invalidate a newly successful login.
   let heldRoute;
-  await page.route('**/tasks', async route => {
+  await page.route('**/tasks**', async route => {
     if (!heldRoute) { heldRoute = route; return; }
     await route.continue();
   });
@@ -105,6 +106,7 @@ async function start() {
   for (let n = 0; !heldRoute && n < 50; n++) await page.waitForTimeout(20);
   assert.ok(heldRoute, 'missing in-flight refresh');
   await page.evaluate(() => logout());
+  await page.evaluate(()=>refresh());
   await page.locator('#authGate').waitFor({ state: 'visible' });
   await page.locator('#authPassword').fill(password);
   await page.locator('#authSubmit').click();
@@ -113,11 +115,12 @@ async function start() {
   await page.waitForTimeout(150);
   assert.equal(await page.locator('#authGate').isVisible(), false, 'old unauthorized response replaced new login');
   assert.equal(await page.evaluate(() => authenticated), true);
-  await page.unroute('**/tasks');
+  await page.unroute('**/tasks**');
 
   // If startup itself encounters an expired session, it must not restart its interval afterward.
   assert.ok((await context.request.post(base + '/auth/logout')).ok());
   await page.evaluate(() => bootApp());
+  await page.evaluate(()=>refresh());
   await page.locator('#authGate').waitFor({ state: 'visible' });
   const requestsAfterFailedBoot = taskRequests;
   await page.waitForTimeout(1800);

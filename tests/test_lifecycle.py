@@ -283,7 +283,8 @@ class PreflightEndpointTests(unittest.TestCase):
         with mock.patch.object(ui, "read_saved_config", side_effect=RuntimeError("索引损坏")):
             captured = self._call()
         self.assertEqual(500, captured["status"])
-        self.assertIn("索引损坏", captured["payload"]["error"])
+        self.assertNotIn("索引损坏", captured["payload"]["error"])
+        self.assertTrue(captured["payload"]["request_id"])
 
     def test_endpoint_returns_estimate_for_local_target(self):
         cfg = {"url": "http://127.0.0.1:8666/v1/chat/completions", "model": "m", "mode": "smoke",
@@ -382,6 +383,7 @@ class RiskConfirmationGateTests(unittest.TestCase):
         public = dict(self.PUBLIC)
         handler = ui.Handler.__new__(ui.Handler)
         handler.path = "/tasks"
+        handler.headers = {}
         captured = {}
 
         def fake_json(self, data, status=200, headers=None):

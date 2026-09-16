@@ -12,6 +12,8 @@
   3. 缓存命中率差异来自真实 usage 字段，而不是把「拿不到 usage」当成未命中。
 """
 import json
+import asyncio
+import tempfile
 import os
 import sys
 import threading
@@ -104,8 +106,15 @@ class InterleavedExecutionTests(unittest.TestCase):
         _MissHandler.arrivals = []
         self.hit_server, self.hit_url = _serve(_HitHandler)
         self.miss_server, self.miss_url = _serve(_MissHandler)
+        self.addCleanup(self.hit_server.server_close)
         self.addCleanup(self.hit_server.shutdown)
+        self.addCleanup(self.miss_server.server_close)
         self.addCleanup(self.miss_server.shutdown)
+        folder = tempfile.TemporaryDirectory()
+        self.addCleanup(folder.cleanup)
+        patch = mock.patch("routing_compare._results_dir", return_value=folder.name)
+        patch.start()
+        self.addCleanup(patch.stop)
 
     def _run(self, tier=PROD_TIER):
         comparison = routing_compare.RouteComparison({
@@ -134,16 +143,31 @@ class InterleavedExecutionTests(unittest.TestCase):
         self.assertEqual(snapshot["report"]["reliability"]["unpaired_count"], 0)
 
     def test_requests_are_interleaved_not_batched(self):
-        """两侧到达时间必须互相穿插。若一侧全部先到，说明执行顺序被批量化了。"""
-        self._run()
-        merged = ([(t, "b") for t in _HitHandler.arrivals]
-                  + [(t, "c") for t in _MissHandler.arrivals])
-        merged.sort()
-        sides = [side for _, side in merged]
-        # 统计相邻两侧不同的次数；真正交错时这个数会接近总数。
-        switches = sum(1 for i in range(1, len(sides)) if sides[i] != sides[i - 1])
-        self.assertGreater(switches, len(sides) * 0.5,
-                           f"两侧请求没有交错（切换 {switches}/{len(sides)}）")
+        """Observe enqueue pairs; socket completion order is not a scheduler contract."""
+        dispatched = []
+        real_queue = asyncio.Queue
+        queues = []
+
+        class ObservedQueue(real_queue):
+            def __init__(self):
+                super().__init__()
+                self.side = len(queues)
+                queues.append(self)
+
+            async def put(self, item):
+                if item is not None:
+                    dispatched.append((self.side, item["item_id"]))
+                return await super().put(item)
+
+        with mock.patch("routing_compare.asyncio.Queue", ObservedQueue):
+            comparison = self._run()
+        self.assertEqual(comparison.status, "finished")
+        self.assertEqual(len(dispatched), TEST_TIER * 2)
+        for index in range(TEST_TIER):
+            pair = dispatched[index*2:index*2+2]
+            self.assertEqual([side for side, _ in pair], [0, 1] if index % 2 == 0 else [1, 0])
+            self.assertEqual(pair[0][1], pair[1][1])
+        self.assertEqual(len({item for _, item in dispatched}), TEST_TIER)
 
     def test_cache_hit_rate_drops_and_is_attributable(self):
         """固定路由恒命中、智能路由恒未命中时，报告必须给出可归因的下降。"""

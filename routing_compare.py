@@ -18,6 +18,7 @@
 一致：JSONL（逐行 JSON）逐条追加，权限 0600。
 """
 import asyncio
+from app_paths import DATA_DIR
 import json
 import os
 import threading
@@ -36,7 +37,7 @@ def _now():
 
 
 def _results_dir():
-    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "results")
+    return os.path.join(DATA_DIR, "results")
 
 
 def result_paths(run_id):

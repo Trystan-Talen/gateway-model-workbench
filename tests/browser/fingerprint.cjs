@@ -56,6 +56,7 @@ async function fillEndpoint(page,name='合成通道自检') {
       page.on('pageerror',e=>errors.push({width,message:e.message}));
       page.on('dialog',async d=>{errors.push({width,message:'Unexpected dialog: '+d.message()});await d.dismiss()});
       await context.route('**/*',async route=>{
+    if(await require('./assets.cjs').serveAsset(route,root))return;
         const req=route.request(), url=new URL(req.url()), endpoint=url.pathname, method=req.method();
         if(url.origin!==origin){unexpected.push(req.url());return route.abort()}
         if(endpoint==='/')return route.fulfill({contentType:'text/html',body:html});

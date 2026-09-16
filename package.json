@@ -1,0 +1,16 @@
+{
+  "name": "gateway-model-workbench",
+  "private": true,
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "check": "node --check static/app.js && node --check static/actions.js && node --check static/fingerprint.js && node tools/check-ui.cjs",
+    "test": "npm run check && node tests/test_fingerprint_ui.cjs && node tests/test_fingerprint_models_ui.cjs",
+    "e2e": "node tests/browser/smoke.cjs",
+    "e2e:full": "node tests/browser/run-all.cjs"
+  },
+  "devDependencies": {
+    "playwright": "1.62.1"
+  }
+}

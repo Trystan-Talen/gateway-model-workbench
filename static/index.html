@@ -1,0 +1,102 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<link rel="icon" type="image/svg+xml" href="/favicon.ico">
+<title>网关与模型评测工作台</title>
+<link rel="stylesheet" href="/static/tokens.css">
+<link rel="stylesheet" href="/static/app.css">
+<link rel="stylesheet" href="/assets/fingerprint.css">
+</head>
+<body>
+<div class="auth-gate" id="authGate" hidden>
+  <section class="auth-card" aria-labelledby="authTitle">
+    <div class="auth-mark">R</div>
+    <h1 id="authTitle">登录网关与模型评测工作台</h1>
+    <p id="authHint">请输入系统管理员分发的账号。首次使用时需要先初始化管理员账号。</p>
+    <form class="auth-form" id="authForm">
+      <div class="field"><label for="authUsername">账号</label><input class="input" id="authUsername" autocomplete="username" required placeholder="输入账号"></div>
+      <div class="field password-field"><label for="authPassword">密码</label><input class="input" id="authPassword" type="password" autocomplete="current-password" required placeholder="至少 8 个字符"><button class="password-toggle" type="button" aria-label="显示密码" aria-pressed="false" data-click-action="togglePasswordVisibility" data-arg0="authPassword"><svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M2.5 12s3.5-6 9.5-6 9.5 6 9.5 6-3.5 6-9.5 6-9.5-6-9.5-6Z"/><circle cx="12" cy="12" r="2.5"/></svg></button></div>
+      <div class="field password-field" id="authConfirmField" hidden><label for="authConfirm">确认密码</label><input class="input" id="authConfirm" type="password" autocomplete="new-password" placeholder="再次输入管理员密码"><button class="password-toggle" type="button" aria-label="显示密码" aria-pressed="false" data-click-action="togglePasswordVisibility" data-arg0="authConfirm"><svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M2.5 12s3.5-6 9.5-6 9.5 6 9.5 6-3.5 6-9.5 6-9.5-6-9.5-6Z"/><circle cx="12" cy="12" r="2.5"/></svg></button></div>
+      <div class="auth-error" id="authError" aria-live="polite"></div>
+      <button class="auth-submit" id="authSubmit" type="submit">登录</button>
+    </form>
+  </section>
+</div>
+<div class="app">
+<header class="top"><div class="logo">R</div><div class="brand">网关与模型评测工作台</div><div class="crumb" id="crumb">黑盒请求执行与观测</div><div class="health" id="health"><span class="health-dot"></span><span id="healthText">服务正常</span></div><div class="account-tools"><button class="btn theme-toggle" type="button" id="themeToggle" aria-label="切换主题">深色模式</button><button class="top-action" type="button" data-click-action="openDiagnostics">运行诊断</button><button class="top-action" type="button" data-click-action="openStorageModal">存储与结果文件</button><span class="account-user" id="accountUser"></span><button class="top-action" id="accountManage" type="button" data-click-action="openAccountModal" hidden>账号管理</button><button class="top-action danger" type="button" data-click-action="logout">退出登录</button></div></header>
+<div class="layout">
+<aside class="sidebar" aria-label="测试模块导航"><div class="section-title">产品模块</div><div class="module-nav" aria-label="测试模块"><button class="module-nav-item active" data-module="gateway" type="button"><span class="module-icon"><svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19V5M4 19h16M8 14l4-5 4 3 4-7"/></svg></span><span><b>网关压测</b><small>吞吐与稳定性</small></span></button><button class="module-nav-item" data-module="routing" type="button"><span class="module-icon"><svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h6l4 10h6"/><path d="M4 17h4l3-6"/><circle cx="18" cy="17" r="2"/></svg></span><span><b>路由对照</b><small>固定与智能路由</small></span></button><button class="module-nav-item" data-module="quality" type="button"><span class="module-icon"><svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3l8 3v6c0 5-8 9-8 9s-8-4-8-9V6l8-3Z"/><path d="m8 12 3 3 5-6"/></svg></span><span><b>质量评测</b><small>能力与一致性</small></span></button><button class="module-nav-item" data-module="fingerprint" type="button"><span class="module-icon"><svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 11a8 8 0 0 1 16 0v3M7 20c2-3 2-5 2-9a3 3 0 0 1 6 0c0 5-1 8-3 11M4 16c1-2 1-3 1-5M12 11c0 4 0 5-1 7M17 20c1-3 1-6 1-9a6 6 0 0 0-12 0"/></svg></span><span><b>模型指纹</b><small>行为分布与通道自检</small></span></button></div><div class="nav-note"><span class="nav-note-dot"></span><span>先选择模块，再在模块内创建和管理测试</span></div></aside><aside class="record-panel" id="recordPanel" aria-label="当前模块记录"><div class="record-panel-head"><div><div class="record-kicker">测试记录</div><h2 id="recordTitle">压测记录</h2><div class="record-subtitle" id="recordSubtitle">网关吞吐与稳定性测试</div></div><button class="new-btn record-create-button" id="recordCreateButton" data-click-action="openCreateForContext"><svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg><span>新建压测</span></button></div><section class="workspace-subnav record-filter" id="gatewaySubnav" aria-label="网关压测记录分类"><button class="subnav-item active" data-view="single" type="button"><span>单次压测 <em id="gatewaySingleCount">0</em></span></button><button class="subnav-item" data-view="compare" type="button"><span>对照实验 <em id="gatewayCompareCount">0</em></span></button></section><section class="workspace-subnav record-filter" id="qualitySubnav" aria-label="质量评测记录分类" hidden><button class="subnav-item active" data-view="single" type="button"><span>单资源测试 <em id="qualitySingleCount">0</em></span></button><button class="subnav-item" data-view="compare" type="button"><span>资源对照 <em id="qualityCompareCount">0</em></span></button></section><section class="record-summary" id="routingSubnav" aria-label="路由对照记录" hidden><span>全部对照记录</span><span class="record-count" id="routingCount">0</span></section><div class="section-title task-section-title" id="recordListLabel" hidden>压测记录</div><div class="task-list" id="gatewayList"></div><div class="task-list" id="qualityList" hidden></div><div class="task-list" id="routingList" hidden></div></aside>
+<main class="main"><div class="loading-state" id="loadingState"><div class="loading-spinner" aria-hidden="true"></div><b>正在恢复任务记录</b><span>正在读取本地任务索引，请稍候…</span></div><div class="empty" id="empty" hidden><div><div class="empty-visual"><svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19V5M4 19h16M8 14l4-5 4 3 4-7"/></svg></div><b id="emptyTitle">还没有可查看的测试</b><span id="emptyHint">当前工作区还没有记录。点击左侧按钮开始。</span><ol class="first-run-steps"><li><b>1 · 连接资源</b><span>填写接口与密钥，获取并选择模型</span></li><li><b>2 · 配置计划</b><span>确认测试范围、请求数与费用</span></li><li><b>3 · 复核证据</b><span>查看结果、失败原因和适用边界</span></li></ol><button class="text-btn empty-action" type="button" data-click-action="openCreateForContext">创建第一条测试</button></div></div><div id="detail" class="detail-layout" hidden></div><div id="modulePlaceholder" hidden></div></main>
+</div>
+</div>
+<div class="drawer-backdrop" id="drawerBackdrop" data-click-action="toggleConfig" hidden></div>
+<aside class="config" id="config" role="dialog" aria-modal="true" aria-labelledby="createTitle" aria-hidden="true" inert>
+  <header class="drawer-head"><div><div class="form-title" id="createTitle">新建压测</div><div class="form-sub" id="createSubtitle">配置网关连接和压力参数，开始后查看实时结果。</div></div><button class="drawer-close" type="button" data-click-action="toggleConfig" aria-label="关闭新建测试"><svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="m6 6 12 12M6 18 18 6"/></svg></button></header>
+  <div class="drawer-body">
+    <div id="templatePicker" class="template-picker" hidden><div class="template-picker-head"><span class="template-picker-title">快速填入压力参数</span><button class="text-btn" type="button" id="templatePickerToggle" aria-expanded="true">收起</button></div><div class="template-picker-body" id="templatePickerBody"><div class="field-hint">正在读取模板…</div></div><p class="template-picker-note">模板只填入并发、速率与时长；连接信息保留。</p></div>
+    <div id="routingFields" class="routing-only" hidden>
+      <section class="routing-form-scope">
+        <div class="field"><label for="routingName">对照名称</label><input class="input" id="routingName" placeholder="例如：智能路由与固定路由 · 电商问答"></div>
+        <h3 class="form-section-title">1 <span>连接两条路由</span></h3>
+        <p class="field-hint">为两条路由分别填写连接信息。切换标签会保留已填内容。</p>
+        <div class="tabs" id="routingSideTabs" role="tablist" aria-label="路由连接配置"><button class="tab active" id="routingBaselineTab" role="tab" aria-selected="true" aria-controls="routing-baseline-panel" data-routing-tab="baseline" type="button">固定路由<span class="routing-side-status">待填写</span></button><button class="tab" id="routingCandidateTab" role="tab" aria-selected="false" aria-controls="routing-candidate-panel" tabindex="-1" data-routing-tab="candidate" type="button">智能路由<span class="routing-side-status">待填写</span></button></div>
+        <div id="routingSidePanels"></div>
+        <h3 class="form-section-title">2 <span>设置共同参数</span></h3>
+        <div class="field"><label for="routingModel">共同模型 <span class="field-required">必填</span></label><input class="input" id="routingModel" required autocomplete="off" placeholder="输入两条路由都支持的模型名称"><div class="field-hint">两侧使用同一个模型名称；请确认两条路由均支持该模型。</div></div>
+        <div class="field"><label for="routingTier">每侧请求数</label><select class="input" id="routingTier" required aria-describedby="routingTierHint"></select><div class="field-hint" id="routingTierHint" aria-live="polite">正在读取测试集…</div><button class="text-btn" type="button" id="routingCorpusRetry" data-click-action="loadRoutingCorpus" hidden>重新加载测试集</button></div>
+        <div class="inline"><div class="field"><label for="routingConcurrency">每侧并发上限</label><input class="input" id="routingConcurrency" type="number" min="1" max="2000" required value="20"></div><div class="field"><label for="routingRpm">每侧每分钟请求数</label><input class="input" id="routingRpm" type="number" min="0.01" max="600000" step="any" required value="600"></div></div>
+        <div class="comparison-hint">两侧按相同清单、节奏和并发交错发出请求，再按请求编号配对比较。</div>
+        <details class="routing-advanced"><summary>超时与原始记录</summary><div class="inline"><div class="field"><label for="routingConnectTimeout">连接超时（秒）</label><input class="input" id="routingConnectTimeout" type="number" min="1" max="120" required value="10"></div><div class="field"><label for="routingReadTimeout">读取超时（秒）</label><input class="input" id="routingReadTimeout" type="number" min="1" max="600" required value="60"></div></div><div class="adv-toggle"><div class="switch-copy"><div class="switch-title">保存原始输入与输出</div><div class="switch-txt">便于逐条核对结果，会增加本地存储占用。</div></div><label class="switch"><input type="checkbox" id="routingCapture" aria-label="保存路由对照原始输入与输出"><span class="slider"></span></label></div></details>
+      </section>
+    </div>
+    <div class="field gateway-single-name"><label for="name">任务名称</label><input class="input" id="name" placeholder="例如：生产网关晚高峰"></div><div class="field gateway-connection-field"><label for="url">网关 URL（统一资源定位符）</label><input class="input" id="url" placeholder="https://gateway.example.com/v1"></div><div class="field gateway-connection-field"><label for="api_key">API Key（应用程序编程接口密钥）</label><div class="secret-row"><input class="input secret-input" id="api_key" type="password" autocomplete="off" spellcheck="false" placeholder="输入新密钥；已保存密钥可留空复用"><button class="secret-action" id="copyKey" type="button" aria-label="复制 API Key（应用程序编程接口密钥）" title="复制 API Key（应用程序编程接口密钥）">复制</button><button class="secret-toggle" id="toggleKey" type="button" aria-label="显示 API Key（应用程序编程接口密钥）" aria-pressed="false" title="显示 API Key（应用程序编程接口密钥）"><svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M2.2 12s3.4-5.3 9.8-5.3 9.8 5.3 9.8 5.3-3.4 5.3-9.8 5.3S2.2 12 2.2 12Z"></path><circle cx="12" cy="12" r="2.7"></circle></svg></button></div><div class="field-hint" id="keyInputHint">密钥不会写入任务记录；保存后刷新页面可按 URL 自动复用。</div></div><div class="field gateway-connection-field"><label for="modelSelect">模型</label><div class="model-row"><select class="input model-select" id="modelSelect" aria-describedby="modelListHint"><option value="">请先填写 URL 和 API Key，再获取模型</option></select><button class="icon-btn" id="loadModels" type="button" title="刷新并获取模型列表">刷新模型</button></div><div class="model-fallback" id="modelFallback"><button class="text-btn" id="manualModelToggle" type="button" aria-expanded="false">无法获取列表？手动指定模型</button></div><div id="modelManualWrap" hidden><input class="input" id="model" placeholder="输入模型名称" autocomplete="off"><div class="field-hint" id="modelHint">仅在网关不支持模型列表时使用；手动输入不会自动校验模型是否存在。</div></div><div class="field-hint" id="modelListHint" aria-live="polite">尚未获取模型列表。</div></div><div class="tabs gateway-single-pressure" role="tablist"><button class="tab active" data-mode="smoke">冒烟</button><button class="tab" data-mode="ramp">阶梯</button><button class="tab" data-mode="soak">长跑</button></div><div id="modeFields" class="gateway-single-pressure"></div><div class="field gateway-single-pressure single-only"><label for="concurrency">并发上限</label><input class="input" id="concurrency" type="number" min="1" max="2000" value="20"><div class="muted-help">实际完成能力约等于：并发数 ÷ 单条平均耗时。</div></div>
+<details class="gateway-single-advanced"><summary>高级选项</summary><div class="inline" style="margin-top:14px"><div class="field"><label for="connect_timeout">连接超时（秒）</label><input class="input" id="connect_timeout" type="number" value="10"></div><div class="field"><label for="read_timeout">读取超时（秒）</label><input class="input" id="read_timeout" type="number" value="60"></div></div><div class="field"><label for="profile">请求内容</label><select id="profile"><option value="smoke">常规短问答</option><option value="short">最短响应</option><option value="long">长输入</option></select></div><div class="adv-toggle"><div class="switch-copy"><div class="switch-title">记录所有请求的原始数据</div><div class="switch-txt">开启后每条 JSONL（逐行 JSON）都会包含原始输入与输出；单条响应最多记录 1MB。</div></div><label class="switch"><input type="checkbox" id="capture_raw"><span class="slider"></span></label></div></details>
+    <div id="comparisonFields" hidden></div>
+    <div id="preflightCard" class="preflight-card" aria-live="polite" hidden></div>
+  </div>
+  <footer class="drawer-footer"><div class="form-status" id="formStatus" role="status" aria-live="polite"></div><button class="submit" id="submit" type="button">创建并开始压测</button><div class="form-note">开始后会向所填目标发送真实请求，请核对配置。</div></footer>
+</aside>
+<div class="modal" id="qualityMethodologyModal" hidden><div class="modal-backdrop" data-click-action="closeModal" data-arg0="qualityMethodologyModal"></div><section class="modal-panel" role="dialog" aria-modal="true" aria-labelledby="qualityMethodologyTitle"><header class="modal-head"><div><div class="modal-kicker">评分依据 · 实验设计 · 官方来源</div><h2 id="qualityMethodologyTitle">评测方法与参考</h2></div><button class="modal-close" type="button" data-click-action="closeModal" data-arg0="qualityMethodologyModal" aria-label="关闭评测方法">×</button></header><div class="modal-body" id="qualityMethodologyBody" tabindex="0"></div></section></div>
+<div class="modal" id="qualityEvidenceModal" hidden><div class="modal-backdrop" data-click-action="closeQualityEvidence"></div><section class="modal-panel" role="dialog" aria-modal="true" aria-labelledby="qualityEvidenceTitle"><header class="modal-head"><h2 id="qualityEvidenceTitle">逐题证据</h2><button class="modal-close" data-click-action="closeQualityEvidence" aria-label="关闭逐题证据">×</button></header><div class="modal-body" id="qualityEvidenceBody" tabindex="0"></div></section></div>
+<div class="modal" id="qualitySuiteModal" hidden><div class="modal-backdrop" data-click-action="closeQualitySuite"></div><section class="modal-panel" role="dialog" aria-modal="true" aria-labelledby="qualitySuiteTitle"><header class="modal-head"><h2 id="qualitySuiteTitle">题集与评分规则</h2><button class="modal-close" data-click-action="closeQualitySuite" aria-label="关闭题集">×</button></header><div class="modal-body" id="qualitySuiteBody" tabindex="0"></div></section></div>
+<div class="modal" id="storageModal" hidden>
+  <div class="modal-backdrop" data-click-action="closeStorageModal"></div>
+  <section class="modal-panel" role="dialog" aria-modal="true" aria-labelledby="storageTitle">
+    <header class="modal-head">
+      <div><div class="modal-kicker">本机结果文件</div><h2 id="storageTitle">存储占用与清理</h2></div>
+      <button class="modal-close" type="button" data-click-action="closeStorageModal" aria-label="关闭存储面板"><svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="m6 6 12 12M6 18 18 6"/></svg></button>
+    </header>
+    <div class="modal-body" tabindex="0"><div id="storageBody"><div class="field-hint">正在读取本机结果文件占用…</div></div></div>
+  </section>
+</div>
+<div class="modal" id="diagnosticsModal" hidden>
+  <div class="modal-backdrop" data-click-action="closeDiagnostics"></div>
+  <section class="modal-panel" role="dialog" aria-modal="true" aria-labelledby="diagnosticsTitle">
+    <header class="modal-head">
+      <div><div class="modal-kicker">调度 · 事件 · 审计</div><h2 id="diagnosticsTitle">运行诊断</h2></div>
+      <button class="modal-close" type="button" data-click-action="closeDiagnostics" aria-label="关闭运行诊断"><svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="m6 6 12 12M6 18 18 6"/></svg></button>
+    </header>
+    <div class="modal-body" tabindex="0">
+      <div class="diag-tools"><button class="btn" type="button" data-click-action="loadDiagnostics">刷新</button><label class="diag-limit">读取条数<input class="input" id="diagLimit" type="number" min="10" max="500" step="10" value="50" data-change-action="loadDiagnostics"></label></div>
+      <div class="diag-grid" id="diagnosticsBody"><div class="field-hint">正在读取调度状态、事件与审计记录…</div></div>
+    </div>
+  </section>
+</div>
+<div class="modal" id="rawModal" hidden>
+  <div class="modal-backdrop" data-click-action="closeRaw"></div>
+  <section class="modal-panel" role="dialog" aria-modal="true" aria-labelledby="rawTitle">
+    <header class="modal-head">
+      <div><div class="modal-kicker">原始请求记录</div><h2 id="rawTitle">请求原始输入与输出</h2></div>
+      <button class="modal-close" type="button" data-click-action="closeRaw" aria-label="关闭原始数据"><svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="m6 6 12 12M6 18 18 6"/></svg></button>
+    </header>
+    <div class="modal-body" tabindex="0"><div class="raw-grid">
+      <div><div class="raw-label">输入</div><pre id="rawInput"></pre></div>
+      <div><div class="raw-label">输出</div><pre id="rawOutput"></pre></div>
+    </div></div>
+  </section>
+</div>
+<div class="modal" id="accountModal" hidden><div class="modal-backdrop" data-click-action="closeAccountModal"></div><section class="modal-panel" role="dialog" aria-modal="true" aria-labelledby="accountModalTitle"><div class="account-modal-head"><div><h2 id="accountModalTitle">账号管理</h2><p>系统管理员创建并分发使用者账号；密码只在创建时提交，不会在页面回显。</p></div><button class="drawer-close" type="button" data-click-action="closeAccountModal" aria-label="关闭账号管理"><svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="m6 6 12 12M6 18 18 6"/></svg></button></div><div class="modal-body" tabindex="0"><div class="account-list" id="accountList"></div><form class="account-create" id="accountCreateForm"><h3>创建账号</h3><div class="account-create-grid"><div class="field"><label for="newUsername">账号</label><input class="input" id="newUsername" minlength="3" required placeholder="使用者账号"></div><div class="field password-field"><label for="newPassword">初始密码</label><input class="input" id="newPassword" type="password" minlength="8" required placeholder="至少 8 个字符"><button class="password-toggle" type="button" aria-label="显示密码" aria-pressed="false" data-click-action="togglePasswordVisibility" data-arg0="newPassword"><svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M2.5 12s3.5-6 9.5-6 9.5 6 9.5 6-3.5 6-9.5 6-9.5-6-9.5-6Z"/><circle cx="12" cy="12" r="2.5"/></svg></button></div><div class="field"><label for="newRole">角色</label><select class="input" id="newRole"><option value="user">使用者</option><option value="admin">管理员</option></select></div><button class="submit account-create-submit" type="submit">创建账号</button></div><div class="form-status" id="accountStatus" aria-live="polite"></div></form></div></section></div>
+<div class="toast" id="toast" role="status" aria-live="polite"></div>
+<script src="/assets/fingerprint.js"></script>
+<script src="/static/app.js"></script><script src="/static/actions.js"></script></body></html>

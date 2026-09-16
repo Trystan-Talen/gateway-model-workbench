@@ -10,6 +10,10 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 os.environ['NO_PROXY'] = os.environ['no_proxy'] = '127.0.0.1,localhost'
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+folder = Path(sys.argv[1])
+folder.mkdir(parents=True, exist_ok=True)
+os.environ["ROUTE_TEST_DATA_DIR"] = str(folder)
+os.environ["ROUTE_TEST_DISABLE_CREDENTIAL_STORE"] = "1"
 import route_test_ui as ui
 
 folder = Path(sys.argv[1])
@@ -76,4 +80,11 @@ ui.restore_history()
 server = ThreadingHTTPServer(('127.0.0.1', 0), ui.Handler)
 print(json.dumps({'base': f'http://127.0.0.1:{server.server_port}',
                   'upstream': f'http://127.0.0.1:{upstream.server_port}', 'suite': str(smoke)}), flush=True)
-server.serve_forever()
+try:
+    server.serve_forever()
+finally:
+    ui.FINGERPRINTS.close()
+    server.server_close()
+    upstream.shutdown()
+    upstream.server_close()
+    ui.LOOP.call_soon_threadsafe(ui.LOOP.stop)

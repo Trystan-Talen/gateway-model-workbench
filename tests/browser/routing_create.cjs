@@ -62,6 +62,7 @@ async function side(page,key){
    page.on('pageerror',error=>errors.push({width,message:error.message}));
    page.on('console',message=>{if(message.type()==='error'&&/\[render\]|\[refresh\]/.test(message.text()))errors.push({width,message:message.text()})});
    await context.route('**/*',async route=>{
+    if(await require('./assets.cjs').serveAsset(route,root))return;
     const request=route.request(),url=new URL(request.url()),endpoint=url.pathname;
     if(url.origin!=='http://127.0.0.1:18767'){unexpected.push(url.origin);return route.abort()}
     if(endpoint==='/')return route.fulfill({contentType:'text/html',body:html});

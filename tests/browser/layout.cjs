@@ -27,6 +27,7 @@ async function screenshot(page,name){await page.screenshot({path:path.join(outpu
   const page=await browser.newPage({viewport:{width,height:1080},reducedMotion:'reduce'});
   page.on('pageerror',e=>errors.push(e.message));
   await page.route('**/*',async route=>{
+    if(await require('./assets.cjs').serveAsset(route,root))return;
    const url=new URL(route.request().url()),pathname=url.pathname;let data={};
    if(url.hostname!=='127.0.0.1'){unexpected.push(url.origin);return route.abort()}
    if(pathname==='/')return route.fulfill({contentType:'text/html',body:html});
@@ -119,10 +120,10 @@ async function screenshot(page,name){await page.screenshot({path:path.join(outpu
   await page.keyboard.press('Tab');await create.focus();
   assert.equal(await create.evaluate(el=>getComputedStyle(el).outlineStyle),'solid','keyboard focus outline');
   if(width===1920){
-   await page.mouse.move(0,0);const normal=await create.evaluate(el=>getComputedStyle(el).backgroundImage);
-   await create.hover();const hover=await create.evaluate(el=>getComputedStyle(el).backgroundImage);assert.notEqual(normal,hover,'hover feedback');
+   await page.mouse.move(0,0);const normal=await create.evaluate(el=>getComputedStyle(el).backgroundColor);
+   await create.hover();await page.waitForTimeout(200);const hover=await create.evaluate(el=>getComputedStyle(el).backgroundColor);assert.notEqual(normal,hover,'hover feedback');
    await create.evaluate(el=>el.disabled=true);assert.equal(await create.evaluate(el=>getComputedStyle(el).cursor),'not-allowed','disabled feedback');await create.evaluate(el=>el.disabled=false);
-   assert.equal(await page.locator('.record-create-button:visible,.mobile-config:visible,.empty-action:visible').count(),1,'single primary creation action');
+   assert.equal(await page.locator('.record-create-button:visible,.mobile-config:visible').count(),1,'single primary creation action');
   }
   const visibleIcons=await page.locator('.module-icon .ui-icon').evaluateAll(els=>els.map(el=>({stroke:getComputedStyle(el).strokeWidth,fill:getComputedStyle(el).fill})));assert.ok(visibleIcons.every(x=>x.stroke==='1.8px'&&x.fill==='none'));
   assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth>innerWidth),false,'page horizontal overflow');

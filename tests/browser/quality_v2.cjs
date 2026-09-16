@@ -13,7 +13,7 @@ async function start(){
 async function until(fn,label,ms=90000){const end=Date.now()+ms;while(Date.now()<end){if(await fn())return;await new Promise(r=>setTimeout(r,80))}throw Error(label)}
 (async()=>{
  let server=await start();
- const browser=await chromium.launch({headless:true,executablePath:'/Applications/Google Chrome.app/Contents/MacOS/Google Chrome'});
+ const browser=await chromium.launch({headless:true,executablePath:process.env.CHROME_PATH||undefined});
  try{
   const context=await browser.newContext({viewport:{width:1440,height:1000}});
   await context.route('**/*',r=>new URL(r.request().url()).hostname==='127.0.0.1'?r.continue():r.abort());
@@ -63,7 +63,7 @@ async function until(fn,label,ms=90000){const end=Date.now()+ms;while(Date.now()
   assert.equal(single.report.resources[0].constraint_diagnostics.passed_checks,constraintRules);
   assert.equal(single.report.resources[0].constraint_diagnostics.passed_cases,10);
   assert.deepEqual(single.resources[0].case_results.map(c=>c.execution_sequence),Array.from({length:120},(_,i)=>i+1));
-  await page.evaluate(async id=>{await refresh();selectQuality(id)},singleId);
+  await page.evaluate(async id=>{await refresh();await selectQuality(id)},singleId);
   await page.waitForFunction(id=>window.currentQualityDetail?.id===id,singleId);
   assert.match(await page.locator('#modulePlaceholder').innerText(),/单资源诊断/);
   assert.equal(await page.locator('.quality-score-card').count(),1);
@@ -114,7 +114,7 @@ async function until(fn,label,ms=90000){const end=Date.now()+ms;while(Date.now()
   assert.equal(pair.report.pairwise.paired_cases,120);assert.equal(pair.report.pairwise.a_wins,11);
   assert.equal(pair.report.pairwise.regressions.length,11);assert.equal(pair.report.pairwise.selection,'优先复核 资源 A');
   assert.equal(pair.report.resources[1].score_pct,90.83);assert.equal(pair.report.resources[1].eligible,false);
-  await page.evaluate(async id=>{await refresh();selectQuality(id)},pairId);
+  await page.evaluate(async id=>{await refresh();await selectQuality(id)},pairId);
   await page.waitForFunction(id=>window.currentQualityDetail?.id===id,pairId);
   assert.equal(await page.locator('.quality-score-card').count(),2);
   assert.match(await page.locator('#modulePlaceholder').innerText(),/资源对照 · 选择依据/);
@@ -127,7 +127,7 @@ async function until(fn,label,ms=90000){const end=Date.now()+ms;while(Date.now()
   // Running stop flow uses real server state, not a timer pretending progress.
   const {quality_test_id:stoppedId}=await call('/quality-tests',{name:'本地模拟 · 停止与滚动',resources:[{name:'慢速模拟',url:server.upstream+'/v1',api_key:'synthetic-key-only',model:'quality-slow'}]});
   let stopped;await until(async()=>{stopped=await call('/quality-test/'+stoppedId);return stopped.completed_cases>=18},'slow task');
-  await page.evaluate(async id=>{await refresh();selectQuality(id)},stoppedId);
+  await page.evaluate(async id=>{await refresh();await selectQuality(id)},stoppedId);
   await page.locator('#modulePlaceholder .report-tab').nth(1).click();
   const activeTable=page.locator('#modulePlaceholder .table-wrap').last();
   await activeTable.evaluate(el=>{el.scrollTop=200});const top=await activeTable.evaluate(el=>el.scrollTop);assert.ok(top>0);
@@ -141,7 +141,7 @@ async function until(fn,label,ms=90000){const end=Date.now()+ms;while(Date.now()
   const restored=await call('/quality-test/'+pairId);assert.deepEqual(restored.report,pair.report);
   assert.equal(restored.resources[1].case_results.length,120);
   await page.goto(server.base);await page.waitForFunction(()=>qualityTests.length===3&&!refreshing);await page.evaluate(()=>clearInterval(refreshTimer));
-  await page.evaluate(id=>{setModule('quality');setRecordFilter('compare');selectQuality(id)},pairId);
+  await page.evaluate(async id=>{setModule('quality');setRecordFilter('compare');await selectQuality(id)},pairId);
   await page.locator('#modulePlaceholder .report-tab').first().click();
   await page.setViewportSize({width:390,height:844});await page.screenshot({path:path.join(output,'comparison-mobile.png')});
   assert.ok(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth+1),'mobile page overflows horizontally');

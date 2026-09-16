@@ -17,6 +17,8 @@ class InlineScripts(HTMLParser):
         self.current = None
 
     def handle_starttag(self, tag, attrs):
+        if tag == 'script' and dict(attrs).get('src') == '/static/app.js':
+            self.scripts.append((ui.CODE_DIR / 'static' / 'app.js').read_text(encoding='utf-8'))
         if tag == 'script' and not dict(attrs).get('src'):
             self.current = []
 

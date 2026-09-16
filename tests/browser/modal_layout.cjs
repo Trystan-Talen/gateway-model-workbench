@@ -5,9 +5,9 @@ const {spawn}=require('child_process');
 const output=process.env.UI_ARTIFACT_DIR||fs.mkdtempSync(path.join(os.tmpdir(),'route-modal-layout-'));
 fs.mkdirSync(output,{recursive:true});
 let server,browser;
-async function start(){server=spawn('python3',['-u',path.join(__dirname,'workflow_server.py'),output]);server.stderr.on('data',d=>fs.appendFileSync(path.join(output,'server.log'),d));return new Promise((resolve,reject)=>{let text='';server.stdout.on('data',d=>{text+=d;if(text.includes('\n'))try{resolve(JSON.parse(text.split('\n')[0]))}catch(e){reject(e)}});server.on('error',reject);server.on('exit',c=>reject(Error('server '+c)))})}
+async function start(){server=spawn(process.env.PYTHON||'python3',['-u',path.join(__dirname,'workflow_server.py'),output]);server.stderr.on('data',d=>fs.appendFileSync(path.join(output,'server.log'),d));return new Promise((resolve,reject)=>{let text='';server.stdout.on('data',d=>{text+=d;if(text.includes('\n'))try{resolve(JSON.parse(text.split('\n')[0]))}catch(e){reject(e)}});server.on('error',reject);server.on('exit',c=>reject(Error('server '+c)))})}
 (async()=>{
- const {base}=await start();browser=await chromium.launch({headless:true,executablePath:process.env.BROWSER_PATH||'/Applications/Google Chrome.app/Contents/MacOS/Google Chrome'});
+ const {base}=await start();browser=await chromium.launch({headless:true,executablePath:process.env.BROWSER_PATH||process.env.CHROME_PATH||undefined});
  const context=await browser.newContext(),page=await context.newPage(),errors=[],results=[];
  page.on('pageerror',e=>errors.push(e.message));
  await context.route('**/*',r=>new URL(r.request().url()).origin===base?r.continue():r.abort());
