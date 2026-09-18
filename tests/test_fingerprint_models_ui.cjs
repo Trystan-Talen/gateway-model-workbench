@@ -7,7 +7,7 @@ const vm = require('node:vm');
 const assert = require('node:assert/strict');
 const asset = process.env.UI_FINGERPRINT_JS || path.resolve(__dirname,'../static/fingerprint.js');
 const original = fs.readFileSync(asset,'utf8');
-const source = original.replace('window.FingerprintUI = Object.freeze({init,setRuns,updateChrome,render,openCreate,closeCreate,hide,onAuthLost});','window.__modelTest = {s,referenceLibrary,welcome,defaultCreateMode,updateCreateHeading,selectedModel,paintModelControls,invalidateModelConnection,setModelInputMode,discoverModels,resetModelDiscovery,updateAdapterHint,isDeepseekOfficial,onInput,onChange,closeCreate,onAuthLost};');
+const source = original.replace('window.FingerprintUI = Object.freeze({init,setRuns,updateChrome,render,openCreate,closeCreate,hide,onAuthLost,select,setTab});','window.__modelTest = {s,referenceLibrary,welcome,defaultCreateMode,updateCreateHeading,selectedModel,paintModelControls,invalidateModelConnection,setModelInputMode,discoverModels,resetModelDiscovery,updateAdapterHint,isDeepseekOfficial,onInput,onChange,closeCreate,onAuthLost};');
 const nodes = new Map();
 let focused = null; let formMode = 'selfcheck';
 function element(id) {
@@ -18,6 +18,8 @@ const modeButtons=['list','manual'].map(mode=>{const el=element('mode-'+mode);el
 const requests=[];
 const pending=[];
 const sandbox={window:{},document:{getElementById:element,querySelectorAll:selector=>selector.includes('model-input-mode')?modeButtons:[],querySelector:selector=>selector==='.app'?element('app'):selector==='input[name="fpMode"]:checked'?{value:formMode}:null,body:{classList:{toggle(){}}}},URL,console,TextEncoder,authenticated:true,api:(url,options)=>{requests.push({url,options:JSON.parse(JSON.stringify(options)),body:JSON.parse(options.body)});return new Promise((resolve,reject)=>pending.push({resolve,reject}))}};
+const uiKit = path.resolve(__dirname,'../static/ui-kit.js');
+vm.runInNewContext(fs.readFileSync(uiKit,'utf8'),sandbox,{filename:uiKit});
 vm.runInNewContext(source,sandbox,{filename:asset});
 const t=sandbox.window.__modelTest,s=t.s;
 let checks=0;

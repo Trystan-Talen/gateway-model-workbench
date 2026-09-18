@@ -13,6 +13,12 @@
 3. **流式请求一律带 usage。** 缓存命中率的口径是 ``usage.cached_tokens``，不请求
    usage 就永远算不出来。网关不认 ``stream_options.include_usage`` 时自动降级重试，
    并把这个事实记在报告里——不能把兼容性缺口读成缓存退化。
+4. **缓存按「运行 × 侧」隔离。** 两侧发的是同一份清单，而两条路由背后常常是同一批
+   上游渠道；不隔离的话，先到的一侧会替后到的一侧把前缀缓存预热好，上一次运行也会
+   替这一次预热（清单是确定性的）。因此每条请求最前面都加一行本侧专属的隔离标记：
+   同一侧、同一段内前缀仍逐字节相同（缓存该命中照样命中），跨侧、跨运行从第一个
+   token 起就不同（谁也借不到谁的缓存）。段首请求本应几乎都未命中，报告据此检测
+   「实验之外的预热」。
 
 这个模块只负责执行与汇总，不发通知、不写全局历史；执行结果落盘逻辑与压测任务保持
 一致：JSONL（逐行 JSON）逐条追加，权限 0600。
@@ -21,6 +27,7 @@ import asyncio
 from app_paths import DATA_DIR
 import json
 import os
+import secrets
 import threading
 import time
 import uuid
@@ -79,15 +86,46 @@ def build_plan(tier, rpm):
     return [{"index": 1, "rpm": rpm, "duration": duration, "count": tier}], tier, duration
 
 
-def _payload_for(item, model, stream, max_tokens=256):
+# 隔离方案版本：标记的格式或位置一旦改变就递增，报告据此判断两次运行是否同口径。
+CACHE_SCOPE_SCHEME = "run-side-prefix-v1"
+CACHE_SCOPE_DIGITS = 12
+
+
+def new_cache_scopes():
+    """为一次运行的两侧各生成一个互不相同的隔离标记。
+
+    用定长十进制数字而不是十六进制：主流分词器把数字按固定位数切块，两侧标记的
+    token 数因此一致，不会让某一侧的提示词系统性地多几个 token。
+    """
+    baseline = secrets.randbelow(10 ** CACHE_SCOPE_DIGITS)
+    candidate = baseline
+    while candidate == baseline:
+        candidate = secrets.randbelow(10 ** CACHE_SCOPE_DIGITS)
+    width = CACHE_SCOPE_DIGITS
+    return {"scheme": CACHE_SCOPE_SCHEME,
+            "baseline": f"{baseline:0{width}d}", "candidate": f"{candidate:0{width}d}"}
+
+
+def scoped_prompt(prompt, scope):
+    """把隔离标记放在提示词最前面。
+
+    前缀缓存按「从第一个 token 起的最长公共前缀」匹配，标记放在最前面才能让不同侧、
+    不同运行的请求从一开始就分叉；放在末尾则完全不起隔离作用。
+    """
+    if not scope:
+        return prompt
+    return f"[对照隔离标记 {scope}]\n{prompt}"
+
+
+def _payload_for(item, model, stream, max_tokens=256, scope=None):
     """用对照清单里的 prompt 构造请求，而不是复用常规压测的模板。
 
     对照清单的每条请求都带一个很长的共享前缀；换成常规模板会让前缀结构消失，
-    缓存命中率这个指标就测不出东西了。
+    缓存命中率这个指标就测不出东西了。``scope`` 是本侧隔离标记，见模块说明第 4 条。
     """
     payload = {
         "model": model,
-        "messages": [{"role": "user", "content": item["prompt"]}],
+        "messages": [{"role": "user", "content": scoped_prompt(item["prompt"], scope)}],
         "stream": bool(stream),
     }
     if max_tokens:
@@ -123,6 +161,7 @@ class RouteComparison:
         self._files = {}
         self._report = None
         self.history_only = False
+        self.cache_scopes = new_cache_scopes()
 
     # ---- 历史恢复 ---------------------------------------------------------
 
@@ -173,6 +212,9 @@ class RouteComparison:
         run._files = {}
         run._report = snapshot.get("report")
         run.history_only = True
+        # 旧版本记录没有隔离标记：保持 None，界面据此提示「这次运行未做缓存隔离」。
+        scopes = snapshot.get("cache_isolation")
+        run.cache_scopes = dict(scopes) if isinstance(scopes, dict) else None
         return run
 
     # ---- 生命周期 ---------------------------------------------------------
@@ -232,7 +274,7 @@ class RouteComparison:
             "status_code", "completed", "error_type", "error_detail", "ttft_ms",
             "total_ms", "reason", "usage_seen", "usage_source", "usage_level",
             "prompt_tokens", "cached_tokens", "completion_tokens", "total_tokens",
-            "cache_hit")}
+            "cache_hit", "burst_first")}
         clean["route_side"] = side
         stored = dict(clean)
         if self.config[side].get("capture_raw"):
@@ -258,7 +300,8 @@ class RouteComparison:
                 async with semaphore:
                     if self._stop_event.is_set():
                         continue
-                    payload = _payload_for(item, cfg["model"], cfg["stream"])
+                    payload = _payload_for(item, cfg["model"], cfg["stream"],
+                                           scope=(self.cache_scopes or {}).get(side))
                     headers = {"Authorization": f"Bearer {cfg['api_key']}",
                                "Accept": "text/event-stream" if cfg["stream"] else "application/json"}
                     timeout_cfg = {"connect": cfg["connect_timeout"], "read": cfg["read_timeout"],
@@ -281,6 +324,9 @@ class RouteComparison:
                             client, job, payload, headers, timeout_cfg,
                             chat_url=cfg["chat_url"], include_usage=False,
                             capture_raw=bool(cfg.get("capture_raw")))
+                    # 段首请求在本侧、本次运行里没有任何先行者，理应未命中；
+                    # 报告用它检测「实验之外的缓存预热」。
+                    result["burst_first"] = item["index"] % max(1, int(item.get("burst_size") or 1)) == 0
                     self._record(side, result)
                     with self.lock:
                         self.progress["done"] += 1
@@ -436,12 +482,15 @@ class RouteComparison:
                 "progress": {"done": done, "scheduled": scheduled, "total": self.total,
                              "pct": (done / (self.total * 2)) if self.total else 0},
                 "report": report,
+                "cache_isolation": dict(self.cache_scopes) if self.cache_scopes else None,
                 "limits": self._limits(),
             }
 
     def _limits(self):
         return [
-            "两侧共用同一份请求清单并交错发出，但上游容量、缓存状态和限流窗口仍可能随时间漂移。",
+            "两侧共用同一份请求清单并交错发出，但上游容量与限流窗口仍可能随时间漂移。",
+            "缓存按运行和侧隔离：每侧请求最前面带本侧专属标记，只能命中本侧本次运行自己预热的前缀；"
+            "若网关改写或剥离了提示词开头，隔离会失效，报告以段首命中数提示这种情况。",
             "缓存命中率只统计能取到 usage 的请求；命中只证明本次命中，不能证明缓存还能存活多久。",
             "本对照是黑盒观测，无法看到网关内部的模型替换、渠道切换或重试，只能看到最终结果。",
         ]

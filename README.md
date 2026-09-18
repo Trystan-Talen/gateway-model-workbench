@@ -15,7 +15,7 @@ npm ci
 make run
 ```
 
-打开 [本机工作台](http://127.0.0.1:8666/)。首次运行创建管理员；已有数据继续使用原账号。可用 `ROUTE_TEST_PORT`（监听端口）设置其他端口。服务只监听本机回环地址。
+打开 [本机工作台](http://127.0.0.1:8666/)。安装完成后，也可以在访达里双击 `启动正式版.command`：它使用正式数据目录启动服务，就绪后自动打开浏览器；服务已在运行时可选择直接打开或重启，关闭终端窗口即停止服务。首次运行创建管理员；已有数据继续使用原账号。可用 `ROUTE_TEST_PORT`（监听端口）设置其他端口。默认只监听本机回环地址；部署到服务器见 [服务器部署](docs/deployment.md)。
 
 版本以 `app_version.py` 为准，页面健康接口 `/health` 可查看当前运行版本。
 
@@ -42,10 +42,12 @@ make benchmark  # 有限的本机请求引擎基线
 ## 文档
 
 - [本轮逐项核验与处置](docs/项目建议逐项核验与处置.md)
+- [服务器部署](docs/deployment.md)
 - [架构与数据恢复](docs/architecture.md)
 - [指标口径](docs/metrics.md)
 - [贡献与检查约定](CONTRIBUTING.md)
 - [变更记录](CHANGELOG.md)
-- [界面规范](界面规范.md)
+- [设计系统](docs/design-system.md)（[组件画廊](docs/design-system/gallery.html)）
+- [智能体工作约定](CLAUDE.md)
 - [质量评测方法](质量评测方法.md)
 - [旧版交接记录](docs/archive/交接文档-2026.09.16.1.md)

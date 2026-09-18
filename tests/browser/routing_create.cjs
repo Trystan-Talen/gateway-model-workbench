@@ -14,7 +14,8 @@ const html=process.env.UI_HTML?fs.readFileSync(process.env.UI_HTML,'utf8'):execF
 const corpus={tiers:[{tier:1000,bursts:10,note:'合成测试集。'},{tier:3000,bursts:30,note:'合成测试集。'}],metrics:[]};
 const suite={manifest:{title:'合成题集',case_count:1,categories:['basic'],input_chars:{min:4,max:4}},cases:[]};
 const emptyRecords={tasks:[],comparisons:[],quality_tests:[],routing_comparisons:[]};
-const results=[],errors=[],unexpected=[],submissions=[];
+const results=[],errors=[],unexpected=[],submissions=[],discoveries=[];
+let discoveryMode='normal',releaseDelayed;
 async function uniqueIds(page,label){
  const duplicates=await page.locator('[id]').evaluateAll(nodes=>{
   const counts={};for(const node of nodes)counts[node.id]=(counts[node.id]||0)+1;
@@ -74,6 +75,17 @@ async function side(page,key){
     else if(endpoint==='/routing-corpus')data=corpus;
     else if(endpoint==='/quality-suite')data=suite;
     else if(endpoint==='/quality-reference-records')data={records:[]};
+    else if(endpoint==='/routing-models'){
+     const connection=request.postDataJSON();discoveries.push(connection);
+     assert.deepEqual(Object.keys(connection).sort(),['api_key','url']);
+     const baseline=connection.url.includes(':9001/');
+     const mode=discoveryMode;
+     if(mode==='delayed'&&baseline)await new Promise(resolve=>{releaseDelayed=resolve});
+     if(mode==='failure'&&!baseline)return route.fulfill({status:502,contentType:'application/json',body:JSON.stringify({error:'模型接口返回 401，请检查密钥'})});
+     data={ok:true,models:mode==='disjoint'?[baseline?'fixed-only':'smart-only']:
+      mode==='empty'?[]:mode==='delayed'?['obsolete-model']:
+      [baseline?'fixed-only':'smart-only','shared-routing-model','<synthetic-model & "quoted">']};
+    }
     else if(endpoint==='/models')data={models:['synthetic-quality-model']};
     else if(endpoint==='/credential-status')data={saved:false};
     else if(endpoint==='/preflight')data={level:'ok',requires_confirmation:false,planned_requests:2000,min_seconds:100,estimated_bytes:1024,target:{host:'127.0.0.1'},findings:[]};
@@ -109,7 +121,9 @@ async function side(page,key){
    assert.equal(submissions.length,beforeInvalid,'incomplete route form must not submit');
    assert.equal(await page.locator('#config').evaluate(node=>node.classList.contains('mobile-open')),true);
    await page.locator('#routingName').fill('按钮交互回归');
-   await page.locator('#routingModel').fill('shared-routing-model');
+   assert.equal(await page.locator('#routingModel').isDisabled(),true);
+   await page.locator('#loadRoutingModels').click();
+   assert.equal(await page.locator('#routingModelHint').textContent(),'请先填写固定路由的有效网关地址。');
    await page.locator('#routingConcurrency').fill('4');
    await page.locator('#routingRpm').fill('120');
    await page.locator('#routingTier').selectOption('1000');
@@ -128,6 +142,30 @@ async function side(page,key){
     assert.equal(await panel.locator('.routing-side-url').inputValue(),`http://127.0.0.1:${key==='baseline'?9001:9002}/v1`);
     assert.equal(await panel.locator('.routing-side-key').inputValue(),`synthetic-${key}-key`,key+': switching must retain input');
    }
+   await page.locator('#loadRoutingModels').click();
+   await page.waitForFunction(()=>!document.getElementById('loadRoutingModels').disabled);
+   assert.deepEqual(await page.locator('#routingModel option').evaluateAll(nodes=>nodes.map(node=>node.value)),['','<synthetic-model & "quoted">','shared-routing-model']);
+   assert.match(await page.locator('#routingModelHint').textContent(),/固定路由 3 个模型；智能路由 3 个模型；共同支持 2 个/);
+   assert.equal(await page.locator('#routingModel').inputValue(),'','selection is explicit');
+   await page.locator('#submit').click();
+   assert.equal(submissions.length,beforeInvalid,'discovered models still require a selection');
+   await page.locator('#routingModel').selectOption('shared-routing-model');
+   assert.equal(await page.locator('#formStatus').textContent(),'','correcting a model clears the outdated validation error');
+   // Route labels do not affect discovery, but credentials and addresses do.
+   await (await side(page,'baseline')).locator('.routing-side-name').fill('固定入口');
+   assert.equal(await page.locator('#routingModel').inputValue(),'shared-routing-model');
+   await page.locator('#routing-baseline-key').fill('replacement-key');
+   assert.equal(await page.locator('#routingModel').inputValue(),'');
+   assert.equal(await page.locator('#routingModel').isDisabled(),true);
+   await page.locator('#routing-baseline-key').fill('synthetic-baseline-key');
+   await page.locator('#loadRoutingModels').click();
+   await page.waitForFunction(()=>!document.getElementById('loadRoutingModels').disabled);
+   await page.locator('#routingModel').selectOption('shared-routing-model');
+   assert.deepEqual(discoveries.slice(-2).sort((a,b)=>a.url.localeCompare(b.url)),[
+    {url:'http://127.0.0.1:9001/v1',api_key:'synthetic-baseline-key'},
+    {url:'http://127.0.0.1:9002/v1',api_key:'synthetic-candidate-key'}]);
+   await page.locator('#routingModel').scrollIntoViewIfNeeded();
+   await drawerGeometry(page,width,height,'routing-models '+width);
    await page.screenshot({path:path.join(output,`routing-create-${width}.png`)});
    await page.locator('#submit').click();
    await page.waitForFunction(()=>!document.getElementById('config').classList.contains('mobile-open'));
@@ -147,7 +185,57 @@ async function side(page,key){
    assert.deepEqual(shared(request.body.baseline),shared(request.body.candidate),'both route sides use identical shared parameters');
    assert.equal(request.body.tier,1000);
 
+   // Failure, empty intersection and stale responses must never keep a usable old choice.
    await page.locator('#recordCreateButton').click();
+   for(const key of ['baseline','candidate']){
+    const panel=await side(page,key);
+    await panel.locator('.routing-side-url').fill(`http://127.0.0.1:${key==='baseline'?9001:9002}/v1`);
+    await panel.locator('.routing-side-key').fill(`synthetic-${key}-key`);
+   }
+   for(const mode of ['failure','disjoint','empty']){
+    discoveryMode=mode;
+    await page.locator('#loadRoutingModels').click();
+    await page.waitForFunction(()=>!document.getElementById('loadRoutingModels').disabled);
+    assert.equal(await page.locator('#routingModel').isDisabled(),true);
+    assert.equal(await page.locator('#routingModel').inputValue(),'');
+    assert.match(await page.locator('#routingModelHint').textContent(),mode==='failure'?/智能路由获取失败.*401/:/没有同名的共同模型/);
+   }
+   await page.locator('#routingManualModelToggle').click();
+   await page.locator('#routingModelManual').fill('manually-specified-model');
+   assert.equal(await page.evaluate(()=>readRouting().baseline.model),'manually-specified-model');
+   assert.equal(await page.evaluate(()=>readRouting().candidate.model),'manually-specified-model');
+   await page.locator('#routingManualModelToggle').click();
+   assert.equal(await page.evaluate(()=>readRouting().baseline.model),'','hidden manual draft must not leak');
+
+   discoveryMode='delayed';releaseDelayed=null;
+   await page.locator('#loadRoutingModels').click();
+   await page.waitForFunction(()=>document.getElementById('loadRoutingModels').disabled);
+   // Wait until both mock requests exist, then edit the connection and request fresh data.
+   while(!releaseDelayed)await new Promise(resolve=>setTimeout(resolve,10));
+   await (await side(page,'baseline')).locator('.routing-side-url').fill('http://127.0.0.1:9001/v1/');
+   assert.equal(await page.locator('#loadRoutingModels').isEnabled(),true);
+   discoveryMode='normal';
+   await page.locator('#loadRoutingModels').click();
+   await page.waitForFunction(()=>!document.getElementById('loadRoutingModels').disabled);
+   await page.locator('#routingModel').selectOption('shared-routing-model');
+   const oldResponse=page.waitForResponse(response=>response.url().endsWith('/routing-models'));
+   releaseDelayed();await oldResponse;
+   await page.evaluate(()=>new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve))));
+   assert.equal(await page.locator('#routingModel').inputValue(),'shared-routing-model','late result cannot replace new list');
+   assert.equal(await page.locator('#routingModel option[value="obsolete-model"]').count(),0);
+   // Manual fallback remains a real submission path for gateways without discovery.
+   await page.locator('#routingManualModelToggle').click();
+   await page.locator('#routingModelManual').fill('manually-specified-model');
+   await page.locator('#submit').click();
+   await page.waitForFunction(()=>!document.getElementById('config').classList.contains('mobile-open'));
+   const manual=submissions.filter(item=>item.width===width&&item.endpoint==='/routing-comparisons').at(-1);
+   assert.equal(manual.body.baseline.model,'manually-specified-model');
+   assert.equal(manual.body.candidate.model,'manually-specified-model');
+
+   await page.locator('#recordCreateButton').click();
+   assert.equal(await page.locator('#routingModel').inputValue(),'');
+   assert.equal(await page.locator('#routingModelManualWrap').isHidden(),true);
+   assert.equal(await page.locator('#routingModelManual').inputValue(),'');
    for(const key of ['baseline','candidate']){
     const panel=await side(page,key);
     assert.equal(await panel.locator('.routing-side-key').inputValue(),'','new run must not retain submitted credentials');

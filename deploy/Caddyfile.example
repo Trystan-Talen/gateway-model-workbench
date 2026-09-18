@@ -1,0 +1,14 @@
+# 可选：需要 HTTPS 时，用 Caddy 在前面终止 TLS 并转发到本机服务。
+# 此时 /etc/gateway-workbench.env 改为：
+#   ROUTE_TEST_HOST=127.0.0.1
+#   ROUTE_TEST_PORT=8666
+#   ROUTE_TEST_TRUSTED_PROXIES=127.0.0.1
+#   ROUTE_TEST_SECURE_COOKIE=1
+#
+# 只有 IP 没有域名时用 tls internal（Caddy 自签证书，浏览器首次访问需信任）；
+# 有公司域名时把地址换成域名并删掉 tls internal，Caddy 会自动申请证书。
+https://103.186.215.40:3003 {
+	tls internal
+	# Caddy 默认原样转发 Host 并追加 X-Forwarded-For，服务依赖这两点做同源校验与来源识别。
+	reverse_proxy 127.0.0.1:8666
+}

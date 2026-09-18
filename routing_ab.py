@@ -224,10 +224,51 @@ def cache_hit_rate(records):
     }
 
 
+# 无法用抢跑解释的段首命中达到这个比例（且不少于 CONTAMINATION_MIN_HITS 段）才判定为
+# 缓存被实验之外预热。留一点余量，避免个别上游把极短的公共片段计入 cached_tokens 时误报。
+CONTAMINATION_THRESHOLD = 0.1
+CONTAMINATION_MIN_HITS = 2
+
+
+def cold_start_hits(records):
+    """统计段首请求的命中情况，并区分「本侧抢跑」与「外部预热」。
+
+    每段的第一条请求在本侧、本次运行里没有先行者（前缀带本侧隔离标记），理应未命中。
+    它若命中，有两种来源：
+    1. 本侧抢跑：并发下同段后续请求先到达上游、先写入缓存。只有当某条同段请求在
+       段首请求拿到首字之前就已发出时才可能发生——用发送时间 ``ts`` 与段首请求的
+       首字耗时（缺失时用总耗时）判断，属于正常现象，不算污染；
+    2. 外部预热：没有任何同段请求来得及抢跑，缓存只能来自实验之外（别人同时在测、
+       网关剥离了提示词开头、上次运行残留）。只有这一类计入 ``unexplained``。
+    没有 ``burst_first`` 字段的旧记录不参与统计。
+    """
+    firsts = [r for r in records if r.get("burst_first") is True and r.get("cached_tokens") is not None]
+    sibling_sent = {}
+    for r in records:
+        burst, sent = r.get("step_index"), r.get("ts")
+        if r.get("burst_first") is False and burst is not None and isinstance(sent, (int, float)):
+            sibling_sent[burst] = min(sent, sibling_sent.get(burst, sent))
+    hits = raced = 0
+    for r in firsts:
+        if (r.get("cached_tokens") or 0) <= 0:
+            continue
+        hits += 1
+        sent, burst = r.get("ts"), r.get("step_index")
+        answered = sent + float(r.get("ttft_ms") or r.get("total_ms") or 0) if isinstance(sent, (int, float)) else None
+        if answered is not None and burst in sibling_sent and sibling_sent[burst] <= answered:
+            raced += 1
+    return {"hits": hits, "raced": raced, "unexplained": hits - raced, "eligible": len(firsts),
+            "pct": _percent(hits / len(firsts)) if firsts else None}
+
+
 def compare_cache(baseline_records, candidate_records):
     """比较两侧缓存命中率，并把「无 usage」当作不可比而非未命中。"""
     base = cache_hit_rate(baseline_records)
     cand = cache_hit_rate(candidate_records)
+    cold = {"baseline": cold_start_hits(baseline_records), "candidate": cold_start_hits(candidate_records)}
+    contaminated = [side for side, stat in cold.items()
+                    if stat["unexplained"] >= CONTAMINATION_MIN_HITS
+                    and stat["unexplained"] / stat["eligible"] >= CONTAMINATION_THRESHOLD]
     result = {
         "baseline": public_rate(rate_stat(base["hits"], base["eligible"])),
         "candidate": public_rate(rate_stat(cand["hits"], cand["eligible"])),
@@ -239,6 +280,8 @@ def compare_cache(baseline_records, candidate_records):
         "p_value": None,
         "attribution": ATTRIBUTION_UNKNOWN,
         "note": "",
+        "cold_start": cold,
+        "contamination_suspected": bool(contaminated),
     }
     if not base["eligible"] or not cand["eligible"]:
         result["note"] = ("至少一侧没有请求返回 usage 统计，缓存命中率不可比；"
@@ -252,7 +295,16 @@ def compare_cache(baseline_records, candidate_records):
     comparison = compare_rates(base["hits"], base["eligible"], cand["hits"], cand["eligible"])
     for key in ("delta_pct", "p_value", "ci_overlap", "attribution"):
         result[key] = comparison[key]
-    result["note"] = (comparison["note"] + (" " + result["note"] if result["note"] else "")).strip()
+    usage_note = result["note"]
+    result["note"] = (comparison["note"] + (" " + usage_note if usage_note else "")).strip()
+    if contaminated:
+        # 命中里混进了外部预热，差值不再只由路由决定：降级归因，而不是照常下结论。
+        labels = {"baseline": "固定路由", "candidate": "智能路由"}
+        detail = "、".join(f"{labels[side]} {cold[side]['unexplained']}/{cold[side]['eligible']}" for side in contaminated)
+        result["attribution"] = ATTRIBUTION_WEAK
+        result["note"] = (f"段首请求出现无法用同段抢跑解释的缓存命中（{detail}）：这些请求在本侧本次运行里"
+                          "没有先行者，命中只能来自实验之外的预热，缓存命中率差值不能归因于路由。"
+                          + (" " + usage_note if usage_note else "")).strip()
     return result
 
 
@@ -344,7 +396,7 @@ def build_comparison(baseline_records, candidate_records):
 
     limitations = [
         "本对照只说明本次清单、本次时段、本次并发下的黑盒观测，不等于长期稳定性证明。",
-        "两侧共用同一批请求；但路由两侧的缓存状态、连接池和上游负载可能随时间漂移。",
+        "两侧共用同一批请求但缓存互相隔离；连接池和上游负载仍可能随时间漂移。",
         "缓存命中率只统计能取到 usage 的请求；命中只证明本次命中，不能证明缓存还能存活多久。",
     ]
     if success.get("attribution") != ATTRIBUTION_OK:
@@ -377,6 +429,7 @@ def build_comparison(baseline_records, candidate_records):
             "confidence": "Wilson 95%",
             "test": "Fisher 精确检验 / McNemar 精确检验",
             "cache_basis": "usage.cached_tokens>0",
+            "cache_isolation": "每侧每次运行独立前缀标记；段首命中用于检测外部预热",
         },
         "limitations": limitations,
     }

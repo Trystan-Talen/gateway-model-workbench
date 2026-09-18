@@ -13,6 +13,7 @@
 """
 import json
 import asyncio
+import re
 import tempfile
 import os
 import sys
@@ -40,20 +41,32 @@ def load_fixture(name):
         return handle.read()
 
 
+def _burst_first(prompt):
+    """从提示词结尾的问题里取出全局序号，判断是否为段首请求（各模板里第一个数字就是序号）。"""
+    tail = prompt.rsplit("\n\n", 1)[-1]
+    return int(re.search(r"\d+", tail).group()) % routing_corpus.BURST_SIZE == 0
+
+
 class _RouteHandler(BaseHTTPRequestHandler):
-    """按模型名回放命中/未命中夹具，并把到达时间记下来供交错断言使用。"""
+    """按夹具回放命中/未命中，并把到达时间与请求正文记下来供断言使用。"""
 
     fixture = "sse_cache_hit.txt"
     arrivals = []
+    prompts = []
 
     def log_message(self, *args):
         pass
+
+    def _fixture_for(self, prompt):
+        return type(self).fixture
 
     def do_POST(self):
         length = int(self.headers.get("Content-Length", 0))
         body = json.loads(self.rfile.read(length) or b"{}")
         type(self).arrivals.append(time.monotonic())
-        raw = load_fixture(type(self).fixture)
+        prompt = body["messages"][0]["content"]
+        type(self).prompts.append(prompt)
+        raw = load_fixture(self._fixture_for(prompt))
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         self.send_header("Connection", "close")
@@ -68,13 +81,25 @@ class _RouteHandler(BaseHTTPRequestHandler):
 
 
 class _HitHandler(_RouteHandler):
+    """像真实前缀缓存一样：段首请求没有先行者，未命中；同段后续请求命中。"""
+    arrivals = []
+    prompts = []
+
+    def _fixture_for(self, prompt):
+        return "sse_cache_miss.txt" if _burst_first(prompt) else "sse_cache_hit.txt"
+
+
+class _PrewarmedHandler(_RouteHandler):
+    """连段首请求都命中：只可能是实验之外的流量预热过缓存。"""
     fixture = "sse_cache_hit.txt"
     arrivals = []
+    prompts = []
 
 
 class _MissHandler(_RouteHandler):
     fixture = "sse_cache_miss.txt"
     arrivals = []
+    prompts = []
 
 
 def _serve(handler):
@@ -102,8 +127,9 @@ class InterleavedExecutionTests(unittest.TestCase):
     """交错执行：把「先跑完 A 再跑 B」这个混淆因素排除掉。"""
 
     def setUp(self):
-        _HitHandler.arrivals = []
-        _MissHandler.arrivals = []
+        for handler in (_HitHandler, _MissHandler, _PrewarmedHandler):
+            handler.arrivals = []
+            handler.prompts = []
         self.hit_server, self.hit_url = _serve(_HitHandler)
         self.miss_server, self.miss_url = _serve(_MissHandler)
         self.addCleanup(self.hit_server.server_close)
@@ -116,14 +142,14 @@ class InterleavedExecutionTests(unittest.TestCase):
         patch.start()
         self.addCleanup(patch.stop)
 
-    def _run(self, tier=PROD_TIER):
+    def _run(self, tier=PROD_TIER, baseline_url=None, candidate_url=None, rpm=60000):
         comparison = routing_compare.RouteComparison({
             "name": "交错对照", "tier": tier,
-            "baseline": _side(self.hit_url, "固定路由"),
-            "candidate": _side(self.miss_url, "智能路由"),
+            "baseline": _side(baseline_url or self.hit_url, "固定路由"),
+            "candidate": _side(candidate_url or self.miss_url, "智能路由"),
         })
         comparison.plan, comparison.total, comparison.planned_duration = (
-            routing_compare.build_plan(tier, 60000))
+            routing_compare.build_plan(tier, rpm))
         # 只发前 TEST_TIER 条——清单前缀是共用的，item_id 与正式跑法一致，
         # 但不会为了跑通测试真的发满 1000 条。
         with mock.patch("routing_corpus.build_corpus", side_effect=_small_corpus):
@@ -170,13 +196,52 @@ class InterleavedExecutionTests(unittest.TestCase):
         self.assertEqual(len({item for _, item in dispatched}), TEST_TIER)
 
     def test_cache_hit_rate_drops_and_is_attributable(self):
-        """固定路由恒命中、智能路由恒未命中时，报告必须给出可归因的下降。"""
+        """固定路由段内命中、智能路由恒未命中时，报告必须给出可归因的下降。"""
         comparison = self._run()
         report = comparison.snap()["report"]
-        self.assertAlmostEqual(report["baseline"]["cache"]["pct"], 100.0, places=2)
+        bursts = -(-TEST_TIER // routing_corpus.BURST_SIZE)
+        expected = (TEST_TIER - bursts) / TEST_TIER * 100
+        self.assertAlmostEqual(report["baseline"]["cache"]["pct"], expected, places=2)
         self.assertAlmostEqual(report["candidate"]["cache"]["pct"], 0.0, places=2)
-        self.assertAlmostEqual(report["cache"]["delta_pct"], -100.0, places=2)
+        self.assertAlmostEqual(report["cache"]["delta_pct"], -expected, places=2)
         self.assertEqual(report["cache"]["attribution"], routing_compare.routing_ab.ATTRIBUTION_OK)
+        self.assertFalse(report["cache"]["contamination_suspected"])
+        self.assertEqual(report["cache"]["cold_start"]["baseline"]["hits"], 0)
+        self.assertEqual(report["cache"]["cold_start"]["baseline"]["eligible"], bursts)
+
+    def test_prewarmed_cache_downgrades_attribution(self):
+        """段首请求也命中说明缓存被实验之外预热过：差值不得再归因于路由。"""
+        server, url = _serve(_PrewarmedHandler)
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        # 放慢节奏：同段请求在段首请求返回首字之后才发出，段首命中无法用抢跑解释。
+        report = self._run(baseline_url=url, rpm=1200).snap()["report"]
+        self.assertTrue(report["cache"]["contamination_suspected"])
+        self.assertEqual(report["cache"]["attribution"], routing_ab.ATTRIBUTION_WEAK)
+        self.assertIn("无法用同段抢跑解释", report["cache"]["note"])
+        self.assertNotIn("可归因于路由", report["cache"]["note"])
+
+    def test_sides_and_runs_never_share_a_cache_prefix(self):
+        """两侧打到同一个上游时，任何一侧都不能借到另一侧或上一次运行预热的前缀。"""
+        first = self._run(baseline_url=self.hit_url, candidate_url=self.hit_url)
+        second = self._run(baseline_url=self.hit_url, candidate_url=self.hit_url)
+        prompts = _HitHandler.prompts
+        self.assertEqual(len(prompts), TEST_TIER * 4)
+        scopes = [first.cache_scopes, second.cache_scopes]
+        tokens = [scope[side] for scope in scopes for side in ("baseline", "candidate")]
+        self.assertEqual(len(set(tokens)), 4, "每次运行、每一侧的隔离标记都必须不同")
+        self.assertEqual({len(token) for token in tokens}, {routing_compare.CACHE_SCOPE_DIGITS})
+        by_scope = {token: [p for p in prompts if p.startswith(f"[对照隔离标记 {token}]\n")] for token in tokens}
+        self.assertEqual(sum(map(len, by_scope.values())), len(prompts), "每条请求都必须以本侧标记开头")
+        # 前缀缓存按公共前缀匹配：只要第一行不同，两组请求之间就没有可复用的前缀。
+        first_lines = {token: {p.split("\n", 1)[0] for p in group} for token, group in by_scope.items()}
+        for token, lines in first_lines.items():
+            self.assertEqual(lines, {f"[对照隔离标记 {token}]"})
+        # 去掉标记后两侧内容逐字相同：对照的仍是同一份清单。
+        base = sorted(p.split("\n", 1)[1] for p in by_scope[tokens[0]])
+        cand = sorted(p.split("\n", 1)[1] for p in by_scope[tokens[1]])
+        self.assertEqual(base, cand)
+        self.assertEqual(first.snap()["cache_isolation"]["scheme"], routing_compare.CACHE_SCOPE_SCHEME)
 
     def test_no_usage_side_is_incomparable_not_zero(self):
         """把智能路由换成一个不回 usage 的网关，命中率必须是「不可比」而不是 0%。"""

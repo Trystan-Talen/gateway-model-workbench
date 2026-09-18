@@ -1,0 +1,29 @@
+# systemd 服务：复制到 /etc/systemd/system/gateway-workbench.service。
+# 路径与用户按 docs/deployment.md 创建；修改后执行 systemctl daemon-reload。
+[Unit]
+Description=Gateway and model evaluation workbench
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=workbench
+Group=workbench
+WorkingDirectory=/opt/gateway-workbench
+EnvironmentFile=/etc/gateway-workbench.env
+ExecStart=/opt/gateway-workbench/.venv/bin/python route_test_ui.py
+Restart=on-failure
+RestartSec=5
+# 收到停止信号后正常收尾；超时才强制结束。
+TimeoutStopSec=30
+UMask=0077
+
+# 只允许写数据目录，其余文件系统只读。
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/srv/gateway-workbench-data
+
+[Install]
+WantedBy=multi-user.target

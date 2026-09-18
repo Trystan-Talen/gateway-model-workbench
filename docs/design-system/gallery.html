@@ -1,0 +1,157 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Instrument 组件画廊</title>
+<!-- Living reference for docs/design-system.md. Open this file directly in a browser.
+     Every example is rendered by static/ui-kit.js with the real stylesheets, so it cannot drift from production.
+     tools/check-ui.cjs requires one example per exported UI builder. -->
+<link rel="stylesheet" href="../../static/tokens.css">
+<link rel="stylesheet" href="../../static/app.css">
+<style>
+  html body{overflow:auto;background:var(--color-canvas)}
+  .gallery-page{display:grid;grid-template-columns:220px minmax(0,1fr);min-height:100vh}
+  .gallery-nav{position:sticky;top:0;align-self:start;height:100vh;padding:var(--space-6) var(--space-4);background:var(--color-rail);color:var(--color-rail-muted);overflow:auto}
+  .gallery-nav .logo{margin-bottom:var(--space-4)}
+  .gallery-nav b{display:block;margin-bottom:var(--space-5);color:var(--color-rail-text);font-size:var(--text-title)}
+  .gallery-nav a{display:block;padding:6px 10px;border-radius:var(--radius-sm);color:var(--color-rail-muted);font-size:var(--text-body);text-decoration:none}
+  .gallery-nav a:hover{background:color-mix(in srgb,var(--color-rail-text) 8%,transparent);color:var(--color-rail-text)}
+  .gallery-nav .rail-btn{margin-top:var(--space-5);flex-direction:row;justify-content:center;gap:8px;border:1px solid var(--color-rail-line)}
+  .gallery-main{min-width:0;padding:var(--space-8) var(--space-10) var(--space-12);container-type:inline-size;container-name:detail}
+  .gallery-main>header{max-width:760px;margin-bottom:var(--space-8)}
+  .gallery-main>header h1{font-size:var(--text-page);font-weight:760;letter-spacing:-.035em}
+  .gallery-main>header p{margin-top:var(--space-2);color:var(--color-text-secondary);font-size:var(--text-lead);line-height:1.8}
+  .gallery-block{margin:0 0 var(--space-12)}
+  .gallery-block>h2{margin-bottom:var(--space-1);font-size:var(--text-heading);font-weight:720;letter-spacing:-.02em}
+  .gallery-block>p{margin-bottom:var(--space-4);color:var(--color-muted);font-size:var(--text-body)}
+  .gallery-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:var(--space-3)}
+  .gallery-swatch{overflow:hidden;border:1px solid var(--color-border);border-radius:var(--radius-inner);background:var(--color-surface)}
+  .gallery-swatch i{display:block;height:56px;border-bottom:1px solid var(--color-border)}
+  .gallery-swatch div{padding:var(--space-2) var(--space-3)}
+  .gallery-swatch code,.gallery-code{font-family:var(--font-mono);font-size:var(--text-caption);color:var(--color-text)}
+  .gallery-swatch small{display:block;color:var(--color-muted);font-family:var(--font-mono);font-size:var(--text-micro)}
+  .gallery-row{display:flex;flex-wrap:wrap;align-items:center;gap:var(--space-3)}
+  .gallery-demo{padding:var(--space-6);border:1px dashed var(--color-border-strong);border-radius:var(--radius-card);background:var(--color-canvas)}
+  .gallery-demo+.gallery-demo{margin-top:var(--space-4)}
+  .gallery-label{margin-bottom:var(--space-3);color:var(--color-accent);font-family:var(--font-mono);font-size:var(--text-caption)}
+  .gallery-type{display:grid;grid-template-columns:200px minmax(0,1fr);align-items:baseline;gap:var(--space-4);padding:var(--space-2) 0;border-bottom:1px solid var(--color-border)}
+  .gallery-shape{display:grid;place-items:center;height:72px;border:1px solid var(--color-border);background:var(--color-surface)}
+  .gallery-narrow{max-width:360px}
+  .gallery-drawer{position:static;visibility:visible;transform:none;width:100%;max-width:560px;height:auto;border:1px solid var(--color-border);border-radius:var(--radius-panel)}
+  @media (max-width:980px){.gallery-page{grid-template-columns:minmax(0,1fr)}.gallery-nav{position:static;height:auto}.gallery-main{padding:var(--space-5) var(--space-4)}}
+</style>
+</head>
+<body>
+<div class="gallery-page">
+  <nav class="gallery-nav" aria-label="画廊目录">
+    <div class="logo"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 15h3.5l2.5-7 4 11 3-8 1.5 4H21"/></svg></div>
+    <b>Instrument 设计系统</b>
+    <a href="#colors">颜色</a><a href="#type">字号</a><a href="#shape">圆角与阴影</a><a href="#actions">操作</a><a href="#feedback">状态与反馈</a><a href="#records">记录栏</a><a href="#page">详情页结构</a><a href="#data">数据展示</a><a href="#forms">表单</a><a href="#recipe">完整页面配方</a>
+    <button class="rail-btn" type="button" id="galleryTheme">切换深色 / 浅色</button>
+  </nav>
+  <main class="gallery-main">
+    <header>
+      <div class="report-kicker">docs/design-system.md 的活示例</div>
+      <h1>组件画廊</h1>
+      <p>这里的每个示例都直接调用 <code class="gallery-code">static/ui-kit.js</code> 并加载真实样式。新增或修改组件时，先在这里确认浅色与深色效果，再用到业务页面。</p>
+    </header>
+
+    <section class="gallery-block" id="colors"><h2>颜色</h2><p>只使用角色变量；数值来自 tokens.css，切换主题可对比。</p><div class="gallery-grid" id="swatches"></div></section>
+    <section class="gallery-block" id="type"><h2>字号</h2><p>按角色选择；数字使用等宽字体。</p><div id="typeScale"></div></section>
+    <section class="gallery-block" id="shape"><h2>圆角与阴影</h2><p>嵌套元素比容器小一级；一级卡片共用一种阴影。</p><div class="gallery-grid" id="shapes"></div></section>
+
+    <section class="gallery-block" id="actions"><h2>操作</h2><p>每个区域最多一个主要按钮。</p>
+      <div class="gallery-demo"><div class="gallery-label">UI.button · UI.textButton · UI.icon</div><div class="gallery-row" id="demoButtons"></div></div>
+      <div class="gallery-demo"><div class="gallery-label">UI.actionBar</div><div class="report-shell" id="demoActionBar"></div></div>
+    </section>
+
+    <section class="gallery-block" id="feedback"><h2>状态与反馈</h2><p>语义色只表达状态；状态必须带文字。</p>
+      <div class="gallery-demo"><div class="gallery-label">UI.status · UI.tag · UI.badge</div><div class="gallery-row" id="demoStatus"></div></div>
+      <div class="gallery-demo"><div class="gallery-label">UI.notice</div><div class="signal-list" id="demoNotice"></div></div>
+      <div class="gallery-demo"><div class="gallery-label">UI.signal · UI.signalList</div><div id="demoSignal"></div></div>
+    </section>
+
+    <section class="gallery-block" id="records"><h2>记录栏</h2><p>记录项名称单行省略，元信息用“·”分隔。</p>
+      <div class="gallery-demo gallery-narrow"><div class="gallery-label">UI.recordItem · UI.recordEmpty</div><div class="task-list" id="demoRecords"></div></div>
+    </section>
+
+    <section class="gallery-block" id="page"><h2>详情页结构</h2><p>UI.pageShell(页头 + 标签 + 进度 + 区块 + 操作区)。</p>
+      <div class="gallery-demo"><div class="gallery-label">UI.pageShell · UI.pageHeader · UI.tabs · UI.progressCard · UI.section</div><div id="demoPage"></div></div>
+    </section>
+
+    <section class="gallery-block" id="data"><h2>数据展示</h2><p>空值统一“—”，单位缩小跟在数字后。</p>
+      <div class="gallery-demo"><div class="gallery-label">UI.metric · UI.metrics</div><div id="demoMetrics"></div></div>
+      <div class="gallery-demo"><div class="gallery-label">UI.methodCards · UI.steps · UI.limitations</div><div id="demoMethod"></div></div>
+      <div class="gallery-demo"><div class="gallery-label">UI.table</div><div id="demoTable"></div></div>
+    </section>
+
+    <section class="gallery-block" id="forms"><h2>表单</h2><p>创建流程统一放在右侧抽屉，按编号分步。</p>
+      <div class="gallery-demo"><div class="gallery-label">.config 抽屉 · UI.formSectionTitle · UI.field · UI.input · UI.select · UI.inlineFields · UI.switchRow · UI.hint</div>
+        <aside class="config gallery-drawer" aria-label="抽屉示例"><header class="drawer-head"><div><div class="form-title">新建缓存评测</div><div class="form-sub">配置连接与请求清单，开始后查看实时结果。</div></div><button class="drawer-close" type="button" aria-label="关闭示例" id="demoClose"></button></header><div class="drawer-body" id="demoForm"></div><footer class="drawer-footer"><button class="submit" type="button">开始缓存评测</button><div class="form-note">开始后会向所填目标发送真实请求，请核对配置。</div></footer></aside>
+      </div>
+    </section>
+
+    <section class="gallery-block" id="recipe"><h2>完整页面配方</h2><p>与 docs/design-system.md 第 7 节的示例代码一致。</p><div class="gallery-demo" id="demoRecipe"></div></section>
+  </main>
+</div>
+<script src="../../static/ui-kit.js"></script>
+<script>
+(function () {
+  const $ = id => document.getElementById(id);
+  const css = () => getComputedStyle(document.documentElement);
+  const colors = ['canvas','surface','surface-2','surface-3','border','border-strong','text','text-secondary','muted','accent','accent-hover','accent-soft','accent-line','accent-2','success','success-soft','warning','warning-soft','danger','danger-soft','ink','on-ink','hero','on-hero','rail','rail-text','chart-grid','chart-plan'];
+  const sizes = ['micro','caption','meta','small','body','control','emphasis','lead','title','section','heading-sm','heading','heading-lg','display-sm','page','number-lg','number-3xl'];
+  function paintFoundations() {
+    $('swatches').innerHTML = colors.map(n => `<div class="gallery-swatch"><i style="--swatch:var(--color-${n})"></i><div><code>--color-${n}</code><small>${UI.esc(css().getPropertyValue('--color-' + n).trim())}</small></div></div>`).join('');
+    document.querySelectorAll('.gallery-swatch i').forEach(el => { el.style.background = 'var(--swatch)'; });
+  }
+  $('typeScale').innerHTML = sizes.map(n => `<div class="gallery-type"><code class="gallery-code">--text-${n}</code><span style="--size:var(--text-${n})" data-size>${n.startsWith('number') ? '81.9%' : '网关与模型评测 Instrument'}</span></div>`).join('');
+  document.querySelectorAll('[data-size]').forEach(el => { el.style.fontSize = 'var(--size)'; if (el.textContent === '81.9%') el.style.fontFamily = 'var(--font-mono)'; });
+  $('shapes').innerHTML = ['xs','sm','control','inner','lg','card','panel'].map(n => `<div class="gallery-shape" data-radius="${n}"><code class="gallery-code">--radius-${n}</code></div>`).join('') +
+    ['card','float','control','glow'].map(n => `<div class="gallery-shape" data-shadow="${n}"><code class="gallery-code">--shadow-${n}</code></div>`).join('');
+  document.querySelectorAll('[data-radius]').forEach(el => { el.style.borderRadius = `var(--radius-${el.dataset.radius})`; });
+  document.querySelectorAll('[data-shadow]').forEach(el => { el.style.borderRadius = 'var(--radius-card)'; el.style.boxShadow = `var(--shadow-${el.dataset.shadow})`; });
+
+  $('demoButtons').innerHTML = UI.button('开始评测', { variant: 'primary', iconName: 'plus' }) + UI.button('下载结论报告', { iconName: 'download' }) + UI.button('删除本地记录', { variant: 'danger', iconName: 'trash' }) + UI.button('运行中不可删除', { disabled: true }) + UI.textButton('无法获取列表？手动指定模型') + UI.icon('activity');
+  $('demoActionBar').innerHTML = UI.actionBar(UI.button('停止后续请求', { variant: 'danger', iconName: 'stop' }) + UI.button('下载报告', { iconName: 'download' }) + UI.button('删除本地记录', { variant: 'danger', iconName: 'trash' }));
+  $('demoStatus').innerHTML = [['running','运行中'],['waiting','排队中'],['finished','已完成'],['finished_with_errors','完成但有错误'],['error','失败'],['stopped','已停止']].map(([s, l]) => UI.status(s, l)).join('') +
+    UI.TONES.map(t => UI.tag(t, t)).join('') + UI.badge('有限证据') + UI.badge('12 道题', { hint: true });
+  $('demoNotice').innerHTML = UI.notice('结果文件已删除；页面仍保留历史摘要。') + UI.notice('两侧成功率差异可归因于路由。', { tone: 'success', title: '成功率' }) + UI.notice('样本不足，不做显著性判断。', { tone: 'warning' }) + UI.notice('结果文件已失效，证据无法逐条核对。', { tone: 'danger' });
+  $('demoSignal').innerHTML = UI.signalList([{ title: '对比组 1 完成吞吐未随压力增长', detail: '计划调度速率提高不等于实际完成能力提高。', tone: 'danger' }, { title: '长尾延迟上升', detail: 'p95 增加 2,738 ms。', tone: 'warning' }]) + UI.signal({ title: '当前窗口没有额外异常信号', tone: 'success' });
+  $('demoRecords').innerHTML = UI.recordItem({ id: 'a', title: '生产网关晚高峰 · 40 并发', state: 'running', stateLabel: '运行中', typeLabel: '单次压测', meta: ['冒烟', '600 RPM'], progress: 42, selected: true, action: 'selectTask' }) +
+    UI.recordItem({ id: 'b', title: '并发 40 与 100 对照', state: 'finished', stateLabel: '已完成', typeLabel: '对照实验', compare: true, meta: ['2/2 组完成'], progress: 100, trailing: '风险', action: 'selectComparison' }) +
+    UI.recordEmpty('暂无缓存评测记录', '创建一次缓存评测后，结果会出现在这里。');
+  $('demoPage').innerHTML = UI.pageShell([
+    UI.pageHeader({ kicker: '网关压测 · 对照实验记录', title: '并发 40 与 100 对照', description: '一条实验记录承载公共配置和全部压力组。', meta: ['已完成', '2 个实验组', '串行执行'], statusLabel: '风险', statusNote: '对比组出现明显退化', statusTone: 'danger' }),
+    UI.tabs({ label: '示例标签', items: [['report', '对照结论'], ['base', '基准组'], ['cmp', '对比组 1']], active: 'report', action: 'setComparisonTab', ownerId: 'demo' }),
+    UI.progressCard({ kicker: '实验整体进度', value: 64, summary: '26 / 40 条请求 · 1/2 组完成', note: '实验尚未完成；当前只展示过程数据。' }),
+    UI.section({ title: '关键发现', description: '异常信号是复测线索，不是根因结论。', badgeHtml: UI.badge('有限证据'), bodyHtml: UI.signalList([{ title: '成功率下降 6.5%', detail: '相对基准组。', tone: 'warning' }]) })
+  ].join(''));
+  $('demoMetrics').innerHTML = UI.metrics([{ label: '稳定完成吞吐', value: '50.5', unit: 'RPM', note: '不是网关容量承诺', primary: true }, { label: '成功率', value: '100', unit: '%', note: '仅完整 2xx 计为成功' }, { label: '总耗时 p95', value: '22,293', unit: 'ms' }, { label: '缓存命中率', value: null }]) +
+    `<div class="gallery-narrow">${UI.metric({ label: '单个指标', value: '43.8', unit: 'RPM' })}</div>`;
+  $('demoMethod').innerHTML = UI.methodCards([{ title: '配对方式', lines: ['按请求编号一一配对。', '只有一侧有结果的请求整条剔除。'] }, { title: '唯一变量', lines: ['只有 URL 与密钥背后的路由不同。'] }]) + '<br>' +
+    UI.steps(['暂停扩大流量，定位失败类型', '用相同题集重复运行', '风险解除前不作为放量依据']) + UI.limitations(['证据量级不等于统计置信区间。', '黑盒结果不能证明上游来源。']);
+  $('demoTable').innerHTML = UI.table({ columns: [{ label: '请求编号' }, { label: '结果' }, { label: '总耗时' }], rowsHtml: [['159', UI.tag('超时', 'warning'), '60,005 ms'], ['158', UI.tag('成功', 'success'), '4,322 ms']] });
+  $('demoClose').innerHTML = UI.icon('close');
+  $('demoForm').innerHTML = UI.formSectionTitle(1, '连接网关') +
+    UI.field({ id: 'demoUrl', label: '网关地址', required: true, controlHtml: UI.input({ id: 'demoUrl', type: 'url', placeholder: 'https://gateway.example.com/v1' }), hint: '密钥不会写入任务记录。' }) +
+    UI.formSectionTitle(2, '请求参数') +
+    UI.inlineFields(UI.field({ id: 'demoConc', label: '并发上限', controlHtml: UI.input({ id: 'demoConc', type: 'number', value: 20, min: 1 }) }) + UI.field({ id: 'demoTier', label: '请求数', controlHtml: UI.select({ id: 'demoTier', options: [['100', '100 条'], ['1000', '1,000 条']], value: '100' }) })) +
+    UI.hint('两侧按相同清单、节奏和并发交错发出请求。', { title: '对照方式' }) +
+    UI.switchRow({ id: 'demoCapture', title: '保存原始输入与输出', description: '便于逐条核对结果，会增加本地存储占用。' });
+  $('demoRecipe').innerHTML = UI.pageShell([
+    UI.pageHeader({ kicker: '缓存评测 · 单次运行', title: '长前缀缓存命中', description: '同一清单重复请求，观察缓存命中与首字耗时。', meta: ['运行中', '1,000 条请求'], statusLabel: '可复测', statusNote: '证据有限', statusTone: 'warning' }),
+    UI.tabs({ label: '缓存评测详情', items: [['report', '结论'], ['raw', '逐条结果']], active: 'report', action: 'setQualityTab', ownerId: 'recipe' }),
+    UI.progressCard({ kicker: '执行进度', value: 82, summary: '820 / 1,000 条' }),
+    UI.section({ title: '关键指标', description: '只描述客户端观测窗口。', badgeHtml: UI.badge('有限证据'), bodyHtml: UI.metrics([{ label: '命中率', value: '82.4', unit: '%', primary: true }, { label: '首字 p95', value: '640', unit: 'ms' }]) }),
+    UI.section({ title: '下一步动作', bodyHtml: UI.steps(['扩大样本后复测', '检查未命中的请求']) }),
+    UI.actionBar(UI.button('下载结论报告', { iconName: 'download' }) + UI.button('删除本地记录', { variant: 'danger' }))
+  ].join(''));
+
+  function setTheme(theme) { document.documentElement.dataset.theme = theme; paintFoundations(); }
+  $('galleryTheme').addEventListener('click', () => setTheme(document.documentElement.dataset.theme === 'dark' ? 'light' : 'dark'));
+  setTheme(matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');
+})();
+</script>
+</body>
+</html>

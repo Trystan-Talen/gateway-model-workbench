@@ -65,7 +65,7 @@ async function until(fn,label,ms=90000){const end=Date.now()+ms;while(Date.now()
   assert.deepEqual(single.resources[0].case_results.map(c=>c.execution_sequence),Array.from({length:120},(_,i)=>i+1));
   await page.evaluate(async id=>{await refresh();await selectQuality(id)},singleId);
   await page.waitForFunction(id=>window.currentQualityDetail?.id===id,singleId);
-  assert.match(await page.locator('#modulePlaceholder').innerText(),/单资源诊断/);
+  assert.equal(await page.locator('#modulePlaceholder .report-tab.active').innerText(),'结论','single-resource records open on the conclusion tab');
   assert.equal(await page.locator('.quality-score-card').count(),1);
   await page.screenshot({path:path.join(output,'single-report.png')});
   const downloadEvent=page.waitForEvent('download');await page.getByRole('button',{name:'下载报告与证据'}).click();

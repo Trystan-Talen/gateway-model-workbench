@@ -166,6 +166,14 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(result["models"], [])
         self.assertIn("HTTP 401", result["error"])
 
+    def test_phase_never_reports_a_finished_soak_as_running(self):
+        cfg = self.make_config(mode='soak', duration=60)
+        steps, total = ui.build_plan(cfg)
+        task = ui.Task(cfg, steps, total)
+        task.status = 'finished_with_errors'
+        self.assertNotIn('仍在执行', task._phase())
+        self.assertIn('部分请求失败', task._phase())
+
     def test_timeout_stays_timeout(self):
         result = self.request('timeout')
         self.assertEqual(result['error_type'], 'TIMEOUT')

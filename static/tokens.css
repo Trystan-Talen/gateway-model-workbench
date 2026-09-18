@@ -1,52 +1,183 @@
+/* Design tokens · "Instrument" design system — the single source of truth.
+ * Spec: docs/design-system.md · Gallery: docs/design-system/gallery.html
+ * Rules (enforced by tools/check-ui.cjs):
+ *   - Only this file may define raw colours, type sizes, radii, shadows, z-index layers and font stacks.
+ *   - Component CSS references tokens by role (e.g. --text-body, --radius-card), never literal values.
+ *   - Add a token here (both themes for colours) before using a new value, and document it in the spec. */
 :root {
+  --color-canvas: #f2f1ec;
   --color-surface: #ffffff;
-  --color-canvas: #f0f3f8;
-  --color-border: #dce4ef;
-  --color-border-strong: #b4c3d7;
-  --color-text: #192b43;
-  --color-text-secondary: #425b78;
-  --color-muted: #657a94;
-  --color-accent: #326bdd;
-  --color-accent-hover: #2152b5;
-  --color-accent-soft: #eaf1ff;
-  --color-accent-line: #bbd0fc;
-  --color-success: #177b59;
-  --color-success-soft: #e6f5ee;
-  --color-danger: #bb3e4b;
-  --color-danger-soft: #fff0f1;
-  --color-warning: #936216;
-  --color-warning-soft: #fff5de;
-  --color-purple: #7152ac;
-  --color-purple-soft: #f2edfc;
+  --color-surface-2: #f8f7f3;
+  --color-surface-3: #efede6;
+  --color-border: #e4e1d8;
+  --color-border-strong: #ccc8bc;
+  --color-text: #16161a;
+  --color-text-secondary: #4b4b53;
+  --color-muted: #7b7a82;
+  --color-accent: #5b47f5;
+  --color-accent-hover: #4632e0;
+  --color-accent-soft: #efecff;
+  --color-accent-line: #cbc2ff;
+  --color-accent-2: #00a6c7;
+  --color-success: #11805a;
+  --color-success-soft: #e2f4eb;
+  --color-danger: #c83340;
+  --color-danger-soft: #fdecec;
+  --color-warning: #9a6200;
+  --color-warning-soft: #fcf1d9;
+  --color-purple: #7b4fd6;
+  --color-purple-soft: #f2ecfd;
   --color-on-accent: #ffffff;
+  --color-ink: #141417;
+  --color-ink-2: #26262c;
+  --color-on-ink: #f7f6f2;
+  --color-on-ink-muted: #9e9da6;
+  --color-hero: #141417;          /* high-emphasis KPI tile */
+  --color-hero-line: #141417;
+  --color-on-hero: #f7f6f2;
+  --color-on-hero-muted: #9e9da6;
+  --color-rail: #111113;
+  --color-rail-line: #26262b;
+  --color-rail-text: #f4f3ef;
+  --color-rail-muted: #8f8e97;
+  --color-overlay: #0d0d10;
+  --color-chart-grid: #e7e4dc;
+  --color-chart-plan: #b7b0e8;
   --surface-rgb: 255 255 255;
   color-scheme: light;
 }
 :root[data-theme="dark"] {
-  --color-surface: #172336;
-  --color-canvas: #101a29;
-  --color-border: #304159;
-  --color-border-strong: #506782;
-  --color-text: #e8eef8;
-  --color-text-secondary: #b9c9df;
-  --color-muted: #98aecb;
-  --color-accent: #82acff;
-  --color-accent-hover: #aec9ff;
-  --color-accent-soft: #203454;
-  --color-accent-line: #405f90;
-  --color-success: #78d5ae;
-  --color-success-soft: #163e34;
-  --color-danger: #ff98a5;
-  --color-danger-soft: #4b2933;
-  --color-warning: #f0c577;
-  --color-warning-soft: #453821;
-  --color-purple: #bda7f5;
-  --color-purple-soft: #362c50;
-  --color-on-accent: #101a29;
-  --surface-rgb: 23 35 54;
+  --color-canvas: #0c0c0f;
+  --color-surface: #16161b;
+  --color-surface-2: #1c1c22;
+  --color-surface-3: #232329;
+  --color-border: #2a2a31;
+  --color-border-strong: #3c3c45;
+  --color-text: #ededf0;
+  --color-text-secondary: #b8b8c0;
+  --color-muted: #8c8c96;
+  --color-accent: #9d8cff;
+  --color-accent-hover: #b8abff;
+  --color-accent-soft: #221e3b;
+  --color-accent-line: #4a4190;
+  --color-accent-2: #3fd0ea;
+  --color-success: #5fd4a1;
+  --color-success-soft: #14322a;
+  --color-danger: #ff8c96;
+  --color-danger-soft: #3d1f25;
+  --color-warning: #f2c26b;
+  --color-warning-soft: #3a2f1a;
+  --color-purple: #c2a9ff;
+  --color-purple-soft: #2c2446;
+  --color-on-accent: #0c0c0f;
+  --color-ink: #f1f0ec;
+  --color-ink-2: #d9d8d3;
+  --color-on-ink: #111114;
+  --color-on-ink-muted: #55555d;
+  --color-hero: #221e3b;
+  --color-hero-line: #4a4190;
+  --color-on-hero: #ededf0;
+  --color-on-hero-muted: #8c8c96;
+  --color-rail: #070709;
+  --color-rail-line: #1d1d22;
+  --color-rail-text: #f1f0ec;
+  --color-rail-muted: #85848d;
+  --color-overlay: #000000;
+  --color-chart-grid: #26262d;
+  --color-chart-plan: #4d4787;
+  --surface-rgb: 22 22 27;
   color-scheme: dark;
 }
-[data-theme="dark"] .submit, [data-theme="dark"] .btn.primary { color: var(--color-canvas); }
-.theme-toggle { white-space: nowrap; }
-.report-readout-section > summary { cursor: pointer; font-weight: 650; padding: 4px 0; }
-.report-readout-section[open] > summary { margin-bottom: 14px; }
+
+/* ---- Theme-independent scales ---------------------------------------------------------- */
+:root {
+  /* Font stacks: local system fonts only (CSP forbids external font hosts). */
+  --font-sans: "Inter", "SF Pro Text", -apple-system, BlinkMacSystemFont, "PingFang SC", "Hiragino Sans GB", "HarmonyOS Sans SC", "Microsoft YaHei", "Segoe UI", sans-serif;
+  --font-mono: "SF Mono", "JetBrains Mono", "Cascadia Mono", ui-monospace, Menlo, Consolas, monospace;
+
+  /* Type scale — pick by role. Numbers (metrics, counts, ids) use --font-mono. */
+  --text-micro: 10.5px;      /* counters inside pills, rail labels */
+  --text-caption: 11px;      /* table headers, tags, status pills */
+  --text-meta: 11.5px;       /* field meta, kickers, metric labels & notes */
+  --text-small: 12px;        /* hints, secondary copy, captions */
+  --text-body: 12.5px;       /* default reading text, buttons */
+  --text-control: 13px;      /* list titles, card sub-headings */
+  --text-emphasis: 13.5px;   /* input values, strong inline copy */
+  --text-lead: 14px;         /* lead paragraphs, primary submit */
+  --text-title: 15px;        /* card titles, top-bar page name */
+  --text-section: 16px;      /* report section titles */
+  --text-heading-sm: 18px;   /* modal titles */
+  --text-heading: 20px;      /* drawer title, focus values */
+  --text-heading-lg: 22px;   /* record panel title, group titles, compact page titles */
+  --text-display-sm: 24px;   /* empty-state title, decision headline, standard metric value */
+  --text-page: 28px;         /* page (detail) title */
+  --text-number-md: 30px;
+  --text-number-lg: 40px;    /* progress percentage */
+  --text-number-xl: 44px;    /* scores */
+  --text-number-2xl: 52px;
+  --text-number-3xl: 64px;   /* hero KPI */
+  --text-hero: clamp(32px, 3.4vw, 52px); /* marketing-style headline (auth screen only) */
+
+  /* Spacing scale (4px grid; 2px half-steps only for dense controls). */
+  --space-1: 4px; --space-2: 8px; --space-3: 12px; --space-4: 16px; --space-5: 20px;
+  --space-6: 24px; --space-7: 28px; --space-8: 32px; --space-10: 40px; --space-12: 48px;
+
+  /* Radius scale — nested elements step down one level from their container. */
+  --radius-hair: 3px;        /* indicator bars, legend swatches */
+  --radius-xs: 6px;          /* tags, small badges */
+  --radius-sm: 8px;          /* compact buttons, list rows inside panels */
+  --radius-control: 10px;    /* inputs, buttons */
+  --radius-inner: 12px;      /* tiles nested inside cards */
+  --radius-lg: 14px;         /* segmented bars, nested panels */
+  --radius-card: 16px;       /* top-level cards */
+  --radius-panel: 20px;      /* dialogs, drawer edge */
+  --radius-xl: 24px;         /* hero illustration tiles */
+  --radius-pill: 999px;
+
+  /* Elevation — top-level cards share one shadow; nested tiles use none. */
+  --shadow-card: 0 1px 0 color-mix(in srgb, var(--color-overlay) 4%, transparent), 0 10px 30px -18px color-mix(in srgb, var(--color-overlay) 22%, transparent);
+  --shadow-float: 0 24px 64px -24px color-mix(in srgb, var(--color-overlay) 45%, transparent), 0 2px 8px color-mix(in srgb, var(--color-overlay) 8%, transparent);
+  --shadow-control: 0 1px 2px color-mix(in srgb, var(--color-overlay) 8%, transparent);
+  --shadow-selected: var(--shadow-control), 0 0 0 1px var(--color-border);
+  --shadow-primary: 0 12px 24px -16px color-mix(in srgb, var(--color-overlay) 80%, transparent);
+  --shadow-glow: 0 10px 24px -10px color-mix(in srgb, var(--color-accent) 80%, transparent);
+  --shadow-knob: 0 1px 3px color-mix(in srgb, var(--color-overlay) 30%, transparent);
+  --shadow-ring: 0 0 0 var(--halo-size) color-mix(in srgb, var(--color-accent) 18%, transparent);
+  --halo-size: 4px;          /* soft status halo: 0 0 0 var(--halo-size) color-mix(<status colour>) */
+
+  /* Layers */
+  --z-behind: -1;
+  --z-raised: 1;
+  --z-drawer-backdrop: 60;
+  --z-drawer: 61;
+  --z-module-drawer-backdrop: 110;
+  --z-module-drawer: 111;
+  --z-modal: 120;
+  --z-module-modal: 130;
+  --z-auth: 200;
+  --z-toast: 300;
+
+  /* Motion */
+  --ease: cubic-bezier(.2, .8, .2, 1);
+  --duration-fast: .15s;
+  --duration-base: .22s;
+  --duration-slow: .34s;
+
+  /* Layout */
+  --rail-w: 84px;
+  --records-w: 312px;
+  --top-h: 60px;
+  --content-max: 1560px;
+  --drawer-w: 600px;
+  --card-inset: var(--space-6);
+  --section-gap: var(--space-4);
+
+  /* Compatibility aliases (fingerprint.css and older markup). Do not use in new code. */
+  --card-shadow: var(--shadow-card);
+  --float-shadow: var(--shadow-float);
+  --control-shadow: var(--shadow-control);
+  --ring: var(--shadow-ring);
+  --line: var(--color-border); --line-strong: var(--color-border-strong); --text: var(--color-text);
+  --sub: var(--color-text-secondary); --muted: var(--color-muted); --blue: var(--color-accent);
+  --green: var(--color-success); --red: var(--color-danger); --amber: var(--color-warning); --canvas: var(--color-canvas);
+}

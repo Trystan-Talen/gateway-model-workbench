@@ -79,6 +79,7 @@ class CreationStateTests(unittest.TestCase):
         names = ['isGatewayCreate', 'isQualityCreate', 'isRoutingCreate', 'isCompareCreate',
                  'setCreateKind', 'routingTierOptions', 'routingSideTemplate', 'renderRoutingFields',
                  'setRoutingSide', 'updateRoutingSideStatus', 'readRoutingSide', 'readRouting',
+                 'currentRoutingModel', 'resetRoutingModels', 'setRoutingModelMode',
                  'resetCreateForm', 'startNewTest', 'openCreateForContext',
                  'openGatewayCreate', 'openQualityCreate', 'openRoutingCreate']
         implementation = '\n'.join(self.function(script, name) for name in names)
@@ -116,6 +117,7 @@ const document={
  },
  querySelector(selector){const match=selector.match(/^\[data-routing-side="([^"]+)"\]$/);return match?panels.find(panel=>panel.dataset.routingSide===match[1])||null:null}
 };
+let routingModelRequestSeq=0;
 let createKind='gateway-single',activeModule='gateway',activeView='single',activeTemplateId=null;
 let preflightData=null,preflightAckRequested=false,preflightTimer=null,preflightSeq=0,templateCache=null;
 let routingCorpus=[{tier:1000,note:'合成测试集'}],lastRendered=null,drawerOpen=false;

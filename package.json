@@ -5,8 +5,8 @@
     "node": ">=20"
   },
   "scripts": {
-    "check": "node --check static/app.js && node --check static/actions.js && node --check static/fingerprint.js && node tools/check-ui.cjs",
-    "test": "npm run check && node tests/test_fingerprint_ui.cjs && node tests/test_fingerprint_models_ui.cjs",
+    "check": "node --check static/app.js && node --check static/actions.js && node --check static/ui-kit.js && node --check static/fingerprint.js && node tools/check-ui.cjs",
+    "test": "npm run check && node tests/test_ui_kit.cjs && node tests/test_check_ui.cjs && node tests/test_fingerprint_ui.cjs && node tests/test_fingerprint_models_ui.cjs",
     "e2e": "node tests/browser/smoke.cjs",
     "e2e:full": "node tests/browser/run-all.cjs"
   },

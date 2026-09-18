@@ -71,6 +71,7 @@ class SubmitGateTests(unittest.TestCase):
             # 真实实现：读取质量/路由表单 + 提交处理。
             "function readQuality(){" + self._body(script, "function readQuality(){") + "}",
             "function readRoutingSide(mode){" + self._body(script, "function readRoutingSide(mode){") + "}",
+            "function currentRoutingModel(){" + self._body(script, "function currentRoutingModel(){") + "}",
             "function readRouting(){" + self._body(script, "function readRouting(){") + "}",
             self.SUBMIT + self._body(script, self.SUBMIT) + "};",
         ]
@@ -109,6 +110,7 @@ class SubmitGateTests(unittest.TestCase):
             "for(const [id,value] of Object.entries({routingTier:'1000',routingName:'路由对照',"
             "routingModel:'shared-routing-model',routingConcurrency:'4',routingRpm:'120',"
             "routingConnectTimeout:'9',routingReadTimeout:'45'}))$(id).value=value;\n"
+            "$('routingModelManualWrap').hidden=true;\n"
             "const currentModel=()=> 'unrelated-gateway-model';\n"
             "const refreshPreflight=async()=>{};\n"
             "const ensurePreflightAck=async()=>true;\n"

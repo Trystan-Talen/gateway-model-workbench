@@ -1,16 +1,25 @@
 """Transactional per-record index with legacy JSON import; immutable evidence stays outside."""
+import hashlib
 import json
 import os
 import sqlite3
 import threading
+import uuid
 from pathlib import Path
 
 _LOCK = threading.RLock()
 KINDS = ('tasks', 'comparisons', 'quality_tests', 'routing_comparisons')
+# 已提交内容的摘要，按数据库路径缓存：运行中每秒写一次索引时，只比较摘要、只写变化的记录，
+# 不再把全部快照正文从数据库读回来逐条对比。只在事务提交成功后更新。
+_COMMITTED = {}
 
 
 def _encode(value):
     return json.dumps(value, ensure_ascii=False, separators=(',', ':'), sort_keys=True)
+
+
+def _digest(encoded):
+    return hashlib.sha256(encoded.encode('utf-8')).digest()
 
 
 def summary(snapshot):
@@ -43,27 +52,53 @@ class HistoryStore:
         db.execute('CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT)')
         return db
 
+    def _committed(self, db):
+        # 库内随机代号标识“这一份数据库”：文件被删除重建时代号变化，不沿用旧摘要。
+        # 缓存只在本进程内有效；恢复备份需先停服务，因此不会读到过期摘要。
+        row = db.execute("SELECT value FROM metadata WHERE key='generation'").fetchone()
+        if row is None:
+            with db:
+                db.execute("INSERT INTO metadata VALUES ('generation',?)", (uuid.uuid4().hex,))
+            row = db.execute("SELECT value FROM metadata WHERE key='generation'").fetchone()
+        key = str(self.path)
+        cached = _COMMITTED.get(key)
+        if cached is None or cached[0] != row[0]:
+            state = {kind: {} for kind in KINDS}
+            for kind, identifier, encoded in db.execute('SELECT kind,id,snapshot FROM records'):
+                if kind in state:
+                    state[kind][identifier] = _digest(encoded)
+            cached = _COMMITTED[key] = (row[0], state)
+        return cached[1]
+
     def write(self, entries):
         with _LOCK:
             db = self._connect()
             try:
+                committed = self._committed(db)
+                pending = {}
                 with db:
                     for kind in KINDS:
                         snapshots = entries.get(kind, [])
-                        existing = {row[0]: row[1] for row in db.execute('SELECT id,snapshot FROM records WHERE kind=?', (kind,))}
-                        seen = set()
+                        existing = committed[kind]
+                        current = {}
                         for snapshot in snapshots:
                             identifier = str(snapshot.get('id') or '')
                             if not identifier:
                                 continue
-                            seen.add(identifier)
                             snapshot = quality_index(snapshot) if kind == 'quality_tests' else snapshot
                             encoded = _encode(snapshot)
-                            if existing.get(identifier) != encoded:
+                            current[identifier] = _digest(encoded)
+                            if existing.get(identifier) != current[identifier]:
                                 db.execute('INSERT OR REPLACE INTO records VALUES (?,?,?,?)', (kind, identifier, _encode(summary(snapshot)), encoded))
-                        for identifier in existing.keys() - seen:
+                        for identifier in existing.keys() - current.keys():
                             db.execute('DELETE FROM records WHERE kind=? AND id=?', (kind, identifier))
+                        pending[kind] = current
                     db.execute("INSERT OR REPLACE INTO metadata VALUES ('initialized','1')")
+                committed.update(pending)
+            except Exception:
+                # 事务已回滚：丢弃缓存，下次从数据库重建，避免摘要与磁盘不一致。
+                _COMMITTED.pop(str(self.path), None)
+                raise
             finally:
                 db.close()
 

@@ -2,6 +2,7 @@
 (() => {
   'use strict';
   const $ = id => document.getElementById(id);
+  const UI = window.UI;
   const html = value => String(value ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
   const finite = value => value !== null && value !== undefined && value !== '' && Number.isFinite(Number(value));
   const number = (value, digits = 0) => finite(value) ? Number(value).toLocaleString('zh-CN', {maximumFractionDigits:digits, minimumFractionDigits:digits}) : '未知';
@@ -14,7 +15,10 @@
   const STATUSES = {waiting:'排队中',running:'采集中',stopping:'正在停止',finished:'已完成',error:'采集失败',stopped:'已停止',interrupted:'进程中断'};
   const VERDICTS = {match:'行为分布相近',mismatch:'行为分布存在明显差异',uncertain:'证据存疑，建议复测',insufficient:'有效证据不足',incomparable:'不具备直接可比条件'};
   const CATEGORIES = {valid:'有效',invalid:'无效回答',refusal:'拒答',empty:'空回答',error:'请求失败',cancelled:'已取消'};
-  const TABS = [['overview','结果总览'],['distribution','回答分布'],['diagnostics','通道诊断'],['protocol','协议与来源'],['samples','原始样本']];
+  const TABS = [['overview','结论'],['distribution','回答分布'],['diagnostics','通道诊断'],['protocol','协议与来源'],['samples','原始样本']];
+  // 记录与页头统一使用 .status 生命周期胶囊；进程中断按失败着色。
+  const STATUS_STATE = {waiting:'waiting',running:'running',stopping:'stopping',finished:'finished',error:'error',stopped:'stopped',interrupted:'error'};
+  const TONE = {good:'success',warn:'warning',neutral:'neutral'};
   const s = {initialized:false,epoch:0,runs:[],references:[],catalog:null,catalogError:'',referenceError:'',catalogPending:false,referencesPending:false,catalogPromise:null,referencesPromise:null,storageWarnings:[],referencesLoaded:false,referencesAt:0,view:'runs',selected:null,tab:'overview',detail:null,detailError:'',detailPending:false,detailSignature:'',selection:0,referenceArtifacts:new Map(),samplePage:null,sampleError:'',samplePending:false,sampleOffset:0,sampleSequence:0,drawerOpen:false,drawerSession:0,submitting:false,modalOpen:false,modalSession:0,modalBusy:false,opener:null,modalOpener:null,refOpen:null,formProtocol:null,modelInputMode:'list',modelOptions:[],modelDiscoverySequence:0,modelDiscoveryPending:false,modelDiscoveryStatus:'',modelDiscoveryTone:'',adapterManual:false,adapterAuto:null};
   const active = () => typeof activeModule !== 'undefined' && activeModule === 'fingerprint';
   const signedIn = () => typeof authenticated === 'undefined' || authenticated;
@@ -150,6 +154,8 @@
     const host = $('modulePlaceholder'); host.hidden = false;
     renderList();
     if (s.view === 'references') { paintHost(referenceLibrary()); return; }
+    // 与其他模块一致：有记录时默认打开最新一条，只有列表为空才显示引导页。
+    if (!s.selected && s.runs.length) { selectRun(s.runs[0].id); renderList(); loadDetail(true); }
     if (!s.selected) { paintHost(welcome()); return; }
     const run = s.detail?.id === s.selected ? s.detail : s.runs.find(r => r.id === s.selected);
     if (!run) { paintHost(welcome()); return; }
@@ -161,7 +167,7 @@
     const same = host.dataset.fpKey === key;
     const scroll = same ? main.scrollTop : 0;
     const activeEl = document.activeElement;
-    const focusKey = host.contains(activeEl) ? {action:activeEl.dataset?.fpAction,id:activeEl.dataset?.fpId,tab:activeEl.dataset?.fpTab,offset:activeEl.dataset?.fpOffset} : null;
+    const focusKey = host.contains(activeEl) ? {action:activeEl.dataset?.fpAction,id:activeEl.dataset?.fpId,tab:activeEl.dataset?.fpTab,offset:activeEl.dataset?.fpOffset,click:activeEl.dataset?.clickAction,arg:activeEl.dataset?.arg1} : null;
     const tableScrolls = same ? [...host.querySelectorAll('[data-fp-scroll]')].map(el => [el.dataset.fpScroll,el.scrollLeft,el.scrollTop]) : [];
     const expanded = same ? [...host.querySelectorAll('details[open][data-fp-details]')].map(el => el.dataset.fpDetails) : [];
     host.dataset.fpKey = key;
@@ -169,6 +175,7 @@
     for (const [id,left,top] of tableScrolls) { const el = [...host.querySelectorAll('[data-fp-scroll]')].find(n => n.dataset.fpScroll === id); if (el) { el.scrollLeft = left; el.scrollTop = top; } }
     for (const id of expanded) { const el = [...host.querySelectorAll('[data-fp-details]')].find(n => n.dataset.fpDetails === id); if (el) el.open = true; }
     if (focusKey?.action) [...host.querySelectorAll('[data-fp-action]')].find(el => el.dataset.fpAction === focusKey.action && el.dataset.fpId === focusKey.id && el.dataset.fpTab === focusKey.tab && el.dataset.fpOffset === focusKey.offset)?.focus({preventScroll:true});
+    else if (focusKey?.click) [...host.querySelectorAll('[data-click-action]')].find(el => el.dataset.clickAction === focusKey.click && el.dataset.arg1 === focusKey.arg)?.focus({preventScroll:true});
     main.scrollTop = scroll;
   }
   function renderList() {
@@ -177,10 +184,12 @@
       list.innerHTML = s.references.length ? s.references.map(ref => { const health = referenceHealth(ref); return `<button class="task fp-record ${s.refOpen === ref.id ? 'sel' : ''}" type="button" data-fp-action="reference-detail" data-fp-id="${html(ref.id)}"><div class="task-top"><div class="task-name">${html(ref.name || '未命名参考')}</div><span class="fp-dot ${health.tone}"></span></div><div class="task-meta">${html(ref.endpoint?.model || '模型未记录')}</div><div class="fp-record-foot"><span>${html(health.text)}</span><span>${html(date(ref.collected_at).split(' ')[0])}</span></div></button>`; }).join('') : `<div class="task-empty"><b>${s.referenceError ? '参考库读取失败' : s.referencesPending ? '正在读取参考库' : '暂无参考指纹'}</b><span>${html(s.referenceError || '从可信来源采集，或导入已保存的指纹文件。')}</span>${s.referenceError ? button('retry-data','重新加载') : ''}</div>`;
       return;
     }
-    list.innerHTML = s.runs.length ? s.runs.map(run => {
-      const pct = Math.min(100,Math.max(0,Number(run.progress?.done || 0) / Math.max(1,Number(run.progress?.total || 0)) * 100));
-      return `<button class="task fp-record ${s.selected === run.id ? 'sel' : ''}" type="button" data-fp-action="select" data-fp-id="${html(run.id)}"><div class="task-top"><div class="task-name">${html(run.name)}</div><span class="fp-status ${running(run) ? 'live' : run.status === 'error' ? 'warn' : ''}">${html(STATUSES[run.status] || run.status)}</span></div><div class="task-meta">${html(MODES[run.mode] || '指纹采集')} · ${html(run.endpoint?.model || '模型未记录')}</div><div class="task-foot"><div class="mini-track"><i style="width:${pct}%"></i></div><span class="fp-count">${number(run.progress?.done || 0)} / ${number(run.progress?.total || 0)}</span></div></button>`;
-    }).join('') : '<div class="task-empty"><b>暂无采集记录</b><span>新建模型指纹，从通道自检开始。</span></div>';
+    list.innerHTML = s.runs.length ? s.runs.map(run => UI.recordItem({
+      id: run.id, title: run.name, state: STATUS_STATE[run.status] || 'waiting', stateLabel: STATUSES[run.status] || run.status,
+      typeLabel: MODES[run.mode] || '指纹采集', compare: Boolean(run.comparison || run.mode === 'verify'), meta: [run.endpoint?.model || '模型未记录'],
+      progress: Number(run.progress?.done || 0) / Math.max(1,Number(run.progress?.total || 0)) * 100,
+      trailing: `${number(run.progress?.done || 0)} / ${number(run.progress?.total || 0)}`, selected: s.selected === run.id, action: 'selectFingerprint'
+    })).join('') : UI.recordEmpty('暂无采集记录','新建模型指纹，从通道自检开始。');
   }
   function welcome() {
     return `<div class="fp-workspace fp-welcome"><section class="fp-hero"><div class="fp-hero-icon">${icon('fingerprint')}</div><div><div class="fp-kicker">模型指纹 · 可重复的黑盒观测</div><h1>让每次对照，都有同一把尺子</h1><p>把固定问题独立、多次发送给同一通道，观察回答分布；先检查自身稳定性，再与可信参考对照。</p></div></section><section class="fp-mode-explainer"><article><span class="fp-step">01</span><h2>通道自检</h2><p>将一次采集分半比较，寻找时间波动或分布不稳定的线索。</p><small>无需参考，适合首次使用</small></article><article><span class="fp-step">02</span><h2>建立可信参考</h2><p>从你认可的来源采集，连同冻结协议、来源和日期存入参考库。</p><small>可信来源需由你明确声明</small>${button('create-reference','采集参考指纹')}</article><article><span class="fp-step">03</span><h2>对照已有参考</h2><p>沿用参考参数采集目标通道，检查协议与证据条件后比较分布。</p><small>也可离线比较已完成记录</small></article></section><section class="fp-card"><div class="fp-section-head"><div><h2>固定协议，保留完整证据</h2><p>独立请求 · 无历史记忆 · 同义改写随机抽取 · 队列随机打乱 · 不自动重试</p></div>${icon('shield')}</div><div class="fp-facts"><span><b>1.0</b> 固定采样温度</span><span><b>双分半</b> 交替与时间顺序自检</span><span><b>${html(s.catalog?.reference_max_age_days || 30)} 天</b> 本地参考有效期策略</span></div><p class="fp-subtle">分布相似不等于模型身份已被证明；差异也可能来自提示词、采样、版本或路由。阈值为未校准的工程提示。</p>${s.catalogError ? notice('协议目录读取失败：' + s.catalogError,'warn') + button('retry-data','重新加载协议') : ''}<details class="fp-details" data-fp-details="method"><summary>方法来源与判读边界</summary>${methodHtml()}</details></section></div>`;
@@ -189,9 +198,11 @@
     const c = s.catalog || {};
     return `<p>借鉴 ${link(c.source_url || 'https://github.com/ToseaAI/llm-fingerprint-detector','llm-fingerprint-detector（大模型指纹检测器）')}；工作台使用独立协议版本。${c.paper_url ? link(c.paper_url,'查看原论文') : ''}</p><p>距离使用 JSD（詹森–香农散度），越小表示观测分布越接近，并非置信度。协议不兼容、参考过期、有效覆盖不足或诊断异常时，结论降级。</p><p>分半自检异常不能确定存在混合后端，低差异也不能排除混合。缓存诊断只作排查线索，不能单独证明模型身份。</p><p>30 天是本地工程策略；阈值借鉴上游，尚未针对当前供应商和模型版本校准。</p>`;
   }
-  async function select(id) {
+  function selectRun(id) {
     if (s.selected !== id) { s.selected = id; s.detail = null; s.detailSignature = ''; s.detailError = ''; s.tab = 'overview'; s.samplePage = null; s.sampleOffset = 0; s.sampleError = ''; s.selection++; s.sampleSequence++; s.detailPending = false; s.samplePending = false; }
-    s.view = 'runs'; render(); await loadDetail(true);
+  }
+  async function select(id) {
+    selectRun(id); s.view = 'runs'; render(); await loadDetail(true);
   }
   async function loadDetail(force = false, signature = '') {
     if (!s.selected || s.detailPending || !active()) return;
@@ -209,8 +220,41 @@
   }
   function detailHtml(run) {
     const done = Number(run.progress?.done || 0), total = Number(run.progress?.total || 0), pct = Math.min(100,Math.max(0,done / Math.max(1,total) * 100));
-    let body = s.tab === 'overview' ? overviewHtml(run) : s.tab === 'distribution' ? distributionHtml(run) : s.tab === 'diagnostics' ? diagnosticsHtml(run) : s.tab === 'protocol' ? protocolHtml(run.protocol || run.artifact?.protocol,run) : samplesHtml(run);
-    return `<div class="fp-workspace"><header class="fp-page-head"><div><div class="fp-kicker">模型指纹 · ${html(MODES[run.mode] || '分布采集')}</div><h1>${html(run.name)}</h1><p>${html(run.endpoint?.model || '模型未记录')}<span class="fp-separator">·</span>${html(date(run.created))}</p><div class="fp-meta"><span class="fp-status ${running(run) ? 'live' : run.status === 'error' ? 'warn' : ''}">${html(STATUSES[run.status] || run.status)}</span><span>${number(run.protocol?.cells?.length)} 格问题</span><span>每格 ${number(run.protocol?.samples_per_cell)} 次</span><span>并发 ${number(run.protocol?.concurrency)}</span></div></div><div class="fp-head-actions">${running(run) ? button('stop',run.status === 'stopping' ? '正在停止…' : '停止采集',`data-fp-id="${html(run.id)}" ${run.status === 'stopping' ? 'disabled' : ''}`,'danger') : run.artifact ? `<a class="btn fp-button" href="/fingerprints/${encodeURIComponent(run.id)}/export" download>${icon('download')}导出指纹</a>` : ''}${run.artifact ? button('compare','离线对照',`data-fp-id="${html(run.id)}"`) : ''}</div></header>${s.detailError ? notice('记录详情读取失败：' + s.detailError,'warn') + button('retry-detail','重新加载详情') : ''}${run.error ? notice(run.error,'warn') : ''}${run.storage_warning ? notice(run.storage_warning,'warn') : ''}${running(run) || !run.artifact || run.artifact.complete === false ? `<section class="fp-card fp-progress" aria-live="polite"><div class="fp-section-head"><h2>${running(run) ? '正在收集证据' : '本次采集已结束'}</h2><strong>${number(pct,0)}%</strong></div><div class="fp-track" role="progressbar" aria-label="指纹采集进度" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${Math.round(pct)}"><i style="width:${pct}%"></i></div><div class="fp-progress-meta"><span>${number(done)} / ${number(total)} 次请求已结算</span><span>有效 ${number(run.progress?.valid || 0)} · 无效 ${number(Math.max(0,done - (run.progress?.valid || 0) - (run.progress?.errors || 0)))} · 请求错误 ${number(run.progress?.errors || 0)}</span></div><p class="fp-subtle">${run.status === 'waiting' ? '等待采集槽位；排队时不会向目标发出请求。' : run.status === 'stopping' ? '停止未发请求并取消在途请求，已获得的证据会保留。' : running(run) ? '完成后计算分布与双分半自检；运行中的局部结果不作为对照结论。' : '仅保留已经采集到的证据，不将不完整采集视为完成。'}</p></section>` : ''}<nav class="fp-tabs" role="tablist" aria-label="模型指纹详情标签页">${TABS.map(([id,label]) => `<button class="fp-tab ${s.tab === id ? 'active' : ''}" role="tab" aria-selected="${s.tab === id}" aria-controls="fpTabPanel" tabindex="${s.tab === id ? 0 : -1}" type="button" data-fp-action="tab" data-fp-tab="${id}">${label}</button>`).join('')}</nav><div id="fpTabPanel" role="tabpanel" aria-label="${TABS.find(t => t[0] === s.tab)?.[1] || ''}">${body}</div><div class="fp-footer-actions"><span>原始证据保存在本机；导出前请留意目标地址与回答原文。</span>${!running(run) ? button('delete-run','删除记录',`data-fp-id="${html(run.id)}"`,'danger') : ''}</div></div>`;
+    const body = s.tab === 'overview' ? overviewHtml(run) : s.tab === 'distribution' ? distributionHtml(run) : s.tab === 'diagnostics' ? diagnosticsHtml(run) : s.tab === 'protocol' ? protocolHtml(run.protocol || run.artifact?.protocol,run) : samplesHtml(run);
+    const verdict = running(run) ? {title:STATUSES[run.status] || '采集中',note:'完成前不作为结论',tone:'accent'} : run.artifact ? (v => ({title:v.title,note:v.note,tone:v.statusTone}))(verdictOf(run)) : {title:STATUSES[run.status] || run.status,note:'结论等待采集完成',tone:'neutral'};
+    const tabs = TABS.map(([id,label]) => [id,id === 'overview' && (run.comparison || run.mode === 'verify') ? '对照结论' : label]);
+    const showProgress = running(run) || !run.artifact || run.artifact.complete === false;
+    const progress = showProgress ? UI.progressCard({kicker:running(run) ? '采集进度' : '本次采集已结束',label:'指纹采集进度',value:pct,
+      summary:`${number(done)} / ${number(total)} 次请求已结算 · 有效 ${number(run.progress?.valid || 0)} · 无效 ${number(Math.max(0,done - (run.progress?.valid || 0) - (run.progress?.errors || 0)))} · 请求错误 ${number(run.progress?.errors || 0)}`,
+      note:run.status === 'waiting' ? '等待采集槽位；排队时不会向目标发出请求。' : run.status === 'stopping' ? '停止未发请求并取消在途请求，已获得的证据会保留。' : running(run) ? '完成后计算分布与双分半自检；运行中的局部结果不作为对照结论。' : '仅保留已经采集到的证据，不将不完整采集视为完成。'}) : '';
+    const actions = [
+      running(run) ? button('stop',icon('stop') + (run.status === 'stopping' ? '正在停止…' : '停止采集'),`data-fp-id="${html(run.id)}" ${run.status === 'stopping' ? 'disabled' : ''}`,'danger') : '',
+      run.artifact ? `<a class="btn fp-button" href="/fingerprints/${encodeURIComponent(run.id)}/export" download>${icon('download')}导出指纹</a>` : '',
+      run.artifact ? button('compare','离线对照',`data-fp-id="${html(run.id)}"`) : '',
+      !running(run) ? button('delete-run','删除本地记录',`data-fp-id="${html(run.id)}"`,'danger') : ''
+    ].join('');
+    return UI.pageShell([
+      UI.pageHeader({kicker:`模型指纹 · ${MODES[run.mode] || '分布采集'}`,title:run.name,
+        description:'固定问题独立多次发送，观察回答分布；原始证据只保存在本机，导出前请留意目标地址与回答原文。',
+        meta:[STATUSES[run.status] || run.status,run.endpoint?.model || '模型未记录',date(run.created),`${number(run.protocol?.cells?.length)} 格问题`,`每格 ${number(run.protocol?.samples_per_cell)} 次`,`并发 ${number(run.protocol?.concurrency)}`],
+        statusLabel:verdict.title,statusNote:verdict.note,statusTone:verdict.tone}),
+      UI.tabs({label:'模型指纹详情标签页',items:tabs,active:s.tab,action:'setFingerprintTab',ownerId:run.id}),
+      progress,
+      s.detailError ? notice('记录详情读取失败：' + s.detailError,'warn') + button('retry-detail','重新加载详情') : '',
+      run.error ? notice(run.error,'warn') : '',
+      run.storage_warning ? notice(run.storage_warning,'warn') : '',
+      `<div class="fp-workspace" id="fpTabPanel" role="tabpanel" aria-label="${html(tabs.find(t => t[0] === s.tab)?.[1] || '')}">${body}</div>`,
+      UI.actionBar(actions)
+    ].join(''));
+  }
+
+  // 页头状态块与结论卡共用同一个判定，避免两处文案漂移。
+  function verdictOf(run) {
+    const a = run.artifact || {}, d = a.diagnostics || run.diagnostics || {}, split = d.split_half || {}, comparison = run.comparison;
+    const complete = a.complete === true, noValid = finite(d.valid_rate) && Number(d.valid_rate) === 0;
+    const title = !complete ? '采集未完成，已保留部分证据' : noValid ? '未获得有效指纹' : comparison ? VERDICTS[comparison.verdict] || comparison.label || '对照结果' : split.warning ? '自检发现分布波动，建议复测' : '已形成指纹证据';
+    const tone = !complete || noValid ? 'warn' : comparison?.verdict === 'match' ? 'good' : ['mismatch','uncertain','incomparable','insufficient'].includes(comparison?.verdict) || split.warning ? 'warn' : 'neutral';
+    return {title,tone,statusTone:TONE[tone],note:comparison ? '描述行为分布，不判定模型身份' : MODES[run.mode] || '分布采集'};
   }
   function overviewHtml(run) {
     const a = run.artifact, d = a?.diagnostics || run.diagnostics || {}, split = d.split_half || {}, comparison = run.comparison;
@@ -218,8 +262,7 @@
     const complete = a.complete === true, noValid = finite(d.valid_rate) && Number(d.valid_rate) === 0;
     const reasoningTruncated = noValid && d.reasoning_observed && Number(d.truncated_rate) === 1;
     const selfcheckAvailable = complete && Number(split.alternating?.comparable_cells || 0) >= 4 && Number(split.temporal?.comparable_cells || 0) >= 4 && finite(split.alternating?.mean_jsd) && finite(split.temporal?.mean_jsd);
-    const title = !complete ? '采集未完成，已保留部分证据' : noValid ? '未获得有效指纹' : comparison ? VERDICTS[comparison.verdict] || comparison.label || '对照结果' : split.warning ? '自检发现分布波动，建议复测' : '已形成指纹证据';
-    const tone = !complete || noValid ? 'warn' : comparison?.verdict === 'match' ? 'good' : ['mismatch','uncertain','incomparable','insufficient'].includes(comparison?.verdict) || split.warning ? 'warn' : 'neutral';
+    const {title,tone} = verdictOf(run);
     const reference = s.references.find(r => r.id === comparedReference(run));
     const c = comparison || {};
     const diagnosis = reasoningTruncated ? '所有已返回回答都被截断，并且观测到推理用量。检查原始样本：若正文为空，说明输出预算被推理占用。请用关闭思考适配重新采集；原记录保留作诊断，不可作为有效参考。' : noValid ? '请求已结算，但没有可用于分布比较的有效回答。请在通道诊断与原始样本中检查截断、拒答和接口错误，再新建采集。' : '';
@@ -269,7 +312,7 @@
     finally { if (seq === s.sampleSequence && selection === s.selection && epoch === s.epoch) { s.samplePending = false; render(); } }
   }
   function referenceLibrary() {
-    return `<div class="fp-workspace"><header class="fp-page-head"><div><div class="fp-kicker">模型指纹 · 可追溯参考</div><h1>参考库</h1><p>保存来源、采集日期和协议快照，为下一次对照提供依据。</p></div><div class="fp-head-actions">${button('create-reference',icon('plus') + '采集参考指纹','','primary')}${button('import',icon('upload') + '导入指纹')}${button('reload-references','刷新')}</div></header>${s.referenceError ? notice('参考库读取失败：' + s.referenceError,'warn') + button('retry-data','重新加载') : ''}<section class="fp-card"><div class="fp-section-head"><h2>${s.references.length ? `${s.references.length} 份参考指纹` : '还没有可信参考'}</h2><span class="fp-subtle">有效期策略：${s.catalog?.reference_max_age_days || 30} 天</span></div>${s.references.length ? `<div class="fp-reference-grid">${s.references.map(ref => { const health = referenceHealth(ref), p = protocolOf(ref); return `<article class="fp-reference-card"><div class="fp-reference-title"><div>${icon('fingerprint')}<h3>${html(ref.name || '未命名参考')}</h3></div><span class="fp-status ${health.tone}">${html(health.text)}</span></div><p>${html(ref.endpoint?.model || '模型未记录')}</p><dl><div><dt>采集时间</dt><dd>${html(date(ref.collected_at))}</dd></div><div><dt>协议</dt><dd class="fp-code">${html(p.id ? p.id.slice(0,16) + '…' : '外部协议／未知')}</dd></div><div><dt>来源</dt><dd>${html(ref.source_note || '未声明')}</dd></div></dl><div class="fp-reference-actions">${button('reference-detail','查看详情',`data-fp-id="${html(ref.id)}"`)}${button('create-from-reference','用此参考采集',`data-fp-id="${html(ref.id)}" ${health.usable ? '' : 'disabled'} title="${html(health.usable ? '沿用参考协议创建目标采集' : health.text)}"`)}<a class="btn fp-button" href="/fingerprint/references/${encodeURIComponent(ref.id)}/export" download>导出</a>${button('delete-reference','删除',`data-fp-id="${html(ref.id)}"`,'danger')}</div></article>`; }).join('')}</div>` : `<div class="fp-library-empty">${icon('fingerprint')}<h3>先为对照准备一份可追溯参考</h3><p>连接你确认可信的来源，选择一个模型，完整采集后自动保存到参考库。也可导入已有指纹文件。</p>${button('create-reference',icon('plus') + '采集参考指纹','','primary')}<p class="fp-subtle">外部文件会保留原协议状态；导入成功并不意味着可以直接对照。</p></div>`}</section><section class="fp-card fp-library-policy"><h2>参考不是永久基准</h2><p>协议变更、采样参数变化或参考过期时，需要重新采集。来源可信由用户声明，不能由一个模型名称自动证明。</p></section></div>`;
+    return `<div class="fp-workspace">${UI.pageHeader({kicker:'模型指纹 · 可追溯参考',title:'参考库',description:'保存来源、采集日期和协议快照，为下一次对照提供依据。',actionsHtml:button('create-reference',icon('plus') + '采集参考指纹','','primary') + button('import',icon('upload') + '导入指纹') + button('reload-references','刷新')})}${s.referenceError ? notice('参考库读取失败：' + s.referenceError,'warn') + button('retry-data','重新加载') : ''}<section class="fp-card"><div class="fp-section-head"><h2>${s.references.length ? `${s.references.length} 份参考指纹` : '还没有可信参考'}</h2><span class="fp-subtle">有效期策略：${s.catalog?.reference_max_age_days || 30} 天</span></div>${s.references.length ? `<div class="fp-reference-grid">${s.references.map(ref => { const health = referenceHealth(ref), p = protocolOf(ref); return `<article class="fp-reference-card"><div class="fp-reference-title"><div>${icon('fingerprint')}<h3>${html(ref.name || '未命名参考')}</h3></div><span class="fp-status ${health.tone}">${html(health.text)}</span></div><p>${html(ref.endpoint?.model || '模型未记录')}</p><dl><div><dt>采集时间</dt><dd>${html(date(ref.collected_at))}</dd></div><div><dt>协议</dt><dd class="fp-code">${html(p.id ? p.id.slice(0,16) + '…' : '外部协议／未知')}</dd></div><div><dt>来源</dt><dd>${html(ref.source_note || '未声明')}</dd></div></dl><div class="fp-reference-actions">${button('reference-detail','查看详情',`data-fp-id="${html(ref.id)}"`)}${button('create-from-reference','用此参考采集',`data-fp-id="${html(ref.id)}" ${health.usable ? '' : 'disabled'} title="${html(health.usable ? '沿用参考协议创建目标采集' : health.text)}"`)}<a class="btn fp-button" href="/fingerprint/references/${encodeURIComponent(ref.id)}/export" download>导出</a>${button('delete-reference','删除',`data-fp-id="${html(ref.id)}"`,'danger')}</div></article>`; }).join('')}</div>` : `<div class="fp-library-empty">${icon('fingerprint')}<h3>先为对照准备一份可追溯参考</h3><p>连接你确认可信的来源，选择一个模型，完整采集后自动保存到参考库。也可导入已有指纹文件。</p>${button('create-reference',icon('plus') + '采集参考指纹','','primary')}<p class="fp-subtle">外部文件会保留原协议状态；导入成功并不意味着可以直接对照。</p></div>`}</section><section class="fp-card fp-library-policy"><h2>参考不是永久基准</h2><p>协议变更、采样参数变化或参考过期时，需要重新采集。来源可信由用户声明，不能由一个模型名称自动证明。</p></section></div>`;
   }
   const adapterLabel = id => ({standard:'标准接口',deepseek:'DeepSeek（深度求索）：关闭思考',openrouter:'OpenRouter（模型聚合平台）',zhipu:'智谱',openai:'OpenAI（模型服务商）'})[id] || String(id || '未知');
   const presetCells = preset => Array.isArray(preset?.cells) ? preset.cells.length : Number(preset?.cells || 0);
@@ -623,7 +666,6 @@
     const action = el.dataset.fpAction, id = el.dataset.fpId;
     switch (action) {
       case 'view': s.view = el.dataset.fpView; ensureData(); render(); break;
-      case 'select': select(id); break;
       case 'create-reference': openCreate('reference'); break;
       case 'fetch-models': discoverModels(); break;
       case 'model-input-mode': setModelInputMode(el.dataset.fpModelMode); break;
@@ -632,7 +674,6 @@
       case 'retry-data': ensureData(true); break;
       case 'retry-detail': loadDetail(true); break;
       case 'reload-references': loadReferences(); break;
-      case 'tab': setTab(el.dataset.fpTab); break;
       case 'stop': stop(id,el); break;
       case 'toggle-key': { const key = $('fpKey'), show = key.type === 'password'; key.type = show ? 'text' : 'password'; el.textContent = show ? '隐藏' : '显示'; el.setAttribute('aria-label',show ? '隐藏接口密钥' : '显示接口密钥'); el.setAttribute('aria-pressed',String(show)); break; }
       case 'reload-samples': loadSamples(s.sampleOffset); break;
@@ -683,11 +724,6 @@
       }
       return;
     }
-    const tab = event.target.closest?.('.fp-tab');
-    if (tab && ['ArrowLeft','ArrowRight','Home','End'].includes(event.key)) {
-      event.preventDefault(); const index = TABS.findIndex(t => t[0] === tab.dataset.fpTab), next = event.key === 'Home' ? 0 : event.key === 'End' ? TABS.length - 1 : (index + (event.key === 'ArrowRight' ? 1 : -1) + TABS.length) % TABS.length;
-      setTab(TABS[next][0]); document.querySelector(`.fp-tab[data-fp-tab="${TABS[next][0]}"]`)?.focus();
-    }
   }
-  window.FingerprintUI = Object.freeze({init,setRuns,updateChrome,render,openCreate,closeCreate,hide,onAuthLost});
+  window.FingerprintUI = Object.freeze({init,setRuns,updateChrome,render,openCreate,closeCreate,hide,onAuthLost,select,setTab});
 })();

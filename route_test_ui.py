@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""网关黑盒压测工作台。启动后访问 http://127.0.0.1:8666。"""
+"""网关黑盒压测工作台。默认访问 http://127.0.0.1:8666；监听地址与端口见 ROUTE_TEST_HOST / ROUTE_TEST_PORT。"""
 from __future__ import annotations
 
 import asyncio
@@ -13,7 +13,9 @@ import os
 import traceback
 import hashlib
 import hmac
+import ipaddress
 import secrets
+import signal
 from http.cookies import SimpleCookie
 import threading
 import time
@@ -107,6 +109,8 @@ def require_risk_confirmation(cfg, body, *, kind="run"):
 
 
 PORT = int(os.environ.get("ROUTE_TEST_PORT", "8666"))
+# 默认只监听本机；部署到服务器时设为 0.0.0.0 或内网地址，并先完成管理员初始化。
+HOST = os.environ.get("ROUTE_TEST_HOST", "127.0.0.1").strip() or "127.0.0.1"
 BASE_DIR = str(DATA_DIR)
 TASKS_FILE = os.path.join(BASE_DIR, "tasks.json")
 HISTORY_FILE = os.path.join(BASE_DIR, "task_index.json")
@@ -216,16 +220,58 @@ def _session_headers(token=None, clear=False):
     return {"Set-Cookie": f"{SESSION_COOKIE}={token}; Path=/; Max-Age=604800; HttpOnly; SameSite=Strict{secure}"}
 
 
-def _login_rate_key(handler):
-    return str(getattr(handler, "client_address", ("unknown",))[0])
+def _trusted_proxies():
+    """反向代理地址清单。只有来自这些地址的连接，才采信 X-Forwarded-For。"""
+    raw = os.environ.get("ROUTE_TEST_TRUSTED_PROXIES", "")
+    return {item.strip() for item in raw.split(",") if item.strip()}
 
 
 def _client_ip(handler):
-    """审计记录里的来源地址：只记 IP，不记端口，避免把临时端口当线索。"""
+    """真实来源 IP：直连取连接地址；经受信代理时取转发链最右侧的非代理地址。
+
+    只记 IP 不记端口。未配置受信代理时一律忽略转发头，防止客户端伪造来源。
+    """
     try:
-        return str(handler.client_address[0])
+        peer = str(handler.client_address[0])
     except (AttributeError, IndexError, TypeError):
         return "unknown"
+    proxies = _trusted_proxies()
+    if peer not in proxies:
+        return peer
+    headers = getattr(handler, "headers", None)
+    forwarded = headers.get("X-Forwarded-For", "") if headers is not None else ""
+    for hop in reversed([item.strip() for item in forwarded.split(",") if item.strip()]):
+        if hop not in proxies:
+            return hop
+    return peer
+
+
+def _login_rate_key(handler):
+    return _client_ip(handler)
+
+
+def _is_loopback_client(handler):
+    try:
+        return ipaddress.ip_address(_client_ip(handler)).is_loopback
+    except ValueError:
+        return False
+
+
+def create_initial_admin(username, password):
+    """创建第一个管理员；已有账号时拒绝。网页初始化与命令行工具共用同一套校验。"""
+    username = str(username or "").strip()
+    password = str(password or "")
+    if len(username) < 3 or len(username) > 40:
+        raise ValueError("管理员账号长度应为 3 到 40 个字符")
+    if len(password) < 8:
+        raise ValueError("管理员密码至少需要 8 个字符")
+    with AUTH_LOCK:
+        if not _auth_setup_required():
+            raise PermissionError("管理员账号已经初始化")
+        salt, digest = _password_hash(password)
+        account = {"username": username, "role": "admin", "salt": salt, "password_hash": digest, "enabled": True, "created_at": time.time()}
+        _write_accounts([account])
+    return account
 
 
 def _login_rate_status(handler, now=None):
@@ -648,6 +694,8 @@ class Task(ArtifactMixin):
     def _phase(self):
         if self.status == "finished":
             return f"已完成全部 {self.total} 条请求"
+        if self.status == "finished_with_errors":
+            return f"已结束 · 完成 {self.done} / {self.total} 条，部分请求失败"
         if self.status == "stopped":
             return f"已停止 · 完成 {self.done} / {self.total} 条"
         if self.status == "error":
@@ -2186,6 +2234,7 @@ class Handler(BaseHTTPRequestHandler):
             "/static/app.js": ("app.js", "text/javascript; charset=utf-8"),
             "/static/app.css": ("app.css", "text/css; charset=utf-8"),
             "/static/actions.js": ("actions.js", "text/javascript; charset=utf-8"),
+            "/static/ui-kit.js": ("ui-kit.js", "text/javascript; charset=utf-8"),
             "/assets/fingerprint.js": ("fingerprint.js", "text/javascript; charset=utf-8"),
             "/assets/fingerprint.css": ("fingerprint.css", "text/css; charset=utf-8"),
         }
@@ -2345,7 +2394,7 @@ class Handler(BaseHTTPRequestHandler):
         path = parsed.path
         if path == "/":
             return self._html()
-        if path in {"/assets/fingerprint.js", "/assets/fingerprint.css", "/static/app.js", "/static/app.css", "/static/actions.js", "/static/tokens.css"}:
+        if path in {"/assets/fingerprint.js", "/assets/fingerprint.css", "/static/app.js", "/static/app.css", "/static/actions.js", "/static/ui-kit.js", "/static/tokens.css"}:
             return self._asset(path)
         if path == "/auth/status":
             user = _current_user(self)
@@ -2576,15 +2625,15 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/auth/setup":
                 if not _auth_setup_required():
                     return self._json({"error": "管理员账号已经初始化"}, 409)
-                username = str(body.get("username") or "").strip()
-                password = str(body.get("password") or "")
-                if len(username) < 3 or len(username) > 40:
-                    raise ValueError("管理员账号长度应为 3 到 40 个字符")
-                if len(password) < 8:
-                    raise ValueError("管理员密码至少需要 8 个字符")
-                salt, digest = _password_hash(password)
-                account = {"username": username, "role": "admin", "salt": salt, "password_hash": digest, "enabled": True, "created_at": time.time()}
-                _write_accounts([account])
+                # 服务对外开放后，谁先打开页面谁就能抢注管理员；网页初始化只接受本机来源。
+                if not _is_loopback_client(self):
+                    self._audit("auth.setup_rejected", ok=False, detail=_client_ip(self))
+                    return self._json({"error": "首次初始化只能在服务器本机完成：请在服务器上运行 .venv/bin/python tools/create_admin.py"}, 403)
+                try:
+                    account = create_initial_admin(body.get("username"), body.get("password"))
+                except PermissionError:
+                    return self._json({"error": "管理员账号已经初始化"}, 409)
+                username = account["username"]
                 token = _new_session(username)
                 self._audit("auth.setup", target=username, detail="初始化管理员")
                 return self._json({"ok": True, "user": _public_account(account)}, headers=_session_headers(token))
@@ -2648,6 +2697,29 @@ class Handler(BaseHTTPRequestHandler):
                 _write_accounts(accounts + [account])
                 self._audit("account.create", target=username, detail=role)
                 return self._json({"ok": True, "account": _public_account(account)})
+            if path == "/routing-models":
+                # 路由对照的密钥只用于本次探测，不读写系统凭据或网关配置。
+                url = str(body.get("url") or "").strip()
+                key = str(body.get("api_key") or "").strip()
+                if not url or not key:
+                    raise ValueError("请填写该路由的网关地址和接口密钥")
+                parsed_url = urllib.parse.urlsplit(url)
+                if (parsed_url.scheme not in {"http", "https"} or not parsed_url.hostname
+                        or parsed_url.username is not None or parsed_url.password is not None
+                        or parsed_url.query or parsed_url.fragment
+                        or any(char.isspace() for char in url) or key in url):
+                    raise ValueError("网关地址须为有效的 HTTP（超文本传输协议）或 HTTPS（安全超文本传输协议）地址；密钥请填入独立字段")
+                try:
+                    result = fetch_models_detailed_sync(url, {"Authorization": f"Bearer {key}"}, timeout=30)
+                except (TimeoutError, asyncio.TimeoutError):
+                    return self._json({"error": "获取模型列表超时，请检查该路由的地址或稍后重试"}, 504)
+                if not result["ok"]:
+                    error = str(result.get("error") or "无法获取模型列表，请检查该路由的地址和密钥")
+                    for secret in (key, urllib.parse.quote(key, safe="")):
+                        error = error.replace(secret, "[密钥已隐藏]")
+                    return self._json({"ok": False, "models": [], "error": error}, 502)
+                models = [model for model in result["models"] if key not in model]
+                return self._json({"ok": True, "models": models})
             if path == "/models":
                 url = str(body.get("url") or "").strip()
                 key = str(body.get("api_key") or "").strip()
@@ -2926,6 +2998,8 @@ def _routing_history_snapshot(snapshot):
         "sides": {key: side(value) for key, value in (snapshot.get("sides") or {}).items()},
         # 报告整体保留：它是这条记录存在的理由，且本身不含密钥与正文。
         "report": snapshot.get("report"),
+        # 隔离标记不是密钥；保留它才能事后核对这次运行的缓存命中是否可能被外部预热。
+        "cache_isolation": snapshot.get("cache_isolation"),
         "limits": snapshot.get("limits"),
     }
 
@@ -3285,12 +3359,13 @@ def restore_history():
         persist_history()
 
 
-def fetch_models_detailed_sync(base, headers):
+def fetch_models_detailed_sync(base, headers, *, timeout=None):
     loop = asyncio.new_event_loop()
     try:
         async def runner():
             async with httpx.AsyncClient() as client:
-                return await fetch_models_detailed(client, base, headers)
+                request = fetch_models_detailed(client, base, headers)
+                return await asyncio.wait_for(request, timeout) if timeout is not None else await request
         return loop.run_until_complete(runner())
     finally:
         loop.close()
@@ -3309,8 +3384,13 @@ def main():
     threading.Thread(target=LOOP.run_forever, daemon=True, name="route-test-loop").start()
     restore_history()
     FINGERPRINTS.restore()
-    server = ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
-    print(f"网关与模型评测工作台 {APP_VERSION} 已启动：http://127.0.0.1:{PORT}")
+    server = ThreadingHTTPServer((HOST, PORT), Handler)
+    # systemd 停止服务发送 SIGTERM：转成正常关闭，保证下方收尾逻辑执行。
+    signal.signal(signal.SIGTERM, lambda *_: threading.Thread(target=server.shutdown, daemon=True).start())
+    shown = "127.0.0.1" if HOST in {"0.0.0.0", "::"} else HOST
+    print(f"网关与模型评测工作台 {APP_VERSION} 已启动：http://{shown}:{PORT}（监听 {HOST}）", flush=True)
+    if HOST not in {"127.0.0.1", "::1", "localhost"} and _auth_setup_required():
+        print("尚未创建管理员：请先在服务器上运行 .venv/bin/python tools/create_admin.py", flush=True)
     try:
         server.serve_forever()
     except KeyboardInterrupt:

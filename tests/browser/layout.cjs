@@ -57,7 +57,7 @@ async function screenshot(page,name){await page.screenshot({path:path.join(outpu
   await page.locator('#gatewayList .task').first().click();await page.waitForFunction(()=>!refreshing);
   await page.locator('#detail .overview-shell').waitFor();
   const single=await bounds(page,'.overview-shell');
-  await sameEdges(page,'#detail>.cards',single);
+  await sameEdges(page,'#detail>.cards,#detail>.report-head',single);
   const headingSingle=await bounds(page,'#recordTitle'),createSingle=await bounds(page,'#recordCreateButton');
   await checkOverflow(page,'.layout,.main,#detail');
   if([1920,768,390].includes(width))await screenshot(page,`single-${width}`);
@@ -66,8 +66,8 @@ async function screenshot(page,name){await page.screenshot({path:path.join(outpu
   near(headingSingle.left,headingCompare.left,'record heading left');near(headingSingle.width,headingCompare.width,'record heading width');
   near(createSingle.left,createCompare.left,'create button left');near(createSingle.width,createCompare.width,'create button width');
   await page.locator('#gatewayList .task').first().click();await page.waitForFunction(()=>!refreshing);
-  await page.locator('.report-head').waitFor();
-  const comparison=await bounds(page,'.report-head');
+  await page.locator('#modulePlaceholder .report-head').waitFor();
+  const comparison=await bounds(page,'#modulePlaceholder .report-head');
   near(single.left,comparison.left,'single vs comparison left');near(single.right,comparison.right,'single vs comparison right');
   assert.equal(single.paddingLeft,comparison.paddingLeft,'shared card padding');assert.equal(single.shadow,comparison.shadow,'shared shadow');
   await sameEdges(page,'.report-shell>.report-section,.report-shell>.report-overview,.report-shell>.report-tabs',single);
@@ -88,14 +88,14 @@ async function screenshot(page,name){await page.screenshot({path:path.join(outpu
    if(tab==='基准组'&&[1920,390].includes(width))await screenshot(page,`group-${width}`);
   }
   await page.getByRole('tab',{name:/^对比组/}).focus();await page.keyboard.press('Home');
-  assert.equal(await page.locator('.report-tab.active').innerText(),'结论报告','keyboard report navigation');
+  assert.equal(await page.locator('#modulePlaceholder .report-tab.active').innerText(),'对照结论','keyboard report navigation');
   await page.evaluate(()=>refresh());
-  const refreshed=await bounds(page,'.report-head');near(refreshed.width,single.width,'width after refresh');
+  const refreshed=await bounds(page,'#modulePlaceholder .report-head');near(refreshed.width,single.width,'width after refresh');
   const completedComparison=fixture.comparisons[0];
   fixture.comparisons[0]={...completedComparison,status:'running',completed_requests:5,planned_requests:20,current_group_name:'40 并发基准'};
   await page.evaluate(()=>refresh());
   assert.equal((await page.locator('.report-progress-line strong').innerText()).trim(),'25%','live request progress');
-  await sameEdges(page,'.report-head,.report-overview',single);
+  await sameEdges(page,'#modulePlaceholder .report-head,.report-overview',single);
   await checkOverflow(page,'.main,.report-head,.report-overview');
   if(width===1920)await screenshot(page,'running-1920');
   fixture.comparisons[0]=completedComparison;await page.evaluate(()=>refresh());
@@ -103,7 +103,7 @@ async function screenshot(page,name){await page.screenshot({path:path.join(outpu
   await page.locator('[data-module="quality"]').click();
   await page.locator('#qualitySubnav [data-view="compare"]').click();
   await page.locator('#qualityList .task').first().click();
-  const quality=await bounds(page,'.report-head');near(quality.left,single.left,'quality left');near(quality.right,single.right,'quality right');
+  const quality=await bounds(page,'#modulePlaceholder .report-head');near(quality.left,single.left,'quality left');near(quality.right,single.right,'quality right');
   await checkOverflow(page,'.main,.report-shell,.report-head,.report-section');
   if(width===1920)await screenshot(page,'quality-1920');
   // All creation flows remain right-aligned, full height, no horizontal overflow.

@@ -58,6 +58,15 @@ class HistorySnapshotTests(unittest.TestCase):
         self.assertEqual(safe["report"]["cache"]["delta_pct"], -12.0)
         self.assertEqual(safe["tier"], 1000)
 
+    def test_cache_isolation_survives_restart(self):
+        """隔离标记留在索引里，重启后仍能核对这次运行是否做过缓存隔离。"""
+        scopes = {"scheme": routing_compare.CACHE_SCOPE_SCHEME, "baseline": "000000000001", "candidate": "000000000002"}
+        safe = ui._routing_history_snapshot(_snapshot(cache_isolation=scopes))
+        restored = routing_compare.RouteComparison.from_snapshot(safe)
+        self.assertEqual(restored.snap()["cache_isolation"], scopes)
+        legacy = routing_compare.RouteComparison.from_snapshot(_snapshot())
+        self.assertIsNone(legacy.snap()["cache_isolation"])
+
 
 class RestoreTests(unittest.TestCase):
     def tearDown(self):

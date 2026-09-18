@@ -25,7 +25,7 @@ async function geometry(page,width,label) {
   assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth>innerWidth+1),false,label+': page overflow');
   const duplicateIds = await page.locator('[id]').evaluateAll(nodes=>{const map={};for(const el of nodes)map[el.id]=(map[el.id]||0)+1;return Object.entries(map).filter(([,n])=>n>1)});
   assert.deepEqual(duplicateIds,[],label+': duplicate ids');
-  const overflow = await page.locator('.fp-workspace,.fp-card,.fp-page-head,#fingerprintDrawer,.fp-modal-dialog,.fp-form-grid').evaluateAll(nodes=>nodes.filter(n=>n.getClientRects().length&&n.scrollWidth>n.clientWidth+1).map(n=>({id:n.id,class:n.className,width:n.clientWidth,scroll:n.scrollWidth})));
+  const overflow = await page.locator('.fp-workspace,.fp-card,.report-head,.report-tabs,#fingerprintDrawer,.fp-modal-dialog,.fp-form-grid').evaluateAll(nodes=>nodes.filter(n=>n.getClientRects().length&&n.scrollWidth>n.clientWidth+1).map(n=>({id:n.id,class:n.className,width:n.clientWidth,scroll:n.scrollWidth})));
   assert.deepEqual(overflow,[],label+': component overflow');
   if(await page.locator('#fingerprintDrawer').evaluate(n=>n.classList.contains('mobile-open'))) {
     await page.waitForFunction(()=>Math.abs(document.getElementById('fingerprintDrawer').getBoundingClientRect().right-innerWidth)<1);
@@ -139,12 +139,12 @@ async function fillEndpoint(page,name='合成通道自检') {
       await page.locator('[data-fp-action="stop"]').click();
       await page.getByRole('heading',{name:'已形成指纹证据'}).waitFor();
       await geometry(page,width,'overview '+width);
-      await page.locator('[data-fp-tab="diagnostics"]').click();
+      await page.getByRole('tab',{name:'通道诊断',exact:true}).click();
       assert.match(await page.locator('.fp-cost').innerText(),/未知/,'missing cost stays unknown');
-      await page.locator('[data-fp-tab="protocol"]').click();
+      await page.getByRole('tab',{name:'协议与来源',exact:true}).click();
       assert.match(await page.locator('#fpTabPanel').innerText(),/冻结协议快照/);
       samplesFail=true;
-      await page.locator('[data-fp-tab="samples"]').click();
+      await page.getByRole('tab',{name:'原始样本',exact:true}).click();
       await page.getByText('样本读取失败：合成样本读取失败').waitFor();
       await page.getByRole('button',{name:'重新加载样本'}).click();
       await page.waitForFunction(()=>document.querySelector('.fp-pagination')?.textContent.includes('1–50'));
@@ -161,7 +161,7 @@ async function fillEndpoint(page,name='合成通道自检') {
       await page.getByRole('heading',{name:'行为分布相近',exact:true}).waitFor();
       assert.equal(compareCount,1);
       assert.equal(allSubmissions.filter(s=>s.width===width).length,1,'offline comparison adds zero upstream runs');
-      await page.locator('[data-fp-tab="distribution"]').click();
+      await page.getByRole('tab',{name:'回答分布',exact:true}).click();
       await page.waitForFunction(()=>document.querySelector('.fp-legend')?.textContent.includes('参考指纹'));
       await page.locator('.fp-distribution summary').first().click();
       assert.equal(await page.locator('.fp-bar-track.reference').count()>0,true,'offline comparison uses comparison.reference_id');

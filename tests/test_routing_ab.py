@@ -169,6 +169,54 @@ class CacheRateTests(unittest.TestCase):
         self.assertIn("排除", outcome["note"])
 
 
+class CacheContaminationTests(unittest.TestCase):
+    """段首请求没有先行者：它的命中要么是同段抢跑，要么是实验之外的预热。"""
+
+    @staticmethod
+    def _side(first_hits, first_total=10, rest_hits=90, sibling_delay_ms=500, ttft_ms=100):
+        """每段 1 条段首 + 若干同段请求；同段请求在段首发出 sibling_delay_ms 后才发出。"""
+        records = []
+        for burst in range(first_total):
+            start = burst * 10_000
+            records.append({"burst_first": True, "step_index": burst, "ts": start, "ttft_ms": ttft_ms,
+                            "cached_tokens": 512 if burst < first_hits else 0})
+            records += [{"burst_first": False, "step_index": burst, "ts": start + sibling_delay_ms + i,
+                         "cached_tokens": 512 if burst * 10 + i < rest_hits else 0} for i in range(10)]
+        return records
+
+    def test_clean_cold_start_keeps_attribution(self):
+        outcome = ab.compare_cache(self._side(0), self._side(0, rest_hits=10))
+        self.assertFalse(outcome["contamination_suspected"])
+        self.assertEqual(outcome["cold_start"]["baseline"],
+                         {"hits": 0, "raced": 0, "unexplained": 0, "eligible": 10, "pct": 0.0})
+        self.assertEqual(outcome["attribution"], ab.ATTRIBUTION_OK)
+
+    def test_unexplained_burst_first_hits_downgrade_attribution(self):
+        outcome = ab.compare_cache(self._side(0), self._side(4, rest_hits=10))
+        self.assertTrue(outcome["contamination_suspected"])
+        self.assertEqual(outcome["cold_start"]["candidate"]["unexplained"], 4)
+        self.assertEqual(outcome["attribution"], ab.ATTRIBUTION_WEAK)
+        self.assertIn("智能路由 4/10", outcome["note"])
+
+    def test_in_run_race_is_not_contamination(self):
+        """同段请求在段首拿到首字前就已发出时，段首命中可能是本侧抢跑，不能算外部预热。"""
+        outcome = ab.compare_cache(self._side(0), self._side(10, sibling_delay_ms=1, rest_hits=10))
+        self.assertEqual(outcome["cold_start"]["candidate"]["raced"], 10)
+        self.assertEqual(outcome["cold_start"]["candidate"]["unexplained"], 0)
+        self.assertFalse(outcome["contamination_suspected"])
+        self.assertEqual(outcome["attribution"], ab.ATTRIBUTION_OK)
+
+    def test_single_unexplained_hit_is_tolerated(self):
+        outcome = ab.compare_cache(self._side(1), self._side(0, rest_hits=10))
+        self.assertFalse(outcome["contamination_suspected"])
+
+    def test_legacy_records_without_marker_are_not_judged(self):
+        outcome = ab.compare_cache([{"cached_tokens": 512}] * 5, [{"cached_tokens": 0}] * 5)
+        self.assertEqual(outcome["cold_start"]["baseline"]["eligible"], 0)
+        self.assertIsNone(outcome["cold_start"]["baseline"]["pct"])
+        self.assertFalse(outcome["contamination_suspected"])
+
+
 class LatencyTests(unittest.TestCase):
     def test_percentile_matches_linear_interpolation(self):
         self.assertAlmostEqual(ab.percentile([1, 2, 3, 4, 5, 6, 7, 8, 9, 10], .95), 9.55, places=3)
