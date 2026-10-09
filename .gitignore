@@ -10,6 +10,7 @@ task_index.json
 accounts.json
 quality_run_*.jsonl
 artifacts/
+backups/
 quality_run_*.json
 
 # Runtime state produced by the service (never commit)
@@ -19,6 +20,7 @@ audit.db
 audit.db-shm
 audit.db-wal
 test_templates.json
+connections.json
 
 # Behavioral fingerprint evidence stays local
 fingerprint_data/

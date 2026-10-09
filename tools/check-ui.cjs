@@ -15,7 +15,7 @@ const stripComments = css => css.replace(/\/\*[\s\S]*?\*\//g, '');
 /* ---- Registries: adding a stylesheet or script is a deliberate, reviewed decision. ---- */
 const TOKENS = 'static/tokens.css';
 const COMPONENT_CSS = ['static/app.css', 'static/fingerprint.css'];
-const SCRIPTS = ['static/ui-kit.js', 'static/app.js', 'static/actions.js', 'static/fingerprint.js'];
+const SCRIPTS = ['static/ui-kit.js', 'static/app.js', 'static/actions.js', 'static/fingerprint.js', 'static/connections.js', 'static/repeat.js'];
 const MARKUP = ['static/index.html', ...SCRIPTS];
 const DOC = 'docs/design-system.md';
 const GALLERY = 'docs/design-system/gallery.html';

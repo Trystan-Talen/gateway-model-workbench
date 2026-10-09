@@ -172,12 +172,17 @@ class DataMigrationTests(unittest.TestCase):
             (source/'run_example.jsonl').write_bytes(b'{"response":"synthetic"}\n')
             (source/'results').mkdir();(source/'results'/'routing-demo.jsonl').write_text('{}\n')
             (source/'accounts.json').write_text('[]')
+            connection_bytes = b'[{"id":"synthetic-connection","name":"daily","url":"https://synthetic.invalid/v1","updated_at":1}]'
+            (source/'connections.json').write_bytes(connection_bytes)
             destination=source/'data'
             result=migrate(source,destination)
-            self.assertEqual(result['files'],3)
+            self.assertEqual(result['files'],4)
             self.assertEqual((source/'run_example.jsonl').read_bytes(),(destination/'run_example.jsonl').read_bytes())
             self.assertTrue((destination/'.migrated-from-root').exists())
             self.assertEqual((destination/'accounts.json').stat().st_mode&0o777,0o600)
+            self.assertEqual((destination/'connections.json').read_bytes(),connection_bytes)
+            self.assertEqual((source/'connections.json').read_bytes(),connection_bytes)
+            self.assertEqual((destination/'connections.json').stat().st_mode&0o777,0o600)
             with self.assertRaises(ValueError):migrate(source,destination)
 
     def test_conflict_never_overwrites_existing_data_or_activates_destination(self):

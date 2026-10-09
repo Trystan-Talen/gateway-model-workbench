@@ -1,34 +1,15 @@
 /** Login-focus regression using an isolated backend; never calls a real upstream. */
 const { chromium } = require('playwright');
 const assert = require('node:assert/strict');
-const fs = require('fs');
-const os = require('os');
-const path = require('path');
-const { spawn } = require('child_process');
-
-const output = fs.mkdtempSync(path.join(os.tmpdir(), 'route-auth-focus-'));
+const artifacts = require('./artifacts.cjs').browserArtifacts('auth_focus');
+const {output} = artifacts;
+const servers = require('./server.cjs').browserServers(artifacts);
 const username = 'focus-regression';
 const password = 'local-focus-888@';
-let server, browser;
-
-async function start() {
-  server = spawn(process.env.PYTHON||'python3', ['-u', path.join(__dirname, 'workflow_server.py'), output]);
-  server.stderr.on('data', data => fs.appendFileSync(path.join(output, 'server.log'), data));
-  return new Promise((resolve, reject) => {
-    let text = '';
-    server.stdout.on('data', data => {
-      text += data;
-      if (text.includes('\n')) {
-        try { resolve(JSON.parse(text.split('\n')[0])); } catch (error) { reject(error); }
-      }
-    });
-    server.on('error', reject);
-    server.on('exit', code => reject(new Error('server exited: ' + code)));
-  });
-}
+let browser;
 
 (async () => {
-  const { base } = await start();
+  const { base } = await servers.start();
   browser = await chromium.launch({
     headless: true,
     executablePath: process.env.BROWSER_PATH || process.env.CHROME_PATH || undefined,
@@ -144,4 +125,4 @@ async function start() {
     passwordVisibility: true, keyboardNavigation: true, loginRetry: true, resumedPolling: true,
     deferredFocus: true, staleResponseIgnored: true, failedBootStopsPolling: true, pageErrors: errors, output }, null, 2));
 })().catch(error => { console.error(error); process.exitCode = 1; })
-  .finally(async () => { if (browser) await browser.close(); if (server) server.kill('SIGTERM'); });
+  .finally(async () => { try { if (browser) await browser.close(); } finally { await servers.close(); } });

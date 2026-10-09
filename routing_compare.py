@@ -24,9 +24,12 @@
 一致：JSONL（逐行 JSON）逐条追加，权限 0600。
 """
 import asyncio
+import copy
 from app_paths import DATA_DIR
 import json
+import math
 import os
+import re
 import secrets
 import threading
 import time
@@ -36,7 +39,7 @@ import httpx
 
 import routing_ab
 import routing_corpus
-from smart_route_load import CHAT_PATH, do_request
+from smart_route_load import CHAT_PATH, USAGE_RETRY_POLICY, do_request, should_retry_without_usage
 
 
 def _now():
@@ -60,6 +63,83 @@ def result_paths(run_id):
 
 def _duration(steps):
     return sum(step["duration"] for step in steps)
+
+
+_REQUEST_SIDES = ("baseline", "candidate")
+_FAILURE_REASONS = {
+    "TIMEOUT": "请求超时", "NETWORK": "网络连接失败", "PROTOCOL": "响应不完整或协议异常",
+    "HTTP_429": "请求被限流", "HTTP_5XX": "上游服务错误", "HTTP_4XX": "请求被拒绝",
+    "HTTP_OTHER": "非成功状态码", "UNKNOWN": "失败原因不可得",
+}
+
+
+def _safe_number(value, integer=False):
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    try:
+        finite = math.isfinite(value)
+    except OverflowError:
+        return None
+    if not finite or value < 0 or (integer and int(value) != value):
+        return None
+    return int(value) if integer else value
+
+
+def public_request_record(record):
+    """逐条接口的字段和值白名单；正文和异常原文不能进入响应或缓存。"""
+    status = record.get("status_code")
+    if isinstance(status, bool) or not isinstance(status, int) or not 100 <= status <= 599:
+        status = None
+    completed = record.get("completed") is True
+    outcome = {"status_code": status, "completed": completed}
+    if isinstance(record.get("ok"), bool):
+        outcome["ok"] = record["ok"]
+    elif isinstance(record.get("class") or record.get("cls"), str):
+        # 仅用类别判断成功，不回显可能混入异常原文的任意类别字符串。
+        outcome["ok"] = (record.get("class") or record.get("cls")) == "ok"
+    ok = routing_ab._record_ok(outcome)
+    error_type = None
+    if not ok:
+        candidate = record.get("error_type")
+        if isinstance(candidate, str) and candidate in _FAILURE_REASONS:
+            error_type = candidate
+        elif status is not None and 200 <= status < 300:
+            error_type = "PROTOCOL"
+        elif status == 408:
+            error_type = "TIMEOUT"
+        elif status == 429:
+            error_type = "HTTP_429"
+        elif status is not None and status >= 500:
+            error_type = "HTTP_5XX"
+        elif status is not None and status >= 400:
+            error_type = "HTTP_4XX"
+        elif status is not None:
+            error_type = "HTTP_OTHER"
+        else:
+            error_type = "UNKNOWN"
+    index = routing_ab.request_index(record)
+    item_id = record.get("item_id")
+    item_id = item_id if isinstance(item_id, str) and re.fullmatch(r"routing-ab-v\d+-\d{6,}", item_id) else None
+    result = {
+        "index": index, "request_index": index, "sequence": index + 1 if index is not None else None,
+        "item_id": item_id, "status_code": status, "completed": completed, "ok": ok,
+        "error_type": error_type, "reason": "完整成功响应" if ok else _FAILURE_REASONS[error_type],
+        "ttft_ms": _safe_number(record.get("ttft_ms")),
+        "total_ms": _safe_number(record.get("total_ms")),
+        "usage_seen": record.get("usage_seen") is True,
+        "usage_source": record.get("usage_source") if record.get("usage_source") in ("stream", "body") else None,
+        "usage_level": record.get("usage_level") if record.get("usage_level") in ("NONE", "HIT_ONLY", "FULL") else None,
+        "cache_hit": record.get("cache_hit") if isinstance(record.get("cache_hit"), bool) else None,
+        "burst_first": record.get("burst_first") if isinstance(record.get("burst_first"), bool) else None,
+    }
+    for key in ("prompt_tokens", "cached_tokens", "completion_tokens", "total_tokens"):
+        result[key] = _safe_number(record.get(key), integer=True)
+    return result
+
+
+def _file_signature(path):
+    info = os.stat(path)
+    return info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns
 
 
 def validate_tier(tier):
@@ -140,6 +220,7 @@ class RouteComparison:
         self.id = uuid.uuid4().hex[:12]
         self.name = config["name"]
         self.config = config
+        self.repeat_corpus = routing_corpus.corpus_manifest(config["tier"])
         self.status = "draft"
         self.created = _now()
         self.started_at = None
@@ -160,7 +241,13 @@ class RouteComparison:
         self.out_paths = {"baseline": None, "candidate": None}
         self._files = {}
         self._report = None
+        self._live_report = None
+        self._live_report_key = None
+        self._request_cache = {}
+        self._history_derived_report = None
+        self._history_derived_key = None
         self.history_only = False
+        self.retry_policy = USAGE_RETRY_POLICY
         self.cache_scopes = new_cache_scopes()
 
     # ---- 历史恢复 ---------------------------------------------------------
@@ -169,19 +256,20 @@ class RouteComparison:
     def from_snapshot(cls, snapshot):
         """从历史索引里的一条摘要重建只读记录，绝不自动继续执行。
 
-        索引里没有密钥（也从没有过），所以恢复出来的记录只能看报告，
-        不能重跑；中断过的状态一律降级为 error，避免界面上看起来还在跑。
+        索引不保存密钥，恢复后的原记录保持只读。完整冻结参数配合当前可用
+        凭据，可由复测接口创建独立记录；中断状态降为 error，不恢复旧执行。
         """
         run = cls.__new__(cls)
         run.id = str(snapshot.get("id") or uuid.uuid4().hex[:12])
         run.name = str(snapshot.get("name") or "历史路由对照")
-        # 索引只存每个侧面的公开字段，执行器要的调度字段（并发、超时…）并没有存；
-        # 这里补齐成执行器预期的最小形状，快照才能照常渲染。缺的字段一律 None，
-        # 界面显示为「—」，绝不假装成某个默认值。
+        run.repeat_corpus = copy.deepcopy(snapshot.get("corpus"))
+        # 新索引保存完整公开 repeat_config；旧索引只存各侧摘要。旧记录缺少的
+        # 调度字段用 None 保持报告可读，界面显示「—」，复测不会猜测默认值。
         concurrency = snapshot.get("concurrency") or {}
-        run.config = {"tier": snapshot.get("tier"), "rpm": snapshot.get("rpm"), "name": run.name}
+        frozen = snapshot.get("repeat_config")
+        run.config = copy.deepcopy(frozen) if isinstance(frozen, dict) else {"tier": snapshot.get("tier"), "rpm": snapshot.get("rpm"), "name": run.name}
         for side in ("baseline", "candidate"):
-            stored = dict((snapshot.get("sides") or {}).get(side) or {})
+            stored = dict(run.config.get(side) or (snapshot.get("sides") or {}).get(side) or {})
             stored.pop("out_path", None)
             stored.setdefault("concurrency", concurrency.get(side) if isinstance(concurrency, dict) else None)
             stored.setdefault("name", side)
@@ -211,7 +299,14 @@ class RouteComparison:
         run.out_paths = result_paths(run.id)
         run._files = {}
         run._report = snapshot.get("report")
+        run._live_report = None
+        run._live_report_key = None
+        run._request_cache = {}
+        run._history_derived_report = None
+        run._history_derived_key = None
         run.history_only = True
+        # 旧记录没有重试协议版本，保持未知，不能冒充新协议执行结果。
+        run.retry_policy = snapshot.get("retry_policy")
         # 旧版本记录没有隔离标记：保持 None，界面据此提示「这次运行未做缓存隔离」。
         scopes = snapshot.get("cache_isolation")
         run.cache_scopes = dict(scopes) if isinstance(scopes, dict) else None
@@ -270,11 +365,12 @@ class RouteComparison:
             return value
 
         clean = {key: clean_value(result.get(key)) for key in (
-            "schema_version", "ts", "item_id", "mode", "profile", "step_index",
+            "schema_version", "ts", "item_id", "index", "mode", "profile", "step_index",
             "status_code", "completed", "error_type", "error_detail", "ttft_ms",
             "total_ms", "reason", "usage_seen", "usage_source", "usage_level",
             "prompt_tokens", "cached_tokens", "completion_tokens", "total_tokens",
             "cache_hit", "burst_first")}
+        clean["index"] = routing_ab.request_index(result)
         clean["route_side"] = side
         stored = dict(clean)
         if self.config[side].get("capture_raw"):
@@ -314,11 +410,9 @@ class RouteComparison:
                         client, job, payload, headers, timeout_cfg,
                         chat_url=cfg["chat_url"], include_usage=include_usage,
                         capture_raw=bool(cfg.get("capture_raw")))
-                    # 网关不认 stream_options.include_usage 时通常直接 400；
-                    # 降级为不带 usage 重试一次，避免把兼容性差异记成请求失败。
-                    if not self._stop_event.is_set() and include_usage \
-                            and 400 <= (result.get("status_code") or 0) < 500 \
-                            and not result.get("usage_seen"):
+                    # 只在明确拒绝 usage 参数时重试，避免限流后再次请求放大压力。
+                    if not self._stop_event.is_set() \
+                            and should_retry_without_usage(result, include_usage, cfg["stream"]):
                         cfg["include_usage"] = False
                         result = await do_request(
                             client, job, payload, headers, timeout_cfg,
@@ -326,6 +420,7 @@ class RouteComparison:
                             capture_raw=bool(cfg.get("capture_raw")))
                     # 段首请求在本侧、本次运行里没有任何先行者，理应未命中；
                     # 报告用它检测「实验之外的缓存预热」。
+                    result["index"] = item["index"]
                     result["burst_first"] = item["index"] % max(1, int(item.get("burst_size") or 1)) == 0
                     self._record(side, result)
                     with self.lock:
@@ -438,6 +533,7 @@ class RouteComparison:
                 try:
                     self._report = routing_ab.build_comparison(
                         self.records["baseline"], self.records["candidate"])
+                    self._report.setdefault("method", {})["usage_retry_policy"] = self.retry_policy
                 except Exception as exc:
                     self.status = "error"
                     self.error = self.error or clean_error(exc)
@@ -450,11 +546,119 @@ class RouteComparison:
 
     # ---- 对外快照 ---------------------------------------------------------
 
+    def _request_rows(self, side):
+        """缓存小摘要，历史文件变化时重新读取；不缓存正文或异常原文。"""
+        with self.lock:
+            if not self.history_only:
+                key = ("memory", len(self.records[side]))
+                cached = self._request_cache.get(side)
+                if cached is not None and cached["key"] == key:
+                    return cached
+                rows = [public_request_record(record) for record in self.records[side]
+                        if isinstance(record, dict)]
+                cached = {"key": key, "rows": routing_ab.ordered_records(rows),
+                          "available": True, "reason": None, "invalid_lines": 0}
+                self._request_cache[side] = cached
+                return cached
+            path = result_paths(self.id)[side]
+            try:
+                key = ("file", *_file_signature(path))
+            except OSError:
+                cached = {"key": ("unavailable",), "rows": [], "available": False,
+                          "reason": "结果文件已删除或不可读，无法查看逐条请求。", "invalid_lines": 0}
+                self._request_cache[side] = cached
+                return cached
+            cached = self._request_cache.get(side)
+            if cached is not None and cached["key"] == key:
+                return cached
+            rows, invalid = [], 0
+            try:
+                with open(path, encoding="utf-8") as handle:
+                    for line in handle:
+                        if not line.strip():
+                            continue
+                        try:
+                            record = json.loads(line)
+                            if not isinstance(record, dict) or not isinstance(record.get("completed"), bool):
+                                raise ValueError("记录必须是对象")
+                            rows.append(public_request_record(record))
+                        except (ValueError, TypeError, OverflowError, RecursionError):
+                            invalid += 1
+                changed = key != ("file", *_file_signature(path))
+            except (OSError, UnicodeError):
+                cached = {"key": ("unreadable",), "rows": [], "available": False,
+                          "reason": "结果文件不可读，无法查看逐条请求。", "invalid_lines": 0}
+                self._request_cache[side] = cached
+                return cached
+            reason = f"已跳过 {invalid} 条损坏记录，列表只展示可读取的结果。" if invalid else None
+            if changed:
+                reason = "结果文件在读取时发生变化，下次刷新将重新读取。"
+            cached = {"key": None if changed else key, "rows": routing_ab.ordered_records(rows),
+                      "available": True, "reason": reason, "invalid_lines": invalid}
+            self._request_cache[side] = cached
+            return cached
+
+    def request_page(self, side="baseline", offset=0, limit=50):
+        """按清单顺序分页查看全部已返回结果，不调用全量报告快照。"""
+        if side not in _REQUEST_SIDES:
+            raise ValueError("路由侧必须是 baseline（固定路由）或 candidate（智能路由）")
+        if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
+            raise ValueError("请求列表起始位置必须是非负整数")
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 100:
+            raise ValueError("请求列表每页条数必须在 1 到 100 之间")
+        with self.lock:
+            cached = self._request_rows(side)
+            total = len(cached["rows"])
+            return {"run_id": self.id, "side": side, "offset": offset, "limit": limit,
+                    "total": total, "recorded_total": len(self.records[side]),
+                    "items": copy.deepcopy(cached["rows"][offset:offset + limit]),
+                    "has_more": offset + limit < total, "status": self.status,
+                    "available": cached["available"], "reason": cached["reason"],
+                    "invalid_lines": cached["invalid_lines"], "order": "request_index"}
+
+    def _derived_history_report(self):
+        """旧历史只增加独立的新统计，保留原报告及其当时的计算事实。"""
+        if not self.history_only or isinstance((self._report or {}).get("stability"), dict):
+            return None
+        cached = {side: self._request_rows(side) for side in _REQUEST_SIDES}
+        key = (self.status, self.total,
+               tuple((side, cached[side]["key"], len(self.records[side])) for side in _REQUEST_SIDES))
+        if self._history_derived_key != key or any(cached[side]["key"] is None for side in _REQUEST_SIDES):
+            stability = {"protocol": routing_ab.stability_protocol(), "source": "result_files"}
+            for side in _REQUEST_SIDES:
+                rows = cached[side]["rows"]
+                partial = (self.status != "finished" or not cached[side]["available"]
+                           or bool(cached[side]["invalid_lines"]) or cached[side]["key"] is None
+                           or len(rows) != len(self.records[side])
+                           or (self.total > 0 and len(rows) != self.total))
+                reason = cached[side]["reason"]
+                if not reason and partial:
+                    reason = "历史运行未取得全部计划结果，新增统计仅覆盖可读取的结果。"
+                stability[side] = {**routing_ab.sequence_stability(rows),
+                                   "available": cached[side]["available"], "partial": partial,
+                                   "reason": reason}
+            self._history_derived_report = {"stability": stability}
+            self._history_derived_key = key
+        return copy.deepcopy(self._history_derived_report)
+
     def snap(self):
         with self.lock:
             done = self.progress["done"]
             scheduled = self.progress["scheduled"]
             report = self._report
+            live_report = None
+            if not self.history_only:
+                partial = not (self.status == "finished" and self.total > 0
+                               and all(len(self.records[side]) == self.total
+                                       for side in ("baseline", "candidate")))
+                live_key = (len(self.records["baseline"]), len(self.records["candidate"]), partial)
+                if self._live_report_key != live_key:
+                    self._live_report = routing_ab.build_live_comparison(
+                        self.records["baseline"], self.records["candidate"])
+                    self._live_report.update({"partial": partial, "observed_at": _now()})
+                    self._live_report_key = live_key
+                # 小型聚合快照独立返回，调用方修改不会污染后续缓存。
+                live_report = copy.deepcopy(self._live_report)
             return {
                 "id": self.id,
                 "name": self.name,
@@ -467,7 +671,9 @@ class RouteComparison:
                             if self.started_at else 0),
                 "tier": self.config["tier"],
                 "config": {"capture_raw": bool(self.config["baseline"].get("capture_raw"))},
-                "corpus": routing_corpus.corpus_manifest(self.config["tier"]),
+                "repeat_config": {"name": self.name, "tier": self.config["tier"], "rpm": self.config.get("rpm"),
+                                  **{side: _public_side(self.config[side]) for side in ("baseline", "candidate")}},
+                "corpus": copy.deepcopy(self.repeat_corpus) if getattr(self, "repeat_corpus", None) else routing_corpus.corpus_manifest(self.config["tier"]),
                 "rpm": self.plan[0]["rpm"] if self.plan else None,
                 "concurrency": {side: self.config[side]["concurrency"]
                                 for side in ("baseline", "candidate")},
@@ -482,6 +688,9 @@ class RouteComparison:
                 "progress": {"done": done, "scheduled": scheduled, "total": self.total,
                              "pct": (done / (self.total * 2)) if self.total else 0},
                 "report": report,
+                "derived_report": self._derived_history_report(),
+                "live_report": live_report,
+                "retry_policy": self.retry_policy,
                 "cache_isolation": dict(self.cache_scopes) if self.cache_scopes else None,
                 "limits": self._limits(),
             }
@@ -571,6 +780,7 @@ def public_config(cfg):
         "name": cfg["name"],
         "tier": cfg["tier"],
         "rpm": cfg["rpm"],
+        "retry_policy": USAGE_RETRY_POLICY,
         "baseline": _public_side(cfg["baseline"]),
         "candidate": _public_side(cfg["candidate"]),
         "corpus": routing_corpus.corpus_manifest(cfg["tier"]),

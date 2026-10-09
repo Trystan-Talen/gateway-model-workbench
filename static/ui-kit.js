@@ -17,6 +17,7 @@
   const ICONS = Object.freeze({
     gateway: '<path d="M4 19V5M4 19h16M8 14l4-5 4 3 4-7"/>',
     routing: '<path d="M4 7h6l4 10h6"/><path d="M4 17h4l3-6"/><circle cx="18" cy="17" r="2"/>',
+    connections: '<rect x="3" y="4" width="18" height="16" rx="2"/><path d="M3 9h18M7 14h4M7 17h7"/><circle cx="17" cy="14" r="1.5"/>',
     quality: '<path d="M12 3l8 3v6c0 5-8 9-8 9s-8-4-8-9V6l8-3Z"/><path d="m8 12 3 3 5-6"/>',
     fingerprint: '<path d="M4 11a8 8 0 0 1 16 0v3M7 20c2-3 2-5 2-9a3 3 0 0 1 6 0c0 5-1 8-3 11M4 16c1-2 1-3 1-5M12 11c0 4 0 5-1 7M17 20c1-3 1-6 1-9a6 6 0 0 0-12 0"/>',
     plus: '<path d="M12 5v14M5 12h14"/>',
@@ -31,11 +32,13 @@
     activity: '<path d="M3 12h4l3-8 4 16 3-8h4"/>',
     database: '<ellipse cx="12" cy="6" rx="7.5" ry="3"/><path d="M4.5 6v6c0 1.7 3.4 3 7.5 3s7.5-1.3 7.5-3V6M4.5 12v6c0 1.7 3.4 3 7.5 3s7.5-1.3 7.5-3v-6"/>',
     eye: '<path d="M2.5 12s3.5-6 9.5-6 9.5 6 9.5 6-3.5 6-9.5 6-9.5-6-9.5-6Z"/><circle cx="12" cy="12" r="2.5"/>',
+    eyeOff: '<path d="m3 3 18 18M10.6 6.2A10.7 10.7 0 0 1 12 6c6 0 9.5 6 9.5 6a18 18 0 0 1-3.1 3.7M6.2 6.8C3.8 8.5 2.5 12 2.5 12s3.5 6 9.5 6c1.2 0 2.3-.2 3.3-.6"/>',
     arrowRight: '<path d="M5 12h14M13 6l6 6-6 6"/>'
   });
 
+  const HTML_ENTITIES = Object.freeze({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' });
   function esc(value) {
-    return String(value ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+    return String(value ?? '').replace(/[&<>"']/g, c => HTML_ENTITIES[c]);
   }
   function tone(value, fallback = 'neutral') { return TONES.includes(value) ? value : fallback; }
   function pct(value) { const n = Number(value); return Number.isFinite(n) ? Math.round(Math.max(0, Math.min(100, n))) : 0; }
@@ -95,9 +98,10 @@
   function pageShell(childrenHtml) { return `<div class="detail-layout report-shell">${childrenHtml}</div>`; }
   const STATUS_CLASS = { neutral: '', accent: '', success: 'good', warning: 'caution', danger: 'risk' };
   function pageHeader({ kicker, title, description = '', meta = [], statusLabel = '', statusNote = '', statusTone = 'neutral', actionsHtml = '' }) {
-    const side = statusLabel
+    const statusHtml = statusLabel
       ? `<div class="${cls('report-status', STATUS_CLASS[tone(statusTone)])}">${esc(statusLabel)}${statusNote ? `<br><small>${esc(statusNote)}</small>` : ''}</div>`
-      : actionsHtml ? `<div class="hero-actions">${actionsHtml}</div>` : '';
+      : '';
+    const side = actionsHtml ? `<div class="hero-actions">${actionsHtml}${statusHtml}</div>` : statusHtml;
     return `<header class="report-head"><div><div class="report-kicker">${esc(kicker)}</div><h1>${esc(title)}</h1>${description ? `<p>${esc(description)}</p>` : ''}${meta.length ? `<div class="report-meta">${meta.map(x => `<span>${esc(x)}</span>`).join('')}</div>` : ''}</div>${side}</header>`;
   }
   // items: [[id, label]]; the page's action receives (ownerId, tabId). Arrow/Home/End keys are handled globally.
@@ -141,6 +145,10 @@
     const extra = [min != null && ` min="${esc(min)}"`, max != null && ` max="${esc(max)}"`, step != null && ` step="${esc(step)}"`, describedBy && ` aria-describedby="${esc(describedBy)}"`].filter(Boolean).join('');
     return `<input class="input" id="${esc(id)}" type="${esc(type)}" value="${esc(value)}" placeholder="${esc(placeholder)}" autocomplete="${esc(autocomplete)}"${required ? ' required' : ''}${extra}>`;
   }
+  function passwordInput({ id, action = 'togglePasswordVisibility', args = [id], visibilityLabel = '密码', ...options }) {
+    const label = `显示${visibilityLabel}`;
+    return `<div class="password-field">${input({ ...options, id, type: 'password' })}<button class="password-toggle" type="button"${actionAttrs(action, args)} aria-controls="${esc(id)}" aria-pressed="false" aria-label="${esc(label)}" title="${esc(label)}">${icon('eye')}</button></div>`;
+  }
   function select({ id, options, value = '', required = false }) {
     return `<select class="input" id="${esc(id)}"${required ? ' required' : ''}>${options.map(([v, text]) => `<option value="${esc(v)}"${String(v) === String(value) ? ' selected' : ''}>${esc(text)}</option>`).join('')}</select>`;
   }
@@ -157,6 +165,6 @@
     recordItem, recordEmpty,
     pageShell, pageHeader, tabs, section, progressCard,
     metric, metrics, methodCards, steps, limitations, table,
-    formSectionTitle, field, input, select, inlineFields, switchRow, hint
+    formSectionTitle, field, input, passwordInput, select, inlineFields, switchRow, hint
   });
 })(typeof window !== 'undefined' ? window : globalThis);

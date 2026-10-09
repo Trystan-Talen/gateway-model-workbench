@@ -78,13 +78,16 @@ class CreationStateTests(unittest.TestCase):
         script = markup.scripts[0]
         names = ['isGatewayCreate', 'isQualityCreate', 'isRoutingCreate', 'isCompareCreate',
                  'setCreateKind', 'routingTierOptions', 'routingSideTemplate', 'renderRoutingFields',
-                 'setRoutingSide', 'updateRoutingSideStatus', 'readRoutingSide', 'readRouting',
+                 'setRoutingSide', 'updateRoutingSideStatus', 'routingHasSavedKey', 'readRoutingSide', 'readRouting',
+                 'connectionBindingNode', 'connectionFieldNodes', 'boundConnectionId', 'boundConnectionProfile',
+                 'savedConnectionPickerHtml',
                  'currentRoutingModel', 'resetRoutingModels', 'setRoutingModelMode',
                  'resetCreateForm', 'startNewTest', 'openCreateForContext',
                  'openGatewayCreate', 'openQualityCreate', 'openRoutingCreate']
         implementation = '\n'.join(self.function(script, name) for name in names)
         harness = r'''
 const assert=require('node:assert/strict');
+require(__UI_KIT__);const UI=globalThis.UI;
 const raw=__MARKUP__;
 const classes=node=>new Set(String(node.class||'').split(/\s+/).filter(Boolean));
 function node(attrs={}){
@@ -118,6 +121,8 @@ const document={
  querySelector(selector){const match=selector.match(/^\[data-routing-side="([^"]+)"\]$/);return match?panels.find(panel=>panel.dataset.routingSide===match[1])||null:null}
 };
 let routingModelRequestSeq=0;
+let routingSavedConnections={};const loadRoutingConnections=()=>{};
+let savedConnectionProfiles=[],savedConnectionsLoaded=false;const renderSavedConnectionPickers=()=>{};
 let createKind='gateway-single',activeModule='gateway',activeView='single',activeTemplateId=null;
 let preflightData=null,preflightAckRequested=false,preflightTimer=null,preflightSeq=0,templateCache=null;
 let routingCorpus=[{tier:1000,note:'合成测试集'}],lastRendered=null,drawerOpen=false;
@@ -150,6 +155,9 @@ for(const side of ['candidate','baseline','candidate']){
 }
 assert.equal(initial.baseline.model,'shared-model');assert.equal(initial.candidate.model,'shared-model');
 assert.equal(initial.baseline.api_key,'synthetic-baseline');assert.equal(initial.candidate.api_key,'synthetic-candidate');
+panels[0].dataset.connectionId='synthetic-profile-a';panels[1].dataset.connectionId='synthetic-profile-b';
+assert.equal(readRouting().baseline.connection_id,'synthetic-profile-a');assert.equal(readRouting().candidate.connection_id,'synthetic-profile-b');
+delete panels[0].dataset.connectionId;delete panels[1].dataset.connectionId;
 for(const key of ['model','concurrency','rpm','connect_timeout','read_timeout','capture_raw'])assert.equal(initial.baseline[key],initial.candidate[key]);
 renderRoutingFields();assert.deepEqual(readRouting(),initial,'corpus refresh must retain both sides');
 toggleConfig(false);openCreateForContext();assert.equal(drawerOpen,true);
@@ -159,7 +167,7 @@ for(const [module,view,kind] of [['gateway','single','gateway-single'],['gateway
  activeModule=module;activeView=view;openCreateForContext();assert.equal(createKind,kind);assert.equal(drawerOpen,true);
 }
 console.log(JSON.stringify({modes:5,contextEntries:5,routeSwitches:3,corpusRefresh:true,credentialsReset:true}));
-'''.replace('__MARKUP__', json.dumps(markup.nodes)).replace('__IMPLEMENTATION__', implementation)
+'''.replace('__MARKUP__', json.dumps(markup.nodes)).replace('__IMPLEMENTATION__', implementation).replace('__UI_KIT__', json.dumps(str(ui.CODE_DIR / 'static' / 'ui-kit.js')))
         result = subprocess.run([shutil.which('node')], input=harness,
                                 capture_output=True, text=True, timeout=20)
         self.assertEqual(0, result.returncode, result.stderr)

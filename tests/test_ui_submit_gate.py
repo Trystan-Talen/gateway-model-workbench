@@ -69,6 +69,8 @@ class SubmitGateTests(unittest.TestCase):
         script = self._script()
         parts = [
             # 真实实现：读取质量/路由表单 + 提交处理。
+            "function connectionBindingNode(context,target=''){" + self._body(script, "function connectionBindingNode(context,target=''){") + "}",
+            "function boundConnectionId(context,target=''){" + self._body(script, "function boundConnectionId(context,target=''){") + "}",
             "function readQuality(){" + self._body(script, "function readQuality(){") + "}",
             "function readRoutingSide(mode){" + self._body(script, "function readRoutingSide(mode){") + "}",
             "function currentRoutingModel(){" + self._body(script, "function currentRoutingModel(){") + "}",
@@ -83,23 +85,23 @@ class SubmitGateTests(unittest.TestCase):
         ]
         harness = (
             "const createKind=%s;\n"
-            "const __calls=[];const __nodes={};\n"
+            "const __calls=[];const __nodes={};const __errors=[];\n"
             "function __el(id){return __nodes[id]||(__nodes[id]={id,textContent:'',className:'',"
-            "value:'',hidden:false,disabled:false,type:'',checked:false,innerHTML:'',styles:{},"
+            "value:'',hidden:false,disabled:false,type:'',checked:false,innerHTML:'',styles:{},dataset:{},"
             "querySelector:()=>({value:''}),querySelectorAll:()=>[],"
             "closest:()=>({classList:{add(){},remove(){}}}),"
             "setAttribute(){},appendChild(){}});}\n"
             "function $(id){return __el(id)}\n"
-            "const QUALITY_ROWS=%s.map(r=>{const kv={'.quality-name':r.name,'.quality-url':r.url,"
+            "const QUALITY_ROWS=%s.map((r,index)=>{const kv={'.quality-name':r.name,'.quality-url':r.url,"
             "'.quality-key':r.api_key,'.quality-model':r.model};"
-            "return {querySelector:(sel)=>({value:kv[sel]??''})}});\n"
+            "return {dataset:{qualityIndex:String(index)},querySelector:(sel)=>({value:kv[sel]??''})}});\n"
             "const ROUTING_ROWS=Object.fromEntries(['baseline','candidate'].map((side,i)=>{"
             "const kv={'.routing-side-name':side,'.routing-side-url':'http://127.0.0.1:'+(9001+i)+'/v1',"
             "'.routing-side-key':'synthetic-'+side};"
-            "return [side,{querySelector:(sel)=>({value:kv[sel]??''})}]}));\n"
+            "return [side,{dataset:{routingSide:side},querySelector:(sel)=>({value:kv[sel]??''})}]}));\n"
             "const document={querySelectorAll:(sel)=>sel==='#qualityResourceFields .quality-resource'?QUALITY_ROWS:[],"
             "querySelector:sel=>sel.includes('data-routing-side')?ROUTING_ROWS[sel.includes('candidate')?'candidate':'baseline']:null,addEventListener(){}};\n"
-            "const esc=s=>String(s??'');const toast=()=>{};const nativeConfirm=()=>true;\n"
+            "const esc=s=>String(s??'');const toast=message=>{if($('formStatus').className==='form-status error')__errors.push(message)};const nativeConfirm=()=>true;\n"
             "const isQualityCreate=()=>createKind.startsWith('quality-');\n"
             "const isRoutingCreate=()=>createKind==='routing-compare';\n"
             "const isCompareCreate=()=>createKind.endsWith('-compare');\n"
@@ -124,7 +126,7 @@ class SubmitGateTests(unittest.TestCase):
             "return {quality_test_id:'x',task_id:'y',comparison_id:'z',routing_comparison_id:'r'}};\n"
             + "\n".join(parts) + "\n"
             "$('submit').onclick();\n"
-            "setTimeout(()=>{console.log(JSON.stringify(__calls))},60);\n"
+            "setTimeout(()=>{if(__errors.length)throw new Error(__errors.join('; '));console.log(JSON.stringify(__calls))},60);\n"
         ) % (json.dumps(create_kind), json.dumps(resources))
         with tempfile.NamedTemporaryFile('w', suffix='.js', delete=False, encoding='utf-8') as handle:
             handle.write(harness)

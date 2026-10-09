@@ -30,7 +30,7 @@ const samples = {
   recordItem: UI.recordItem({ id: evil, title: evil, state: 'finished', stateLabel: '已完成', typeLabel: '对照', compare: true, meta: [evil], progress: 140, selected: true, action: 'selectTask' }),
   recordEmpty: UI.recordEmpty(evil, evil),
   pageShell: UI.pageShell(''),
-  pageHeader: UI.pageHeader({ kicker: evil, title: evil, description: evil, meta: [evil], statusLabel: evil, statusNote: evil, statusTone: 'success' }),
+  pageHeader: UI.pageHeader({ kicker: evil, title: evil, description: evil, meta: [evil], statusLabel: evil, statusNote: evil, statusTone: 'success', actionsHtml: UI.button('再来一次', { action:'repeatTest', args:['task',evil], iconName:'refresh' }) }),
   tabs: UI.tabs({ label: evil, items: [['a', evil], ['b', 'B']], active: 'a', action: 'setComparisonTab', ownerId: evil }),
   section: UI.section({ title: evil, description: evil, badgeHtml: UI.badge('x'), bodyHtml: '' }),
   progressCard: UI.progressCard({ kicker: evil, value: -5, summary: evil, note: evil }),
@@ -43,6 +43,7 @@ const samples = {
   formSectionTitle: UI.formSectionTitle(1, evil),
   field: UI.field({ id: 'x', label: evil, controlHtml: UI.input({ id: 'x', value: evil, placeholder: evil }), hint: evil, required: true }),
   input: UI.input({ id: 'n', type: 'number', min: 1, max: 5, step: 1 }),
+  passwordInput: UI.passwordInput({ id: 'key', value: evil, visibilityLabel: evil, action: 'revealRoutingKey', args: [evil], describedBy: 'key-hint' }),
   select: UI.select({ id: 's', options: [['1', evil], ['2', 'b']], value: '2' }),
   inlineFields: UI.inlineFields(''),
   switchRow: UI.switchRow({ id: 'sw', title: evil, description: evil, checked: true }),
@@ -83,7 +84,28 @@ check('tabs expose selection state', () => {
   assert.match(samples.tabs, /role="tablist"/);
   assert.match(samples.tabs, /report-tab active" role="tab" aria-selected="true"/);
 });
+check('page headers show one visible repeat action together with the conclusion status', () => {
+  assert.match(samples.pageHeader, /class="hero-actions"/);
+  assert.equal((samples.pageHeader.match(/data-click-action="repeatTest"/g)||[]).length,1);
+  assert.ok(samples.pageHeader.indexOf('data-click-action="repeatTest"')<samples.pageHeader.indexOf('report-status good'));
+  assert.match(UI.pageHeader({kicker:'测试',title:'已结束',actionsHtml:UI.button('再来一次')}),/hero-actions/);
+  assert.ok(!UI.pageHeader({kicker:'测试',title:'运行中',statusLabel:'运行中'}).includes('hero-actions'));
+});
 check('unknown icons fail loudly', () => assert.throws(() => UI.icon('nope'), /unknown icon/));
+check('named connections use the shared accessible navigation icon', () => {
+  assert.match(UI.icon('connections'), /class="ui-icon" viewBox="0 0 24 24" aria-hidden="true"/);
+  assert.match(UI.button('管理常用连接', { iconName:'connections', action:'manageSavedConnections' }), /data-click-action="manageSavedConnections"/);
+});
+check('password inputs are concealed with accessible delegated visibility controls', () => {
+  assert.match(samples.passwordInput, /class="password-field"/);
+  assert.match(samples.passwordInput, /type="password"/);
+  assert.match(samples.passwordInput, /aria-describedby="key-hint"/);
+  assert.match(samples.passwordInput, /aria-controls="key" aria-pressed="false"/);
+  assert.match(samples.passwordInput, /data-click-action="revealRoutingKey" data-arg0="&lt;img/);
+  assert.match(UI.passwordInput({ id: 'pw', type: 'text' }), /type="password"/);
+  assert.match(UI.passwordInput({ id: 'pw' }), /data-click-action="togglePasswordVisibility" data-arg0="pw"/);
+  assert.match(UI.icon('eyeOff'), /m3 3 18 18/);
+});
 check('builders emit only documented inline styles', () => {
   for (const [name, html] of Object.entries(samples)) for (const [, style] of html.matchAll(/style="([^"]*)"/g)) assert.match(style, /^width:\d+%$/, `${name} inline style ${style}`);
 });

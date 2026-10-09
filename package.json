@@ -5,8 +5,8 @@
     "node": ">=20"
   },
   "scripts": {
-    "check": "node --check static/app.js && node --check static/actions.js && node --check static/ui-kit.js && node --check static/fingerprint.js && node tools/check-ui.cjs",
-    "test": "npm run check && node tests/test_ui_kit.cjs && node tests/test_check_ui.cjs && node tests/test_fingerprint_ui.cjs && node tests/test_fingerprint_models_ui.cjs",
+    "check": "node --check static/app.js && node --check static/actions.js && node --check static/ui-kit.js && node --check static/fingerprint.js && node --check static/connections.js && node --check static/repeat.js && node tools/check-ui.cjs",
+    "test": "npm run check && node tests/test_ui_kit.cjs && node tests/test_check_ui.cjs && node tests/test_fingerprint_ui.cjs && node tests/test_fingerprint_models_ui.cjs && node tests/test_connections_ui.cjs && node tests/test_saved_connection_picker.cjs && node tests/test_repeat_ui.cjs && node tests/test_frontend_performance.cjs && node tests/test_browser_artifacts.cjs",
     "e2e": "node tests/browser/smoke.cjs",
     "e2e:full": "node tests/browser/run-all.cjs"
   },

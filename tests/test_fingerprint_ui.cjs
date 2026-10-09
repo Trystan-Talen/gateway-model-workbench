@@ -4,7 +4,7 @@ const path = require('node:path');
 const vm = require('node:vm');
 const assert = require('node:assert/strict');
 const asset = process.env.UI_FINGERPRINT_JS || path.resolve(__dirname,'../static/fingerprint.js');
-const source = fs.readFileSync(asset,'utf8').replace('window.FingerprintUI = Object.freeze({init,setRuns,updateChrome,render,openCreate,closeCreate,hide,onAuthLost,select,setTab});','window.__renderTest = {overviewHtml,detailHtml};');
+const source = fs.readFileSync(asset,'utf8').replace(/window\.FingerprintUI = Object\.freeze\(\{[^}]+\}\);/,'window.__renderTest = {overviewHtml,detailHtml};');
 const sandbox = {window:{},document:{getElementById:()=>null},URL,console,TextEncoder};
 const uiKit = path.resolve(__dirname,'../static/ui-kit.js');
 vm.runInNewContext(fs.readFileSync(uiKit,'utf8'),sandbox,{filename:uiKit});

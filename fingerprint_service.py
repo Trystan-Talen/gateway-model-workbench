@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import heapq
 import json
 import math
 import os
@@ -28,6 +29,7 @@ from fingerprint_protocol import (
     compare_artifacts,
     make_plan,
     make_protocol,
+    _protocol_valid,
     normalize_answer,
     validate_import,
 )
@@ -395,7 +397,7 @@ class FingerprintManager:
                     self._quarantine(path)
             self._restored = True
 
-    def create(self, config):
+    def create(self, config, *, frozen_protocol=None, connection_binding=None):
         self.restore()
         if not isinstance(config, dict):
             raise ValueError("采集配置必须是对象")
@@ -416,9 +418,14 @@ class FingerprintManager:
         endpoint, key = _endpoint(config.get("endpoint"))
         if key and any(key in value for value in (endpoint["url"], endpoint["model"], name, source_note)):
             raise ValueError("密钥只能填写在独立密钥字段中")
-        protocol = make_protocol({field: config[field] for field in
-                                  ("preset", "samples_per_cell", "concurrency", "timeout_seconds", "adapter")
-                                  if field in config})
+        if frozen_protocol is None:
+            protocol = make_protocol({field: config[field] for field in
+                                      ("preset", "samples_per_cell", "concurrency", "timeout_seconds", "adapter")
+                                      if field in config})
+        else:
+            if not _protocol_valid(frozen_protocol):
+                raise ValueError("原采集的冻结协议已不受支持，不能自动替换当前方案复测")
+            protocol = copy.deepcopy(frozen_protocol)
         # Validate before freezing/queueing; never silently amend an existing protocol.
         if urlsplit(endpoint["url"]).hostname == "api.deepseek.com" and protocol["adapter"] != "deepseek":
             raise ValueError("DeepSeek（深度求索）官方接口默认启用思考，请选择‘DeepSeek（深度求索）：关闭思考’适配；对照任务需使用相同适配重新采集参考")
@@ -446,7 +453,10 @@ class FingerprintManager:
                 "error": None, "reference_id": reference_id, "comparison": None,
                 "diagnostics": {}, "artifact": None, "source_note": source_note,
                 "trusted_source": trusted,
+                "key_required": bool(key),
             }
+            if connection_binding:
+                run["connection_binding"] = copy.deepcopy(connection_binding)
             sample_path = self._samples_path(run_id)
             try:
                 fd = os.open(sample_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
@@ -475,6 +485,11 @@ class FingerprintManager:
         snapshot = self._summary(run)
         snapshot["artifact"] = copy.deepcopy(run.get("artifact"))
         snapshot["source_note"] = run.get("source_note", "")
+        snapshot["trusted_source"] = run.get("trusted_source", False)
+        if "key_required" in run:
+            snapshot["key_required"] = run["key_required"]
+        if run.get("connection_binding"):
+            snapshot["connection_binding"] = copy.deepcopy(run["connection_binding"])
         if self.storage_warnings:
             snapshot["storage_warning"] = "; ".join(filter(None, [snapshot.get("storage_warning"), *self.storage_warnings]))
         return snapshot
@@ -544,9 +559,9 @@ class FingerprintManager:
             self._runs.pop(run_id)
             self._samples_path(run_id).unlink(missing_ok=True)
 
-    def _read_samples(self, run):
+    def _scan_samples(self, run, collect):
+        """Validate each stored row once and let the caller choose what to retain."""
         path = self._samples_path(run["id"])
-        samples = []
         damaged = False
         try:
             with path.open("r", encoding="utf-8") as stream:
@@ -555,13 +570,19 @@ class FingerprintManager:
                         sample = json.loads(line)
                         if not isinstance(sample, dict) or not isinstance(sample.get("index"), int) or "cell_id" not in sample:
                             raise ValueError("invalid sample")
-                        samples.append(sample)
                     except (ValueError, TypeError):
                         damaged = True
+                        continue
+                    collect(sample)
         except (OSError, UnicodeError):
             damaged = True
         if damaged:
             run["storage_warning"] = "部分原始样本损坏或缺失；仅保留可读取样本，不能据此给出严格结论"
+        return damaged
+
+    def _read_samples(self, run):
+        samples = []
+        damaged = self._scan_samples(run, samples.append)
         return samples, damaged
 
     def samples(self, run_id, offset=0, limit=100):
@@ -572,9 +593,24 @@ class FingerprintManager:
             raise ValueError("每页样本数量必须在 1 至 500 之间")
         with self.lock:
             run = self._require_run(run_id)
-            samples, _ = self._read_samples(run)
-            samples.sort(key=lambda item: item["index"])
-            return {"samples": samples[offset:offset + limit], "total": len(samples), "offset": offset, "limit": limit}
+            page = []
+            total = 0
+            capacity = offset + limit
+
+            def collect(sample):
+                nonlocal total
+                total += 1
+                # The heap root is the latest retained index. The row number
+                # preserves file order when duplicate indexes are present.
+                candidate = (-sample["index"], -total, sample)
+                if len(page) < capacity:
+                    heapq.heappush(page, candidate)
+                elif candidate[:2] > page[0][:2]:
+                    heapq.heapreplace(page, candidate)
+
+            self._scan_samples(run, collect)
+            ordered = sorted(page, key=lambda item: item[:2], reverse=True)
+            return {"samples": [item[2] for item in ordered[offset:]], "total": total, "offset": offset, "limit": limit}
 
     def export(self, run_id):
         self.restore()

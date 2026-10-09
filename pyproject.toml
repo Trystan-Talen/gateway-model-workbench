@@ -9,10 +9,23 @@ dev = ["coverage==7.10.7"]
 
 [tool.coverage.run]
 source = ["task_status", "preflight", "quality_report", "routing_compare"]
+data_file = "artifacts/coverage/.coverage"
 
 [tool.coverage.report]
 show_missing = true
 fail_under = 75
+
+[tool.coverage.json]
+output = "artifacts/coverage/coverage.json"
+
+[tool.coverage.html]
+directory = "artifacts/coverage/html"
+
+[tool.coverage.xml]
+output = "artifacts/coverage/coverage.xml"
+
+[tool.coverage.lcov]
+output = "artifacts/coverage/coverage.lcov"
 
 [tool.setuptools.dynamic]
 version = {attr = "app_version.APP_VERSION"}

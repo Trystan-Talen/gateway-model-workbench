@@ -198,6 +198,15 @@ class CoreTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, '并发上限'):
             ui.validate_config({'url':'http://x.test','api_key':'secret','model':'m','mode':'smoke','concurrency':-1})
 
+    def test_new_gateway_defaults_match_form_and_explicit_pressure_is_preserved(self):
+        base = {'url': 'http://x.test', 'api_key': 'synthetic-key', 'model': 'synthetic-model'}
+        for mode, extra in (('smoke', {}), ('soak', {}), ('ramp', {'ramps': '100,200,400'})):
+            with self.subTest(mode=mode):
+                cfg = ui.validate_config({**base, 'mode': mode, **extra})
+                self.assertEqual((cfg['rpm'], cfg['concurrency']), (100, 100))
+        cfg = ui.validate_config({**base, 'rpm': 321, 'concurrency': 7})
+        self.assertEqual((cfg['rpm'], cfg['concurrency']), (321, 7))
+
     def test_task_classifies_protocol_separately(self):
         cfg = ui.validate_config({'url':'http://x.test','api_key':'secret','model':'m','mode':'smoke'})
         steps, total = ui.build_plan(cfg)

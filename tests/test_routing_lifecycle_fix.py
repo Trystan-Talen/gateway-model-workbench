@@ -199,7 +199,8 @@ class RoutingLifecycleRegression(unittest.TestCase):
         async def request(client, job, *args, **kwargs):
             calls.append(job["id"])
             run.stop()
-            return {**result(job), "status_code": 400, "usage_seen": False}
+            return {**result(job), "status_code": 400, "usage_seen": False,
+                    "_usage_options_rejected": True}
 
         with mock.patch.object(routing, "do_request", side_effect=request):
             run.execute()

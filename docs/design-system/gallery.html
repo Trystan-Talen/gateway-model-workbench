@@ -86,7 +86,7 @@
     </section>
 
     <section class="gallery-block" id="forms"><h2>表单</h2><p>创建流程统一放在右侧抽屉，按编号分步。</p>
-      <div class="gallery-demo"><div class="gallery-label">.config 抽屉 · UI.formSectionTitle · UI.field · UI.input · UI.select · UI.inlineFields · UI.switchRow · UI.hint</div>
+      <div class="gallery-demo"><div class="gallery-label">.config 抽屉 · UI.formSectionTitle · UI.field · UI.input · UI.passwordInput · UI.select · UI.inlineFields · UI.switchRow · UI.hint</div>
         <aside class="config gallery-drawer" aria-label="抽屉示例"><header class="drawer-head"><div><div class="form-title">新建缓存评测</div><div class="form-sub">配置连接与请求清单，开始后查看实时结果。</div></div><button class="drawer-close" type="button" aria-label="关闭示例" id="demoClose"></button></header><div class="drawer-body" id="demoForm"></div><footer class="drawer-footer"><button class="submit" type="button">开始缓存评测</button><div class="form-note">开始后会向所填目标发送真实请求，请核对配置。</div></footer></aside>
       </div>
     </section>
@@ -112,7 +112,7 @@
   document.querySelectorAll('[data-radius]').forEach(el => { el.style.borderRadius = `var(--radius-${el.dataset.radius})`; });
   document.querySelectorAll('[data-shadow]').forEach(el => { el.style.borderRadius = 'var(--radius-card)'; el.style.boxShadow = `var(--shadow-${el.dataset.shadow})`; });
 
-  $('demoButtons').innerHTML = UI.button('开始评测', { variant: 'primary', iconName: 'plus' }) + UI.button('下载结论报告', { iconName: 'download' }) + UI.button('删除本地记录', { variant: 'danger', iconName: 'trash' }) + UI.button('运行中不可删除', { disabled: true }) + UI.textButton('无法获取列表？手动指定模型') + UI.icon('activity');
+  $('demoButtons').innerHTML = UI.button('开始评测', { variant: 'primary', iconName: 'plus' }) + UI.button('下载结论报告', { iconName: 'download' }) + UI.button('管理常用连接', { iconName: 'connections' }) + UI.button('删除本地记录', { variant: 'danger', iconName: 'trash' }) + UI.button('运行中不可删除', { disabled: true }) + UI.textButton('无法获取列表？手动指定模型') + UI.icon('activity');
   $('demoActionBar').innerHTML = UI.actionBar(UI.button('停止后续请求', { variant: 'danger', iconName: 'stop' }) + UI.button('下载报告', { iconName: 'download' }) + UI.button('删除本地记录', { variant: 'danger', iconName: 'trash' }));
   $('demoStatus').innerHTML = [['running','运行中'],['waiting','排队中'],['finished','已完成'],['finished_with_errors','完成但有错误'],['error','失败'],['stopped','已停止']].map(([s, l]) => UI.status(s, l)).join('') +
     UI.TONES.map(t => UI.tag(t, t)).join('') + UI.badge('有限证据') + UI.badge('12 道题', { hint: true });
@@ -122,7 +122,7 @@
     UI.recordItem({ id: 'b', title: '并发 40 与 100 对照', state: 'finished', stateLabel: '已完成', typeLabel: '对照实验', compare: true, meta: ['2/2 组完成'], progress: 100, trailing: '风险', action: 'selectComparison' }) +
     UI.recordEmpty('暂无缓存评测记录', '创建一次缓存评测后，结果会出现在这里。');
   $('demoPage').innerHTML = UI.pageShell([
-    UI.pageHeader({ kicker: '网关压测 · 对照实验记录', title: '并发 40 与 100 对照', description: '一条实验记录承载公共配置和全部压力组。', meta: ['已完成', '2 个实验组', '串行执行'], statusLabel: '风险', statusNote: '对比组出现明显退化', statusTone: 'danger' }),
+    UI.pageHeader({ kicker: '网关压测 · 对照实验记录', title: '并发 40 与 100 对照', description: '一条实验记录承载公共配置和全部压力组。', meta: ['已完成', '2 个实验组', '串行执行'], statusLabel: '风险', statusNote: '对比组出现明显退化', statusTone: 'danger', actionsHtml: UI.button('再来一次', { action: 'openCreateForContext', iconName: 'refresh' }) }),
     UI.tabs({ label: '示例标签', items: [['report', '对照结论'], ['base', '基准组'], ['cmp', '对比组 1']], active: 'report', action: 'setComparisonTab', ownerId: 'demo' }),
     UI.progressCard({ kicker: '实验整体进度', value: 64, summary: '26 / 40 条请求 · 1/2 组完成', note: '实验尚未完成；当前只展示过程数据。' }),
     UI.section({ title: '关键发现', description: '异常信号是复测线索，不是根因结论。', badgeHtml: UI.badge('有限证据'), bodyHtml: UI.signalList([{ title: '成功率下降 6.5%', detail: '相对基准组。', tone: 'warning' }]) })
@@ -135,6 +135,7 @@
   $('demoClose').innerHTML = UI.icon('close');
   $('demoForm').innerHTML = UI.formSectionTitle(1, '连接网关') +
     UI.field({ id: 'demoUrl', label: '网关地址', required: true, controlHtml: UI.input({ id: 'demoUrl', type: 'url', placeholder: 'https://gateway.example.com/v1' }), hint: '密钥不会写入任务记录。' }) +
+    UI.field({ id: 'demoKey', label: 'API Key（接口密钥）', controlHtml: UI.passwordInput({ id: 'demoKey', visibilityLabel: 'API Key（接口密钥）', value: 'synthetic-demo-key' }), hint: '点击眼睛核对合成示例密钥，再次点击恢复遮盖。' }) +
     UI.formSectionTitle(2, '请求参数') +
     UI.inlineFields(UI.field({ id: 'demoConc', label: '并发上限', controlHtml: UI.input({ id: 'demoConc', type: 'number', value: 20, min: 1 }) }) + UI.field({ id: 'demoTier', label: '请求数', controlHtml: UI.select({ id: 'demoTier', options: [['100', '100 条'], ['1000', '1,000 条']], value: '100' }) })) +
     UI.hint('两侧按相同清单、节奏和并发交错发出请求。', { title: '对照方式' }) +
@@ -150,6 +151,16 @@
 
   function setTheme(theme) { document.documentElement.dataset.theme = theme; paintFoundations(); }
   $('galleryTheme').addEventListener('click', () => setTheme(document.documentElement.dataset.theme === 'dark' ? 'light' : 'dark'));
+  document.addEventListener('click', event => {
+    const button = event.target.closest('[data-click-action="togglePasswordVisibility"]');
+    if (!button || button.dataset.arg0 !== 'demoKey') return;
+    const input = $('demoKey'), visible = input.type === 'text';
+    input.type = visible ? 'password' : 'text';
+    button.setAttribute('aria-pressed', String(!visible));
+    const label = `${visible ? '显示' : '隐藏'}API Key（接口密钥）`;
+    button.setAttribute('aria-label', label);button.title = label;
+    button.innerHTML = UI.icon(visible ? 'eye' : 'eyeOff');
+  });
   setTheme(matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');
 })();
 </script>

@@ -3,12 +3,10 @@
  * Optional: CHROME_PATH=<browser binary>, UI_ARTIFACT_DIR=<output directory>.
  */
 const {chromium}=require('playwright');
-const fs=require('fs'),path=require('path'),os=require('os'),assert=require('node:assert/strict');
+const fs=require('fs'),path=require('path'),assert=require('node:assert/strict');
 const {execFileSync}=require('child_process');
-const root=process.env.UI_PROJECT_ROOT||path.resolve(__dirname,'../..');
-const output=process.env.UI_ARTIFACT_DIR||fs.mkdtempSync(path.join(os.tmpdir(),'route-layout-'));
-fs.mkdirSync(output,{recursive:true});
-execFileSync(process.env.PYTHON||'python3',[path.join(root,'tests/browser/make_fixture.py'),output],{cwd:root,env:{...process.env,PYTHONDONTWRITEBYTECODE:'1'}});
+const {projectRoot:root,output,env}=require('./artifacts.cjs').browserArtifacts('layout');
+execFileSync(process.env.PYTHON||'python3',[path.join(root,'tests/browser/make_fixture.py'),output],{cwd:root,env});
 const fixture=JSON.parse(fs.readFileSync(path.join(output,'fixture.json'),'utf8'));
 const html=fs.readFileSync(process.env.UI_HTML||path.join(output,'index.html'),'utf8');
 const results=[],errors=[],unexpected=[];
@@ -34,6 +32,7 @@ async function screenshot(page,name){await page.screenshot({path:path.join(outpu
    if(pathname==='/auth/status')data={authenticated:true,user:{username:'视觉验收',role:'user'}};
    else if(pathname==='/tasks')data=fixture;
    else if(pathname==='/config')data={config:{}};
+   else if(pathname==='/connections'&&route.request().method()==='GET')data={connections:[],storage_available:true};
    else if(pathname==='/templates')data={templates:[]};
    else if(pathname==='/routing-corpus')data={tiers:[{tier:1000,bursts:10,note:'合成布局题集'}],metrics:[]};
    else if(pathname==='/quality-suite')data={manifest:{title:'合成布局题集',case_count:2,categories:['basic'],input_chars:{min:4,max:20}},cases:[]};

@@ -219,13 +219,15 @@
 ### 6.1 基础
 
 - **`UI.esc(text)`**：转义文本。所有外部或上游数据插入结构前必须转义；组件函数已对普通参数转义，名称以 `Html` 结尾的参数接收可信结构。
-- **`UI.icon(name)`** → `.ui-icon`：24×24 线性图标，线宽 1.8，装饰图标 `aria-hidden`。新图标加入 `ICONS`，不要在业务代码里内联 SVG。
+- **`UI.icon(name)`** → `.ui-icon`：24×24 线性图标，线宽 1.8，装饰图标 `aria-hidden`。常用连接模块使用 `connections`（常用连接）图标。新图标加入 `ICONS`，不要在业务代码里内联 SVG。
 
 ### 6.2 操作
 
 - **`UI.button(label, {variant, action, args, iconName, disabled, title})`** → `.btn` / `.btn.primary` / `.btn.danger`。`primary` 每个区域最多一个；危险操作用 `danger` 并在处理函数里 `confirm()` 说明后果。
 - **`UI.textButton(label, {action, args})`** → `.text-btn`：次要的内联操作（“手动指定模型”“查看详情”）。
-- **`UI.actionBar(buttonsHtml)`** → `.report-section.report-footer-actions`：详情页底部操作区，所有模块的停止、下载、重测、删除都放在这里（页头右侧只放结论状态块），顺序：进行中操作（停止）→ 下载/导出 → 重新测试/离线对照 → 删除。
+- **`UI.actionBar(buttonsHtml)`** → `.report-section.report-footer-actions`：详情页底部操作区，停止、下载、离线对照、删除放在这里，顺序：进行中操作（停止）→ 下载/导出 → 离线对照 → 删除。已结束测试的“再来一次”统一放在页头，不在底部重复。
+
+已结束测试的复测入口统一命名为“再来一次”，放在详情页头右侧，沿用原记录配置创建独立任务。每条详情只显示一个复测按钮；窄屏按既有容器断点将操作与状态折到标题下方。直接复用可读取的已保存密钥；缺失凭据时复用 `.modal` 弹窗与 `UI.passwordInput` 补填，关闭后清空。提交期间显示忙碌状态并阻止重复点击；需要风险确认时仅使用本次用户确认。
 - 记录栏新建按钮 `.new-btn`、抽屉提交按钮 `.submit`、表单右侧小按钮 `.icon-btn`、密钥框按钮 `.secret-action` / `.secret-toggle` 由页面骨架提供。
 
 ### 6.3 状态与反馈
@@ -246,7 +248,7 @@
 ### 6.5 详情页结构
 
 - **`UI.pageShell(childrenHtml)`** → `.detail-layout.report-shell`：详情页根容器。
-- **`UI.pageHeader({kicker, title, description, meta, statusLabel, statusNote, statusTone, actionsHtml})`** → `.report-head`：眉标（模块 · 类型）、标题、一句话说明、元信息胶囊；右侧放结论状态块或操作按钮（二选一）。
+- **`UI.pageHeader({kicker, title, description, meta, statusLabel, statusNote, statusTone, actionsHtml})`** → `.report-head`：眉标（模块 · 类型）、标题、一句话说明、元信息胶囊；右侧放结论状态块。`actionsHtml`（操作结构）非空时，以 `.hero-actions` 同时显示操作按钮和状态块，操作排在前面。已结束测试在这里放唯一的“再来一次”按钮。
 - **`UI.tabs({label, items, active, action, ownerId})`** → `.report-tabs` / `.report-tab`：分段标签，激活项为墨色；方向键、Home、End 已全局支持。第一个标签永远是结论，并且是打开详情时的默认标签：对照类记录（压测对照、资源对照、路由对照、指纹参考对照）命名为“对照结论”，单对象记录命名为“结论”；其后才是各侧/各组/证据标签。
 - **`UI.section({title, description, badgeHtml, bodyHtml, className})`** → `.report-section`：内容卡片，标题 + 一句话说明 + 内容。
 - **`UI.progressCard({kicker, value, summary, note})`** → `.report-progress-card`：带 `role="progressbar"` 的进度卡；放在区块内时自动去掉卡片外观。
@@ -265,10 +267,13 @@
 - **`UI.formSectionTitle(index, text)`** → `.form-section-title`：编号步骤标题。
 - **`UI.field({id, label, controlHtml, hint, required, hintId})`** → `.field`：标签在上、控件、说明在下；必填显示 `.field-required`。
 - **`UI.input({...})`** → `.input`；**`UI.select({id, options, value, required})`** → 带统一下拉箭头的 `select.input`。
+- **`UI.passwordInput({id, action, args, visibilityLabel, ...inputOptions})`** → `.password-field` / `.password-toggle`：默认遮盖的密码或密钥输入框，眼睛按钮通过委托动作显示/隐藏；按钮带 `aria-controls`（关联控件）、`aria-pressed`（按下状态）和中文操作说明。密钥使用 `visibilityLabel: 'API Key（接口密钥）'`；取回已保存密钥必须由用户主动点击，隐藏或关闭时清空取回值，输入的新值仍可遮盖保留。
 - **`UI.inlineFields(fieldsHtml)`** → `.inline`：两列字段，640 以下自动单列。
 - **`UI.switchRow({id, title, description, checked})`** → `.adv-toggle` + `.switch`：开关放右侧，说明写清代价（如“会增加存储占用”）。
 - **`UI.hint(text, {title})`** → `.comparison-hint`：虚线说明框。
 - 其他既有结构：分段选择 `.tabs` / `.tab`、折叠高级项 `details.gateway-single-advanced`、模板卡 `.template-chip`、资源分组 `.quality-resource`、实验组行 `.group-row`、预检卡 `.preflight-card.level-ok|warn|risk`。
+
+常用连接的创建、编辑和管理复用 `.config.fp-drawer` / `.drawer-backdrop.fp-backdrop` 的模块抽屉层级，可叠在测试抽屉上。打开时禁止下层表单交互，关闭时恢复原输入和焦点；已保存密钥只允许主动点击眼睛取回，取回值不随普通编辑再次提交。
 
 ## 7. 页面配方示例
 

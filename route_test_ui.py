@@ -31,7 +31,8 @@ from app_version import APP_VERSION
 from session_store import SessionStore
 from history_store import HistoryStore, quality_index
 import credential_store
-from smart_route_load import CHAT_PATH, build_payload, do_request, fetch_models, fetch_models_detailed
+from connection_profiles import ConnectionStore, ConnectionStorageError
+from smart_route_load import CHAT_PATH, USAGE_RETRY_POLICY, build_payload, do_request, fetch_models, fetch_models_detailed, should_retry_without_usage
 from quality_test import QualityRun, QualityCase, load_suite, suite_manifest, run_quality_probe
 from quality_report import build_quality_report, render_quality_markdown
 import storage
@@ -61,7 +62,6 @@ def preflight_payload(cfg, *, kind="run"):
     所以用户改了目标地址能立刻看到「目标疑似生产环境」的提示。
     """
     if kind == "quality":
-        resources = [r for r in (cfg.get("resources") or []) if isinstance(r, dict)]
         cases = cfg.get("case_count")
         if cases is None:
             try:
@@ -312,6 +312,40 @@ _keychain_available = credential_store.available
 _load_api_key = credential_store.load
 _save_api_key = credential_store.save
 _delete_api_key = credential_store.delete
+CONNECTIONS = ConnectionStore(os.path.join(BASE_DIR, "connections.json"),
+                              load_key=lambda ref: _load_api_key(ref),
+                              save_key=lambda ref, key: _save_api_key(ref, key),
+                              delete_key=lambda ref: _delete_api_key(ref),
+                              available=lambda: _keychain_available())
+
+
+def _connection_with_credentials(raw, *, remove_binding=False):
+    """Resolve a named credential only for its exact stored address."""
+    if not isinstance(raw, dict):
+        raise ValueError("连接配置必须是对象")
+    connection = dict(raw)
+    identifier = connection.get("connection_id")
+    if identifier is not None and identifier != "":
+        key = CONNECTIONS.resolve(identifier, connection.get("url"))
+        connection["api_key"] = str(connection.get("api_key") or "").strip() or key
+    if remove_binding:
+        connection.pop("connection_id", None)
+    return connection
+
+
+def _config_with_connections(raw, *, kind="run"):
+    cfg = dict(raw)
+    if kind == "routing":
+        for side in ("baseline", "candidate"):
+            if isinstance(cfg.get(side), dict):
+                cfg[side] = _connection_with_credentials(cfg[side])
+    elif kind == "quality":
+        if isinstance(cfg.get("resources"), list):
+            cfg["resources"] = [_connection_with_credentials(item) if isinstance(item, dict) else item
+                                for item in cfg["resources"]]
+    else:
+        cfg = _connection_with_credentials(cfg)
+    return cfg
 
 def _api_key_hint(key):
     key = str(key or "")
@@ -338,6 +372,7 @@ def _public_task_config(cfg):
         "name", "url", "model", "mode", "rpm", "ramps", "iterations", "duration",
         "concurrency", "connect_timeout", "read_timeout", "write_timeout", "profile",
         "stream", "capture_raw", "include_usage", "http2", "insecure",
+        "usage_retry_policy", "connection_id",
     }
     return {key: _without_secret_fields(value) for key, value in cfg.items() if key in allowed}
 
@@ -414,10 +449,20 @@ def _clear_secret_fields(value):
 
 
 def percentile(values, p):
-    values = sorted(values)
+    return _percentile_from_sorted(sorted(values), p)
+
+
+def _percentile_from_sorted(values, p):
     if not values:
         return None
     return values[max(0, min(len(values) - 1, int(p * len(values)) - 1))]
+
+
+def _latency_percentiles(values):
+    """复用同一份排序结果，保持压测历史沿用的分位数口径。"""
+    ordered = sorted(values)
+    return {"p50": _percentile_from_sorted(ordered, .5),
+            "p95": _percentile_from_sorted(ordered, .95)}
 
 
 def strip_url(url):
@@ -470,10 +515,10 @@ def parse_bool(value, field, default=False):
 def validate_config(raw, require_secret=True):
     if not isinstance(raw, dict):
         raise ValueError("请求体必须是 JSON 对象")
-    cfg = dict(raw)
+    cfg = _connection_with_credentials(raw)
     cfg["url"] = str(cfg.get("url") or "").strip()
     cfg["api_key"] = str(cfg.get("api_key") or "").strip()
-    if not cfg["api_key"]:
+    if not cfg["api_key"] and not cfg.get("connection_id"):
         cfg["api_key"] = _load_api_key(cfg.get("url"))
     cfg["model"] = str(cfg.get("model") or "").strip()
     cfg["name"] = str(cfg.get("name") or "").strip()[:80]
@@ -489,8 +534,8 @@ def validate_config(raw, require_secret=True):
         raise ValueError("请填写或选择模型")
     if cfg["mode"] not in ("smoke", "ramp", "soak"):
         raise ValueError("测试模式无效")
-    cfg["rpm"] = safe_float(cfg.get("rpm", 600), "计划调度 RPM", 0.01, 600000)
-    cfg["concurrency"] = safe_int(cfg.get("concurrency", 20), "并发上限", 1, 2000)
+    cfg["rpm"] = safe_float(cfg.get("rpm", 100), "计划调度 RPM", 0.01, 600000)
+    cfg["concurrency"] = safe_int(cfg.get("concurrency", 100), "并发上限", 1, 2000)
     cfg["iterations"] = safe_int(cfg.get("iterations", 50), "请求条数", 1, 10000000)
     cfg["duration"] = safe_int(cfg.get("duration", 60), "持续时间", 1, 86400)
     cfg["connect_timeout"] = safe_float(cfg.get("connect_timeout", 10), "连接超时", 0.1, 3600)
@@ -502,9 +547,9 @@ def validate_config(raw, require_secret=True):
     cfg["stream"] = parse_bool(cfg.get("stream", True), "stream", True)
     cfg["capture_raw"] = parse_bool(cfg.get("capture_raw", False), "记录原始数据开关", False)
     # 默认开启：缓存命中率的口径就是 usage.cached_tokens，不请求 usage 就永远算不出来。
-    # 个别网关不认 stream_options.include_usage 会直接 400，执行器收到 4xx 会自动降级重试，
-    # 兼容性差异不会被记成请求失败。
+    # 只有 400/422 且明确拒绝该参数时才降级，其他失败不得追加请求。
     cfg["include_usage"] = parse_bool(cfg.get("include_usage", True), "请求用量统计开关", True)
+    cfg["usage_retry_policy"] = USAGE_RETRY_POLICY
     cfg["http2"] = parse_bool(cfg.get("http2", False), "HTTP/2 开关", False)
     cfg["insecure"] = parse_bool(cfg.get("insecure", False), "跳过 TLS 证书校验开关", False)
     ramps = []
@@ -523,6 +568,7 @@ def validate_config(raw, require_secret=True):
         "name", "url", "api_key", "model", "mode", "rpm", "ramps", "iterations", "duration",
         "concurrency", "connect_timeout", "read_timeout", "write_timeout", "profile",
         "stream", "capture_raw", "include_usage", "http2", "insecure",
+        "usage_retry_policy", "connection_id",
     }
     return {key: cfg[key] for key in allowed if key in cfg}
 
@@ -708,15 +754,25 @@ class Task(ArtifactMixin):
             return f"计划调度时长 {self.config['duration']} 秒 · 当前仍在执行"
         return f"已完成 {self.done} / {self.total} 条"
 
-    def snap(self):
+    def snap(self, *, summary=False):
         if self.history_only and self._history_snapshot is not None:
             # 历史任务只读展示：不重新计算运行时指标，也不会被误认为仍在执行。
             snapshot = dict(self._history_snapshot)
             snapshot["config"] = self.public_config
             snapshot["out_path"] = self.out_path
             snapshot["history_only"] = True
-            return snapshot
+            return list_snapshot(snapshot) if summary else snapshot
         with self.lock:
+            identity = {
+                "id": self.id, "name": self.name, "status": self.status,
+                "status_label": status_label(self.status), "created": self.created,
+                "mode": self._mode_label(), "concurrency": self.config.get("concurrency"),
+                "target_rpm": self.current_target_rpm, "done": self.done, "total": self.total,
+                "progress": min(1, self.done / self.total) if self.total else 0,
+            }
+            # 记录栏不需要分位数、趋势、结果文件元数据，避免先计算详情再丢弃。
+            if summary:
+                return list_snapshot(identity)
             elapsed = self._elapsed()
             success = self.counters["ok"] * 100 / self.done if self.done else None
             lag_values = list(self.schedule_lag_ms)
@@ -727,29 +783,28 @@ class Task(ArtifactMixin):
             cache = self.cache_stat
             cache_rate = (cache["hits"] * 100 / cache["eligible"]) if cache["eligible"] else None
             return {
-                "id": self.id, "name": self.name, "status": self.status, "error": self.error,
-                "mode": self._mode_label(), "model": self.public_config.get("model"), "concurrency": self.config.get("concurrency"),
+                **identity, "error": self.error,
+                "model": self.public_config.get("model"),
                 "target_url": self.public_config.get("url"), "config": self.public_config,
-                "total": self.total, "scheduled": self.scheduled, "started": self.started,
-                "done": self.done, "progress": min(1, self.done / self.total) if self.total else 0,
+                "scheduled": self.scheduled, "started": self.started,
                 "remaining": max(0, self.total - self.done),
                 "pending": max(0, self.scheduled - self.started),
                 "inflight": max(0, self.started - self.done),
                 "dropped": self.dropped, "queue_depth": self.queue_depth,
-                "cur_step": self.current_step, "target_rpm": self.current_target_rpm,
+                "cur_step": self.current_step,
                 "schedule_step": self.schedule_step, "schedule_target_rpm": self.schedule_target_rpm,
                 "counters": dict(self.counters), "success_pct": success,
-                "ttft": {"n": len(self.ttft), "p50": percentile(list(self.ttft), .5), "p95": percentile(list(self.ttft), .95)},
-                "total_ms": {"n": len(total_values), "p50": percentile(total_values, .5), "p95": percentile(total_values, .95), "avg": average_total_ms},
+                "ttft": {"n": len(self.ttft), **_latency_percentiles(self.ttft)},
+                "total_ms": {"n": len(total_values), **_latency_percentiles(total_values), "avg": average_total_ms},
                 "rpm": {"live": self._live_rpm(), "avg": self.done * 60 / elapsed if elapsed else None,
                         "capacity_estimate": capacity_rpm},
-                "schedule_lag": {"p50": percentile(lag_values, .5), "p95": percentile(lag_values, .95)},
+                "schedule_lag": _latency_percentiles(lag_values),
                 "cache": {"eligible": cache["eligible"], "hits": cache["hits"],
                           "no_usage": cache["no_usage"], "rate_pct": cache_rate,
                           "basis": "usage.cached_tokens>0"},
                 "phase": self._phase(), "recent": list(reversed(self.recent)),
                 "timeline": list(self.timeline), "out_path": self.out_path,
-                "write_error": self.write_error, "created": self.created,
+                "write_error": self.write_error,
                 "started_at": self.started_at, "finished_at": self.finished_at,
                 "stopped_at": self.stopped_at, "elapsed": elapsed,
                 "planned_duration": planned_duration, "planned_count": self.total,
@@ -757,7 +812,6 @@ class Task(ArtifactMixin):
                 "parent_comparison_id": self.parent_comparison_id,
                 "parent_group_id": self.parent_group_id,
                 "artifact": self.artifact_snapshot(),
-                "status_label": status_label(self.status),
             }
 
     def open_output(self):
@@ -785,22 +839,7 @@ class Task(ArtifactMixin):
     def record(self, result):
         """先落盘，再更新内存统计，避免页面统计领先于结果文件。"""
         status = result.get("status_code") or 0
-        error = result.get("error_type")
-        completed = bool(result.get("completed"))
-        if 200 <= status < 300 and completed:
-            category, label, css = "ok", "成功", "ok"
-        elif error == "TIMEOUT" or status == 408:
-            category, label, css = "timeout", "超时", "timeout"
-        elif error == "NETWORK" or (status == 0 and error != "TIMEOUT"):
-            category, label, css = "network", "网络错误", "network"
-        elif error == "PROTOCOL" or (200 <= status < 300 and not completed):
-            category, label, css = "protocol", "响应不完整", "protocol"
-        elif status == 429 or error == "HTTP_429":
-            category, label, css = "r429", "限流", "r429"
-        elif 500 <= status < 600 or error == "HTTP_5XX":
-            category, label, css = "r5xx", "服务端错误", "r5xx"
-        else:
-            category, label, css = "r4xx", "客户端错误", "r4xx"
+        category, label, css = _classify_result(result)
         secret = self.config.get("api_key")
         clean = {k: _redact_secret(result.get(k), secret) for k in (
             "schema_version", "ts", "item_id", "mode", "profile", "step_index", "grade",
@@ -1232,6 +1271,9 @@ class ComparisonManager:
             last_persist_at = 0.0
             for group in run.config["groups"]:
                 shared = dict(run.config["shared_config"])
+                # The parent already resolved and froze this connection. Later
+                # edits/deletion affect future runs, not remaining groups here.
+                shared.pop("connection_id", None)
                 shared.update({"name": f"{run.name} · {group['name']}", "concurrency": group["concurrency"],
                                "rpm": group["rpm"], "iterations": group["iterations"], "mode": "smoke"})
                 try:
@@ -1335,9 +1377,15 @@ def _quality_public_config(cfg):
     for item in cfg.get("resources", []):
         if not isinstance(item, dict):
             continue
-        resource_allowed = {"name", "url", "model", "connect_timeout", "read_timeout", "write_timeout", "http2", "insecure", "is_reference"}
+        resource_allowed = {"name", "url", "model", "connect_timeout", "read_timeout", "write_timeout", "http2", "insecure", "is_reference", "connection_id", "historical_reference", "reference_task_id"}
         resources.append({key: _without_secret_fields(value) for key, value in item.items() if key in resource_allowed})
     public["resources"] = resources
+    # Frozen public questions allow repetition after the source suite file changes.
+    # Answers from an upstream are held only in the existing evidence artifact.
+    if cfg.get("_suite_cases"):
+        public["suite_cases"] = _without_secret_fields(copy.deepcopy(cfg["_suite_cases"]))
+    elif cfg.get("suite_cases"):
+        public["suite_cases"] = _without_secret_fields(copy.deepcopy(cfg["suite_cases"]))
     return public
 
 
@@ -1357,9 +1405,9 @@ def validate_quality_config(raw):
     for index, item in enumerate(resources, 1):
         if not isinstance(item, dict):
             raise ValueError(f"资源实例 {index} 配置无效")
-        value = dict(item)
+        value = _connection_with_credentials(item)
         unknown_fields = set(value) - {
-            "name", "url", "api_key", "model", "connect_timeout", "read_timeout", "write_timeout", "http2", "insecure", "is_reference",
+            "name", "url", "api_key", "model", "connect_timeout", "read_timeout", "write_timeout", "http2", "insecure", "is_reference", "connection_id",
         }
         if unknown_fields:
             raise ValueError(f"资源实例 {index} 含不支持的字段：{sorted(unknown_fields)[0]}")
@@ -1372,7 +1420,7 @@ def validate_quality_config(raw):
         parsed = urllib.parse.urlparse(value["url"])
         if parsed.scheme not in ("http", "https") or not parsed.netloc:
             raise ValueError(f"资源实例 {index} URL 必须是有效的 http 或 https 地址")
-        if not value["api_key"]:
+        if not value["api_key"] and not value.get("connection_id"):
             value["api_key"] = _load_api_key(value["url"])
         if not value["api_key"]:
             raise ValueError(f"资源实例 {index} 缺少 API Key；也可以留空复用该 URL 已保存的密钥")
@@ -1384,7 +1432,7 @@ def validate_quality_config(raw):
         value["http2"] = parse_bool(value.get("http2", False), f"资源实例 {index} HTTP/2 开关", False)
         value["insecure"] = parse_bool(value.get("insecure", False), f"资源实例 {index} 跳过 TLS 证书校验开关", False)
         resource_allowed = {
-            "name", "url", "api_key", "model", "connect_timeout", "read_timeout", "write_timeout", "http2", "insecure", "is_reference",
+            "name", "url", "api_key", "model", "connect_timeout", "read_timeout", "write_timeout", "http2", "insecure", "is_reference", "connection_id",
         }
         value["is_reference"] = parse_bool(value.get("is_reference", False), f"资源实例 {index} 参考标记", False)
         normalized.append({key: value[key] for key in resource_allowed if key in value})
@@ -1412,14 +1460,6 @@ def validate_quality_config(raw):
         "suite_manifest": manifest, "_suite_cases": [c.to_dict() for c in cases],
         "case_count": len(cases),
     }
-
-
-def _quality_percentile(values, ratio):
-    values = sorted(float(value) for value in values if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(float(value)))
-    if not values:
-        return None
-    index = min(len(values) - 1, max(0, math.ceil(len(values) * ratio) - 1))
-    return round(values[index], 2)
 
 
 def _quality_progress(task):
@@ -1539,10 +1579,12 @@ class QualityManager:
         self.tasks = {}
         self.lock = threading.RLock()
 
-    def create(self, raw):
-        cfg = validate_quality_config(raw)
+    def create(self, raw, *, frozen_config=None, persist_credentials=True):
+        # frozen_config is an internal-only copy from an existing record, never
+        # accepted from an HTTP request. It retains the exact exam and reference.
+        cfg = copy.deepcopy(frozen_config) if frozen_config is not None else validate_quality_config(raw)
         reuse_id = cfg.get("reference_reuse_id")
-        if reuse_id:
+        if reuse_id and frozen_config is None:
             with self.lock:
                 previous = self.tasks.get(reuse_id)
             if not previous or previous.status not in ("finished", "finished_with_errors"):
@@ -1568,7 +1610,7 @@ class QualityManager:
         # 质量评测与网关压测共用同一套 macOS Keychain（钥匙串）凭据策略。
         # 只保存到钥匙串，不进入任务摘要、浏览器本地存储或历史索引。
         for resource in cfg.get("resources", []):
-            if not resource.get("historical_reference"):
+            if persist_credentials and not resource.get("historical_reference") and not resource.get("connection_id"):
                 _save_api_key(resource.get("url"), resource.get("api_key"))
         task = QualityTask(cfg)
         with self.lock:
@@ -1935,16 +1977,17 @@ class TaskManager:
         """调度器自身状态，用于「为什么我的任务还没开始」这类问题。"""
         with self.lock:
             waiting = list(self.queue)
+            running = list(self.running_ids)
         state = LIMITER.snapshot()
         state["waiting"] = waiting
-        state["running"] = list(self.running_ids)
+        state["running"] = running
         return state
 
-    def ordered(self):
+    def ordered(self, *, summary=False):
         with self.lock:
             tasks = list(self.tasks.values())
         order = {"running": 0, "waiting": 1, "error": 2, "stopped": 3, "finished": 4}
-        return [task.snap() for task in sorted(tasks, key=lambda t: (order.get(t.status, 9), -t.created)) if not task.parent_comparison_id]
+        return [task.snap(summary=summary) for task in sorted(tasks, key=lambda t: (order.get(t.status, 9), -t.created)) if not task.parent_comparison_id]
 
 
 MANAGER = TaskManager()
@@ -2061,9 +2104,8 @@ async def run_task(task):
                 result = await do_request(client, item, payload, headers, timeout_cfg,
                                           chat_url=strip_url(cfg["url"]), capture_raw=cfg["capture_raw"],
                                           include_usage=include_usage)
-                # 网关不认 stream_options.include_usage 时通常直接 400；把这一轮降级为
-                # 「不带 usage 参数」再请求一次，避免把兼容性差异记成请求失败。
-                if include_usage and 400 <= (result.get("status_code") or 0) < 500 and not result.get("usage_seen"):
+                # 只有明确拒绝 usage 参数的校验错误才降级，限流或鉴权失败不重发。
+                if should_retry_without_usage(result, include_usage, cfg["stream"]):
                     cfg["include_usage"] = False
                     result = await do_request(client, item, payload, headers, timeout_cfg,
                                               chat_url=strip_url(cfg["url"]), capture_raw=cfg["capture_raw"],
@@ -2136,6 +2178,244 @@ def list_snapshot(item):
     return result
 
 
+class RepeatError(ValueError):
+    def __init__(self, message, status=400):
+        super().__init__(message)
+        self.status = status
+
+
+_REPEAT_TASK_FIELDS = frozenset({
+    "url", "model", "mode", "rpm", "concurrency", "iterations", "duration", "profile",
+    "connect_timeout", "read_timeout", "write_timeout", "stream", "capture_raw", "include_usage", "http2", "insecure",
+})
+_REPEAT_TERMINAL = frozenset({"finished", "finished_with_errors", "stopped", "error", "expired", "interrupted"})
+
+
+def _repeat_source(kind, source_id):
+    managers = {"task": MANAGER, "comparison": COMPARISONS, "routing": ROUTING_COMPARISONS,
+                "quality": QUALITY, "fingerprint": FINGERPRINTS}
+    if not isinstance(kind, str) or kind not in managers or not isinstance(source_id, str) or not source_id:
+        raise RepeatError("复测来源类型或编号无效")
+    source = managers[kind].get(source_id)
+    if source is None:
+        raise RepeatError("原测试记录不存在", 404)
+    status = source.get("status") if isinstance(source, dict) else source.status
+    if status not in _REPEAT_TERMINAL:
+        raise RepeatError("原测试尚未结束，结束后才能再来一次", 409)
+    if kind == "task" and getattr(source, "parent_comparison_id", None):
+        raise RepeatError("这是对照实验的内部任务，请从原对照实验再来一次", 409)
+    return source
+
+
+def _repeat_require_fields(config, fields):
+    if not isinstance(config, dict) or any(field not in config or config[field] is None for field in fields):
+        raise RepeatError("原记录缺少完整的冻结测试参数，不能准确复测；请新建测试")
+
+
+def _repeat_quality_config(source, config):
+    manifest = config.get("suite_manifest") or {}
+    cases = config.get("_suite_cases") or config.get("suite_cases")
+    if cases:
+        cases = tuple(QualityCase.from_dict(item, index) for index, item in enumerate(cases))
+    else:
+        # Old records may reuse the current suite only after its complete public
+        # contents have the same fingerprint as the original frozen examination.
+        try:
+            cases = load_suite(config.get("suite_path"))
+        except ValueError:
+            raise RepeatError("原记录没有冻结题目，且原题集不可读取，不能准确复测") from None
+    canonical = json.dumps([case.to_dict() for case in cases], ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    if not manifest.get("fingerprint") or hashlib.sha256(canonical.encode()).hexdigest() != manifest["fingerprint"]:
+        raise RepeatError("原题集版本或内容已变化，原记录没有可验证的冻结题目，不能准确复测")
+    config["_suite_cases"] = [case.to_dict() for case in cases]
+    config["case_count"] = len(cases)
+    for index, resource in enumerate(config.get("resources") or []):
+        if resource.get("historical_reference"):
+            results = getattr(source, "results", []) or []
+            if index >= len(results):
+                raise RepeatError("原任务的历史参考证据不完整，不能准确复测")
+            result = copy.deepcopy(results[index])
+            if len(result.get("case_results") or []) != len(cases):
+                raise RepeatError("原任务的历史参考证据不完整，不能准确复测")
+            config["_historical_reference_results"] = result
+        else:
+            _repeat_require_fields(resource, {"url", "model", "connect_timeout", "read_timeout", "write_timeout", "http2", "insecure"})
+    return config
+
+
+def _repeat_frozen_config(kind, source):
+    if kind == "fingerprint":
+        protocol = source.get("protocol")
+        if not fingerprint_protocol._protocol_valid(protocol):
+            raise RepeatError("原采集的冻结协议已不受支持，不能自动替换当前方案复测")
+        _repeat_require_fields(source.get("endpoint"), {"url", "model"})
+        if source.get("mode") == "reference" and not source.get("trusted_source"):
+            raise RepeatError("原参考采集缺少可信来源声明，不能准确复测")
+        if source.get("mode") == "verify" and not FINGERPRINTS.get_reference(source.get("reference_id")):
+            raise RepeatError("原采集使用的参考指纹已不存在，不能准确复测")
+        return {"name": source.get("name"), "mode": source.get("mode"), "endpoint": copy.deepcopy(source["endpoint"]),
+                "reference_id": source.get("reference_id"), "trusted_source": source.get("trusted_source", False),
+                "source_note": source.get("source_note", ""), "_protocol": copy.deepcopy(protocol),
+                "_binding": copy.deepcopy(source.get("connection_binding") or {}),
+                "_key_required": source.get("key_required", True) is not False}
+    config = _without_secret_fields(copy.deepcopy(source.config))
+    config["name"] = source.name
+    if kind == "task":
+        if getattr(source, "history_only", False):
+            original = getattr(source, "_history_snapshot", {}) or {}
+            if original.get("repeat_unavailable"):
+                raise RepeatError(original["repeat_unavailable"])
+            _repeat_require_fields(original.get("config"), _REPEAT_TASK_FIELDS | ({"ramps"} if config.get("mode") == "ramp" else set()))
+        _repeat_require_fields(config, _REPEAT_TASK_FIELDS)
+        if config.get("mode") == "ramp":
+            _repeat_require_fields(config, {"ramps"})
+    elif kind == "comparison":
+        _repeat_require_fields(config.get("shared_config"), _REPEAT_TASK_FIELDS)
+        _repeat_require_fields(config, {"groups", "execution_policy"})
+        if not isinstance(config["groups"], list) or not 2 <= len(config["groups"]) <= 4:
+            raise RepeatError("原记录缺少完整的冻结实验分组，不能准确复测；请新建测试")
+        for group in config["groups"]:
+            _repeat_require_fields(group, {"id", "name", "role", "rpm", "concurrency", "iterations"})
+    elif kind == "routing":
+        _repeat_require_fields(config, {"tier", "rpm", "baseline", "candidate"})
+        for side in ("baseline", "candidate"):
+            _repeat_require_fields(config[side], _REPEAT_TASK_FIELDS)
+        original = getattr(source, "repeat_corpus", None) or source.snap().get("corpus")
+        if original != routing_corpus.corpus_manifest(config["tier"]):
+            raise RepeatError("原路由清单版本或指纹已变化，不能准确复测")
+    elif kind == "quality":
+        _repeat_require_fields(config, {"resources", "suite_manifest", "capture_raw"})
+        if not isinstance(config["resources"], list) or not 1 <= len(config["resources"]) <= 2:
+            raise RepeatError("原记录缺少完整的冻结评测资源，不能准确复测；请新建测试")
+        config = _repeat_quality_config(source, config)
+    return config
+
+
+def _repeat_connection_nodes(kind, config):
+    if kind in ("task", "comparison"):
+        return [("main", "网关连接", config if kind == "task" else config["shared_config"], "")]
+    if kind == "routing":
+        return [(side, label, config[side], side) for side, label in (("baseline", "固定路由"), ("candidate", "智能路由"))]
+    if kind == "quality":
+        return [(f"resource-{index}", resource.get("name") or f"资源 {index + 1}", resource, "")
+                for index, resource in enumerate(config["resources"]) if not resource.get("historical_reference")]
+    return [("endpoint", "指纹采集通道", config["endpoint"], "")]
+
+
+def _repeat_resolve_connections(kind, config, supplied=None):
+    nodes = _repeat_connection_nodes(kind, config)
+    supplied = {} if supplied is None else supplied
+    if not isinstance(supplied, dict) or set(supplied) - {slot for slot, _, _, _ in nodes}:
+        raise RepeatError("补填密钥的连接位置无效")
+    states = []
+    for slot, label, connection, side in nodes:
+        override = supplied.get(slot, "")
+        if not isinstance(override, str) or len(override) > 8192 or any(char in override for char in "\r\n"):
+            raise RepeatError(f"{label}的接口密钥无效")
+        override = override.strip()
+        binding = config.get("_binding") if kind == "fingerprint" else connection
+        binding = binding or {}
+        lookup_url = binding.get("url") if kind == "fingerprint" and binding.get("url") else connection.get("url")
+        identifier = binding.get("connection_id")
+        issue = None
+        if override:
+            # Explicit replacement authenticates the frozen source address; it
+            # must not replace a named profile's key or keep a stale binding.
+            connection.pop("connection_id", None)
+            if kind == "fingerprint":
+                config["_binding"] = {"url": lookup_url}
+            key = override
+        elif identifier:
+            try:
+                key = CONNECTIONS.resolve(identifier, lookup_url)
+            except ValueError as exc:
+                key, issue = "", str(exc)
+        elif kind == "fingerprint" and config.get("_key_required") is False:
+            key = ""
+        else:
+            key = _routing_api_key(side, lookup_url) if side else _load_api_key(lookup_url)
+        connection["api_key"] = key
+        row = {"slot": slot, "label": label, "url": lookup_url, "model": connection.get("model"), "saved": bool(key)}
+        if kind == "fingerprint" and config.get("_key_required") is False:
+            row["optional"] = True
+        if not key:
+            if not row.get("optional"):
+                row["issue"] = issue or "本机没有该连接的已保存密钥，请补填后复测"
+        states.append(row)
+    return states
+
+
+def _repeat_preflight(kind, config):
+    if kind == "fingerprint":
+        protocol = config["_protocol"]
+        return {"level": "warn", "requires_confirmation": True, "planned_requests": len(protocol["cells"]) * protocol["samples_per_cell"],
+                "concurrency": protocol["concurrency"], "findings": [{"level": "warn", "title": "再次采集会发送请求并可能计费", "detail": "沿用原冻结协议，每次采集都需要重新确认请求数量及潜在费用。"}]}
+    if kind == "comparison":
+        groups = [preflight_payload({**config["shared_config"], **group, "mode": "smoke"}) for group in config["groups"]]
+        result = copy.deepcopy(groups[0])
+        for field in ("planned_requests", "min_seconds", "estimated_bytes"):
+            result[field] = sum(item[field] for item in groups)
+        findings = []
+        seen = set()
+        for item in groups:
+            for finding in item.get("findings", []):
+                signature = (finding.get("code"), finding.get("detail"))
+                if signature not in seen:
+                    seen.add(signature)
+                    findings.append(finding)
+        result["findings"] = findings
+        result["level"] = risk_level(findings, production_like=result["target"].get("production_like", False))
+        return result
+    if kind == "quality":
+        result = preflight_payload(config, kind="quality")
+        # The legacy estimator describes the first resource. Repetition checks
+        # each requested resource so a production candidate cannot bypass it.
+        checks = [estimate_quality_run({**config, "resources": [resource]}, config["case_count"])
+                  for resource in config["resources"] if not resource.get("historical_reference")]
+        risky = next((item for item in checks if item.get("requires_confirmation")), None)
+        if risky:
+            result.update(requires_confirmation=True, level="risk", target=risky["target"])
+            result["findings"] = risky["findings"]
+        return result
+    if kind == "routing":
+        return estimate_routing_run({**config, "capture_raw": bool(config["baseline"].get("capture_raw"))})
+    return preflight_payload(config)
+
+
+def prepare_repeat(body):
+    kind, source_id = body.get("source_kind"), body.get("source_id")
+    config = _repeat_frozen_config(kind, _repeat_source(kind, source_id))
+    connections = _repeat_resolve_connections(kind, config)
+    return {"source_kind": kind, "source_id": source_id, "name": config["name"], "connections": connections,
+            "preflight": _repeat_preflight(kind, config)}
+
+
+def create_repeat(body):
+    kind, source_id = body.get("source_kind"), body.get("source_id")
+    config = _repeat_frozen_config(kind, _repeat_source(kind, source_id))
+    connections = _repeat_resolve_connections(kind, config, body.get("keys"))
+    missing = [row["label"] for row in connections if not row["saved"] and not row.get("optional")]
+    if missing:
+        raise RepeatError("、".join(missing) + "缺少可用密钥，请补填后复测")
+    if _repeat_preflight(kind, config).get("requires_confirmation") and body.get("risk_acknowledged") is not True:
+        raise RepeatError("请确认本次测试的目标、请求数量及潜在费用后再来一次")
+    config["name"] = (str(config.get("name") or "测试")[:72] + " · 再来一次")
+    if kind == "task":
+        result = {"task_id": MANAGER.add(config).id}
+    elif kind == "comparison":
+        result = {"comparison_id": COMPARISONS.create(config).id}
+    elif kind == "routing":
+        result = {"routing_comparison_id": ROUTING_COMPARISONS.create(config).id}
+    elif kind == "quality":
+        result = {"quality_test_id": QUALITY.create(config, frozen_config=config, persist_credentials=False).id}
+    else:
+        protocol, binding = config.pop("_protocol"), config.pop("_binding")
+        config.pop("_key_required", None)
+        config["risk_acknowledged"] = True
+        result = {"fingerprint_id": FINGERPRINTS.create(config, frozen_protocol=protocol, connection_binding=binding)["id"]}
+    return {"ok": True, "source_kind": kind, "source_id": source_id, **result}
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = f"RouteLoad/{APP_VERSION}"
 
@@ -2179,7 +2459,7 @@ class Handler(BaseHTTPRequestHandler):
             "Content-Security-Policy": "default-src 'self'; base-uri 'none'; frame-ancestors 'none'; object-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'",
         }
 
-    def _json(self, data, status=200, headers=None):
+    def _json(self, data, status=200, headers=None, *, reveal_routing_key=False, reveal_connection_key=False):
         # 防御性脱敏：即使未来某个摘要误带入 api_key，也不能通过接口返回。
         def redact(value, path=()):
             if isinstance(value, dict):
@@ -2192,7 +2472,14 @@ class Handler(BaseHTTPRequestHandler):
             if isinstance(value, (list, tuple)):
                 return [redact(item, path) for item in value]
             return value
-        raw = json.dumps(redact(data), ensure_ascii=False).encode()
+        # Only the explicit, authenticated reveal action may return this one secret.
+        reveal_path = urllib.parse.urlsplit(getattr(self, "path", "")).path
+        connection_reveal = (reveal_connection_key and len(parts := reveal_path.strip("/").split("/")) == 3
+                             and parts[0] == "connections" and parts[2] == "reveal")
+        reveal = (((reveal_routing_key and reveal_path == "/routing-config/reveal") or connection_reveal)
+                  and self.command == "POST"
+                  and status == 200 and isinstance(data, dict) and set(data) == {"api_key"})
+        raw = json.dumps(data if reveal else redact(data), ensure_ascii=False).encode()
         if getattr(self, "command", "") == "GET" and urllib.parse.urlsplit(self.path).path == "/tasks" and status == 200:
             etag = '"' + hashlib.sha256(raw).hexdigest() + '"'
             headers = {**(headers or {}), "ETag": etag}
@@ -2232,6 +2519,8 @@ class Handler(BaseHTTPRequestHandler):
         assets = {
             "/static/tokens.css": ("tokens.css", "text/css; charset=utf-8"),
             "/static/app.js": ("app.js", "text/javascript; charset=utf-8"),
+            "/static/connections.js": ("connections.js", "text/javascript; charset=utf-8"),
+            "/static/repeat.js": ("repeat.js", "text/javascript; charset=utf-8"),
             "/static/app.css": ("app.css", "text/css; charset=utf-8"),
             "/static/actions.js": ("actions.js", "text/javascript; charset=utf-8"),
             "/static/ui-kit.js": ("ui-kit.js", "text/javascript; charset=utf-8"),
@@ -2292,11 +2581,14 @@ class Handler(BaseHTTPRequestHandler):
     def _fingerprint_post(self, path, body):
         parts = path.strip("/").split("/")
         if parts == ["fingerprint", "models"]:
-            # Discovery uses only the submitted connection; it never accesses the
-            # existing model-list route's saved credentials or starts a collection.
-            return self._json(discover_fingerprint_models(body))
+            return self._json(discover_fingerprint_models(_connection_with_credentials(body, remove_binding=True)))
         if parts == ["fingerprints"]:
-            run = FINGERPRINTS.create(body)
+            config = dict(body)
+            binding = None
+            if isinstance(config.get("endpoint"), dict):
+                binding = {key: config["endpoint"][key] for key in ("url", "connection_id") if config["endpoint"].get(key)}
+                config["endpoint"] = _connection_with_credentials(config["endpoint"], remove_binding=True)
+            run = FINGERPRINTS.create(config, connection_binding=binding)
             self._audit("fingerprint.create", target=run["id"], detail=run["mode"])
             return self._json({"run": run}, 201)
         if parts == ["fingerprint", "references", "import"]:
@@ -2394,7 +2686,7 @@ class Handler(BaseHTTPRequestHandler):
         path = parsed.path
         if path == "/":
             return self._html()
-        if path in {"/assets/fingerprint.js", "/assets/fingerprint.css", "/static/app.js", "/static/app.css", "/static/actions.js", "/static/ui-kit.js", "/static/tokens.css"}:
+        if path in {"/assets/fingerprint.js", "/assets/fingerprint.css", "/static/app.js", "/static/connections.js", "/static/repeat.js", "/static/app.css", "/static/actions.js", "/static/ui-kit.js", "/static/tokens.css"}:
             return self._asset(path)
         if path == "/auth/status":
             user = _current_user(self)
@@ -2421,6 +2713,11 @@ class Handler(BaseHTTPRequestHandler):
             return 200
         if path in {"/fingerprints", "/fingerprint"} or path.startswith(("/fingerprints/", "/fingerprint/")):
             return self._fingerprint_get(parsed)
+        if path == "/connections":
+            try:
+                return self._json({"connections": CONNECTIONS.list(), "storage_available": _keychain_available()})
+            except ConnectionStorageError as exc:
+                return self._json({"error": str(exc)}, 503)
         if path == "/admin/accounts":
             user = _current_user(self)
             if not user or user.get("role") != "admin":
@@ -2431,7 +2728,7 @@ class Handler(BaseHTTPRequestHandler):
             compact = query.get("summary") == ["1"]
             selected = query.get("selected", [None])[0]
             kind = query.get("kind", [None])[0]
-            data = {"tasks": MANAGER.ordered(), "comparisons": COMPARISONS.ordered(),
+            data = {"tasks": MANAGER.ordered(summary=compact), "comparisons": COMPARISONS.ordered(),
                     "quality_tests": QUALITY.ordered(summary=compact),
                     "routing_comparisons": ROUTING_COMPARISONS.ordered(),
                     "fingerprint_runs": FINGERPRINTS.list_runs(),
@@ -2542,6 +2839,24 @@ class Handler(BaseHTTPRequestHandler):
         if path.startswith("/comparison/"):
             run = COMPARISONS.get(path.split("/")[-1])
             return self._json(run.snap() if run else {"error": "对比实验不存在"}, 200 if run else 404)
+        if path.startswith("/routing-comparison/") and path.endswith("/requests"):
+            parts = path.split("/")
+            if len(parts) != 4 or not parts[2]:
+                return self._json({"error": "逐条请求地址无效"}, 400)
+            run = ROUTING_COMPARISONS.get(parts[2])
+            if not run:
+                return self._json({"error": "路由对照不存在"}, 404)
+            query = urllib.parse.parse_qs(parsed.query, keep_blank_values=True)
+            if any(key not in {"side", "offset", "limit"} or len(values) != 1
+                   for key, values in query.items()):
+                return self._json({"error": "逐条请求分页参数无效"}, 400)
+            try:
+                side = query.get("side", ["baseline"])[0]
+                offset = int(query.get("offset", ["0"])[0])
+                limit = int(query.get("limit", ["50"])[0])
+            except ValueError:
+                return self._json({"error": "逐条请求分页位置和条数必须是整数"}, 400)
+            return self._json(run.request_page(side, offset, limit))
         if path.startswith("/routing-comparison/"):
             run = ROUTING_COMPARISONS.get(path.split("/")[-1])
             return self._json(run.snap() if run else {"error": "路由对照不存在"}, 200 if run else 404)
@@ -2573,11 +2888,15 @@ class Handler(BaseHTTPRequestHandler):
             task = MANAGER.get(path.split("/")[-1])
             return self._json(task.snap() if task else {"error": "任务不存在"}, 200 if task else 404)
         if path == "/credential-status":
-            url = urllib.parse.parse_qs(parsed.query).get("url", [""])[0]
-            key = _load_api_key(url)
+            query = urllib.parse.parse_qs(parsed.query)
+            url = query.get("url", [""])[0]
+            side = query.get("side", [""])[0] if query.get("kind", [""])[0] == "routing" else ""
+            key = _routing_api_key(side, url) if side in ("baseline", "candidate") else _load_api_key(url)
             return self._json({"saved": bool(key), "hint": _api_key_hint(key), "storage_available": _keychain_available()})
         if path == "/config":
             return self._json({"config": read_saved_config()})
+        if path == "/routing-config":
+            return self._json({"config": read_saved_routing_config(), "storage_available": _keychain_available()})
         if path.startswith("/download/"):
             task = MANAGER.get(path.split("/")[-1])
             if not task or not task.out_path or not os.path.exists(task.out_path):
@@ -2668,6 +2987,42 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json({"error": "请先登录"}, 401)
             if path in {"/fingerprints", "/fingerprint"} or path.startswith(("/fingerprints/", "/fingerprint/")):
                 return self._fingerprint_post(path, body)
+            if path in {"/repeats/prepare", "/repeats"}:
+                try:
+                    if path == "/repeats/prepare":
+                        return self._json(prepare_repeat(body))
+                    result = create_repeat(body)
+                    self._audit("test.repeat", target=next(result[key] for key in ("task_id", "comparison_id", "routing_comparison_id", "quality_test_id", "fingerprint_id") if key in result),
+                                detail=f"来源 {result['source_kind']} / {result['source_id']}")
+                    return self._json(result, 201)
+                except RepeatError as exc:
+                    return self._json({"error": str(exc)}, exc.status)
+            if path == "/connections" or path.startswith("/connections/"):
+                try:
+                    parts = path.strip("/").split("/")
+                    if parts == ["connections"]:
+                        key = str(body.get("api_key") or "").strip()
+                        if not key and not body.get("id") and "source_side" in body:
+                            side = body.get("source_side")
+                            if side not in ("", "baseline", "candidate"):
+                                raise ValueError("密钥来源侧别无效")
+                            url = ConnectionStore.validate_url(body.get("url"))
+                            key = _routing_api_key(side, url)
+                        saved = CONNECTIONS.save(name=body.get("name"), url=body.get("url"), api_key=key,
+                                                 identifier=body.get("id"))
+                        self._audit("connection.save", target=saved["id"])
+                        return self._json({"ok": True, "connection": saved}, 200 if body.get("id") else 201)
+                    if len(parts) == 3 and parts[2] == "delete":
+                        CONNECTIONS.delete(parts[1])
+                        self._audit("connection.delete", target=parts[1])
+                        return self._json({"ok": True})
+                    if len(parts) == 3 and parts[2] == "reveal":
+                        key = CONNECTIONS.reveal(parts[1])
+                        self._audit("connection.key_reveal", target=parts[1])
+                        return self._json({"api_key": key}, reveal_connection_key=True)
+                    return self._json({"error": "常用连接接口不存在"}, 404)
+                except ConnectionStorageError as exc:
+                    return self._json({"error": str(exc)}, 503)
             if path == "/admin/accounts":
                 if user.get("role") != "admin":
                     return self._json({"error": "仅系统管理员可管理账号"}, 403)
@@ -2698,17 +3053,13 @@ class Handler(BaseHTTPRequestHandler):
                 self._audit("account.create", target=username, detail=role)
                 return self._json({"ok": True, "account": _public_account(account)})
             if path == "/routing-models":
-                # 路由对照的密钥只用于本次探测，不读写系统凭据或网关配置。
-                url = str(body.get("url") or "").strip()
-                key = str(body.get("api_key") or "").strip()
-                if not url or not key:
-                    raise ValueError("请填写该路由的网关地址和接口密钥")
-                parsed_url = urllib.parse.urlsplit(url)
-                if (parsed_url.scheme not in {"http", "https"} or not parsed_url.hostname
-                        or parsed_url.username is not None or parsed_url.password is not None
-                        or parsed_url.query or parsed_url.fragment
-                        or any(char.isspace() for char in url) or key in url):
-                    raise ValueError("网关地址须为有效的 HTTP（超文本传输协议）或 HTTPS（安全超文本传输协议）地址；密钥请填入独立字段")
+                side = str(body.get("side") or "")
+                connection = _routing_connection(body, side, require_key=True)
+                url, key = connection["url"], connection["api_key"]
+                # 探测前保存；慢响应返回后不再覆盖用户随后输入的新密钥。
+                saved = bool(key) if connection.get("connection_id") else _save_api_key(_routing_credential_ref(side, url), key)
+                if side:
+                    save_routing_connection(side, connection, save_secret=False)
                 try:
                     result = fetch_models_detailed_sync(url, {"Authorization": f"Bearer {key}"}, timeout=30)
                 except (TimeoutError, asyncio.TimeoutError):
@@ -2719,10 +3070,12 @@ class Handler(BaseHTTPRequestHandler):
                         error = error.replace(secret, "[密钥已隐藏]")
                     return self._json({"ok": False, "models": [], "error": error}, 502)
                 models = [model for model in result["models"] if key not in model]
-                return self._json({"ok": True, "models": models})
+                return self._json({"ok": True, "models": models, "saved": saved,
+                                   "storage_available": _keychain_available()})
             if path == "/models":
-                url = str(body.get("url") or "").strip()
-                key = str(body.get("api_key") or "").strip()
+                connection = _connection_with_credentials(body)
+                url = str(connection.get("url") or "").strip()
+                key = str(connection.get("api_key") or "").strip()
                 # 前端不会回填已保存的真实密钥；模型刷新时按 URL 从 macOS Keychain（钥匙串）复用。
                 if not key:
                     key = _load_api_key(url)
@@ -2730,9 +3083,11 @@ class Handler(BaseHTTPRequestHandler):
                     raise ValueError("需要网关 URL 和 API Key；也可以先保存密钥后留空复用")
                 result = fetch_models_detailed_sync(url, {"Authorization": f"Bearer {key}"})
                 if not result["ok"]:
-                    return self._json({"ok": False, "models": [], "error": result["error"]}, 502)
-                saved = _save_api_key(url, key)
-                return self._json({"ok": True, "models": result["models"], "attempted": result["attempted"], "saved": saved, "hint": _api_key_hint(key)})
+                    return self._json({"ok": False, "models": [], "error": _redact_secrets(result["error"], [key, urllib.parse.quote(key, safe="")])}, 502)
+                saved = bool(key) if connection.get("connection_id") else _save_api_key(url, key)
+                return self._json({"ok": True, "models": [model for model in result["models"] if key not in model],
+                                   "attempted": _redact_secrets(result["attempted"], [key]),
+                                   "saved": saved, "hint": _api_key_hint(key)})
             if path == "/preflight":
                 # 对「表单里的当前草稿」预检，而不是上一次保存的配置：
                 # 用户改了目标地址或题量能立刻看到风险变化，不需要先提交一次。
@@ -2741,6 +3096,10 @@ class Handler(BaseHTTPRequestHandler):
                 draft = body.get("config")
                 if not isinstance(draft, dict):
                     raise ValueError("preflight 需要携带 config 对象")
+                if kind == "routing":
+                    draft = _routing_config_with_credentials(draft)
+                else:
+                    draft = _config_with_connections(draft, kind=kind)
                 # 抽屉刚打开时草稿是空的（没有 URL / 模型），这里必须返回可读的
                 # 「配置尚不足以预检」，而不是 400——否则每打开一次新建面板
                 # 浏览器就记一条失败请求，真正的故障反而被噪声淹没。
@@ -2751,24 +3110,32 @@ class Handler(BaseHTTPRequestHandler):
                 blocked = require_risk_confirmation(validate_config(body, require_secret=False), body, kind="run")
                 if blocked:
                     return self._json({"error": blocked, "requires_confirmation": True}, 400)
-                task = MANAGER.add(body)
-                save_config(body)
+                draft = _connection_with_credentials(body)
+                task = MANAGER.add(draft)
+                save_config(draft, resolve_binding=False)
                 self._audit("task.create", target=task.id, detail=body.get("mode"))
                 return self._json({"ok": True, "task_id": task.id}, 201)
             if path == "/comparisons" and not parsed.query:
-                run = COMPARISONS.create(body)
-                save_config(body.get("shared_config") or {})
+                draft = dict(body)
+                draft["shared_config"] = _connection_with_credentials(body.get("shared_config") or {})
+                run = COMPARISONS.create(draft)
+                save_config(draft["shared_config"], resolve_binding=False)
                 return self._json({"ok": True, "comparison_id": run.id}, 201)
             if path == "/routing-comparisons" and not parsed.query:
                 # 路由对照同样受预检闸门约束：它会真实打到两条路由，可能产生费用。
-                draft = routing_compare.validate_config(body)
+                connections = _routing_config_with_credentials(body)
+                draft = routing_compare.validate_config(connections)
                 blocked = require_risk_confirmation(draft, body, kind="routing")
                 if blocked:
                     return self._json({"error": blocked, "requires_confirmation": True}, 400)
-                run = ROUTING_COMPARISONS.create(body)
+                run = ROUTING_COMPARISONS.create(connections)
+                for side in ("baseline", "candidate"):
+                    save_routing_connection(side, draft[side], resolve_binding=False)
                 # 两侧的地址与模型回填到常规表单，方便用户接着发起普通压测做交叉验证；
                 # 密钥不落常规配置（save_config 会在写入前剔除密钥字段）。
-                save_config({"url": draft["baseline"]["url"], "model": draft["baseline"]["model"]})
+                save_config({"url": draft["baseline"]["url"], "model": draft["baseline"]["model"],
+                             **({"connection_id": connections["baseline"]["connection_id"]} if connections["baseline"].get("connection_id") else {})},
+                            resolve_binding=False)
                 self._audit("routing_compare.create", target=run.id, detail=draft["tier"])
                 persist_history()
                 return self._json({"ok": True, "routing_comparison_id": run.id}, 201)
@@ -2783,7 +3150,7 @@ class Handler(BaseHTTPRequestHandler):
                 blocked = require_risk_confirmation(draft, body, kind="quality")
                 if blocked:
                     return self._json({"error": blocked, "requires_confirmation": True}, 400)
-                quality = QUALITY.create(body)
+                quality = QUALITY.create(_config_with_connections(body, kind="quality"))
                 return self._json({"ok": True, "quality_test_id": quality.id}, 201)
             if path == "/comparisons" and parsed.query.startswith("delete="):
                 target = urllib.parse.unquote(parsed.query.split("=", 1)[1])
@@ -2818,15 +3185,14 @@ class Handler(BaseHTTPRequestHandler):
                     self._audit("task.delete", target=task_id, ok=not error, detail=error)
                     return self._json({"ok": not error, "error": error}, 200 if not error else 400)
                 if action == "retry":
-                    old = MANAGER.get(task_id)
-                    if not old:
-                        raise ValueError("任务不存在")
-                    cfg = dict(old.config)
-                    if body.get("api_key"):
-                        cfg["api_key"] = str(body["api_key"]).strip()
-                    task = MANAGER.add(cfg)
-                    self._audit("task.retry", target=task.id, detail=f"来源 {task_id}")
-                    return self._json({"ok": True, "task_id": task.id}, 201)
+                    try:
+                        result = create_repeat({"source_kind": "task", "source_id": task_id,
+                                                "keys": {"main": body["api_key"]} if body.get("api_key") else {},
+                                                "risk_acknowledged": body.get("risk_acknowledged")})
+                    except RepeatError as exc:
+                        return self._json({"error": str(exc)}, exc.status)
+                    self._audit("task.retry", target=result["task_id"], detail=f"来源 {task_id}")
+                    return self._json(result, 201)
             if path == "/templates":
                 saved = TEMPLATES.save(body)
                 self._audit("template.save", target=saved.get("id"), detail=saved.get("name"))
@@ -2858,10 +3224,31 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json({"ok": True, **result, "storage": storage_overview()})
             if path == "/config":
                 cfg = dict(body)
-                if cfg.get("clear_api_key"):
+                if cfg.get("clear_api_key") and not cfg.get("connection_id"):
                     _delete_api_key(cfg.get("url"))
                 save_config(cfg)
                 return self._json({"ok": True})
+            if path == "/routing-config/reveal":
+                side = str(body.get("side") or "")
+                if side not in ("baseline", "candidate"):
+                    raise ValueError("路由侧别必须为 baseline（固定路由）或 candidate（智能路由）")
+                connection = _routing_connection(body, side)
+                saved = _public_routing_connections(_read_config_document().get("last_routing_config"))
+                if connection["url"] != saved.get(side, {}).get("url"):
+                    raise ValueError("地址已变化，请先保存该侧连接后再核对密钥")
+                key = (CONNECTIONS.resolve(connection["connection_id"], connection["url"])
+                       if connection.get("connection_id") else _routing_api_key(side, connection["url"]))
+                if not key:
+                    return self._json({"error": "该侧没有可读取的已保存密钥，请重新填写"}, 404)
+                self._audit("routing.key_reveal", target=side)
+                return self._json({"api_key": key}, reveal_routing_key=True)
+            if path == "/routing-config":
+                side = str(body.get("side") or "")
+                if side not in ("baseline", "candidate"):
+                    raise ValueError("路由侧别必须为 baseline（固定路由）或 candidate（智能路由）")
+                connection = _routing_connection(body, side, allow_empty=True)
+                saved = save_routing_connection(side, connection)
+                return self._json({"ok": True, "saved": saved, "storage_available": _keychain_available()})
             return self._json({"error": "not found"}, 404)
         except ValueError as exc:
             return self._json({"error": str(exc)}, 400)
@@ -2876,7 +3263,7 @@ def read_saved_config(*, include_credential=True):
         cfg = data.get("last_config", {}) if isinstance(data, dict) else {}
         if isinstance(cfg, dict):
             result = public_config(cfg)
-            key = _load_api_key(result.get("url")) if include_credential else ""
+            key = _saved_connection_key(result) if include_credential else ""
             if key:
                 result["api_key_saved"] = True
                 result["api_key_hint"] = _api_key_hint(key)
@@ -2888,21 +3275,125 @@ def read_saved_config(*, include_credential=True):
 
 CONFIG_SAVE_LOCK = threading.Lock()
 
-def save_config(cfg):
-    raw = dict(cfg or {})
-    if raw.get("url") and raw.get("api_key"):
-        _save_api_key(raw.get("url"), raw.get("api_key"))
-    cfg = public_config(raw)
+def _routing_credential_ref(side, url):
+    """同地址的两侧允许使用不同密钥；普通压测的旧引用保持兼容。"""
+    return f"routing:{side}:{str(url or '').strip().rstrip('/')}" if side else url
+
+
+def _routing_api_key(side, url):
+    if not url:
+        return ""
+    key = _load_api_key(_routing_credential_ref(side, url))
+    return key or (_load_api_key(url) if side else "")
+
+
+def _saved_connection_key(connection, side=""):
+    if connection.get("connection_id"):
+        try:
+            return CONNECTIONS.resolve(connection["connection_id"], connection.get("url"))
+        except ValueError:
+            return ""
+    return _routing_api_key(side, connection.get("url")) if side else _load_api_key(connection.get("url"))
+
+
+def _routing_connection(raw, side, *, require_key=False, allow_empty=False):
+    if side not in ("", "baseline", "candidate"):
+        raise ValueError("路由侧别必须为 baseline（固定路由）或 candidate（智能路由）")
+    raw = _connection_with_credentials(raw)
+    url = str(raw.get("url") or "").strip()
+    supplied = str(raw.get("api_key") or "").strip()
+    if not url:
+        if allow_empty and not supplied:
+            return {"name": str(raw.get("name") or "").strip()[:40], "url": "", "api_key": ""}
+        raise ValueError("请填写该路由的网关地址")
+    parsed = urllib.parse.urlsplit(url)
+    if (parsed.scheme not in {"http", "https"} or not parsed.hostname
+            or parsed.username is not None or parsed.password is not None
+            or parsed.query or parsed.fragment or any(char.isspace() for char in url)
+            or (supplied and supplied in url)):
+        raise ValueError("网关地址须为有效的 HTTP（超文本传输协议）或 HTTPS（安全超文本传输协议）地址；密钥请填入独立字段")
+    key = supplied or (_routing_api_key(side, url) if require_key else "")
+    if require_key and not key:
+        raise ValueError("请填写该路由的接口密钥；已自动保存的密钥可留空复用")
+    return {"name": str(raw.get("name") or "").strip()[:40], "url": url, "api_key": key,
+            **({"connection_id": raw["connection_id"]} if raw.get("connection_id") else {})}
+
+
+def _routing_config_with_credentials(raw):
+    cfg = _config_with_connections(raw, kind="routing")
+    for side in ("baseline", "candidate"):
+        if isinstance(cfg.get(side), dict):
+            connection = dict(cfg[side])
+            if not str(connection.get("api_key") or "").strip():
+                connection["api_key"] = _routing_api_key(side, str(connection.get("url") or "").strip())
+            cfg[side] = connection
+    return cfg
+
+
+def _public_routing_connections(raw):
+    if not isinstance(raw, dict):
+        return {}
+    return {side: {"name": str(value.get("name") or "").strip()[:40],
+                   "url": str(value.get("url") or "").strip(),
+                   **({"connection_id": value["connection_id"]} if value.get("connection_id") else {})}
+            for side in ("baseline", "candidate")
+            if isinstance(value := (raw or {}).get(side), dict)}
+
+
+def _read_config_document():
+    try:
+        with open(TASKS_FILE, encoding="utf-8") as source:
+            data = json.load(source)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _write_config_document(data):
     temp = f"{TASKS_FILE}.{os.getpid()}.{threading.get_ident()}.tmp"
-    with CONFIG_SAVE_LOCK:
-        with open(temp, "w", encoding="utf-8") as f:
-            json.dump({"last_config": cfg}, f, ensure_ascii=False, indent=2)
-            f.flush(); os.fsync(f.fileno())
-        os.replace(temp, TASKS_FILE)
+    with open(temp, "w", encoding="utf-8") as output:
+        json.dump(data, output, ensure_ascii=False, indent=2)
+        output.flush(); os.fsync(output.fileno())
+    os.replace(temp, TASKS_FILE)
     try:
         os.chmod(TASKS_FILE, 0o600)
     except OSError:
         pass
+
+
+def read_saved_routing_config():
+    connections = _public_routing_connections(_read_config_document().get("last_routing_config"))
+    for side, connection in connections.items():
+        connection["api_key_saved"] = bool(_saved_connection_key(connection, side))
+    return connections
+
+
+def save_routing_connection(side, connection, *, save_secret=True, resolve_binding=True):
+    connection = _connection_with_credentials(connection) if resolve_binding else dict(connection)
+    url, key = connection.get("url"), connection.get("api_key")
+    saved = (bool(key) if connection.get("connection_id") else
+             _save_api_key(_routing_credential_ref(side, url), key) if key and save_secret
+             else bool(_routing_api_key(side, url)))
+    with CONFIG_SAVE_LOCK:
+        data = _read_config_document()
+        connections = _public_routing_connections(data.get("last_routing_config"))
+        connections[side] = {"name": str(connection.get("name") or connections.get(side, {}).get("name") or "").strip()[:40],
+                             "url": str(url or "").strip(),
+                             **({"connection_id": connection["connection_id"]} if connection.get("connection_id") else {})}
+        _write_config_document({"last_config": public_config(data.get("last_config") or {}),
+                                "last_routing_config": connections})
+    return bool(saved)
+
+
+def save_config(cfg, *, resolve_binding=True):
+    raw = _connection_with_credentials(dict(cfg or {})) if resolve_binding else dict(cfg or {})
+    if raw.get("url") and raw.get("api_key") and not raw.get("connection_id"):
+        _save_api_key(raw.get("url"), raw.get("api_key"))
+    cfg = public_config(raw)
+    with CONFIG_SAVE_LOCK:
+        data = _read_config_document()
+        _write_config_document({"last_config": cfg,
+                                "last_routing_config": _public_routing_connections(data.get("last_routing_config"))})
 
 
 
@@ -3000,6 +3491,8 @@ def _routing_history_snapshot(snapshot):
         "report": snapshot.get("report"),
         # 隔离标记不是密钥；保留它才能事后核对这次运行的缓存命中是否可能被外部预热。
         "cache_isolation": snapshot.get("cache_isolation"),
+        "retry_policy": snapshot.get("retry_policy"),
+        "repeat_config": _without_secret_fields(snapshot.get("repeat_config")) if snapshot.get("repeat_config") else None,
         "limits": snapshot.get("limits"),
     }
 
@@ -3127,7 +3620,8 @@ def _restore_task_snapshot(snapshot, out_path=None):
     return task
 
 
-def _classify_history_result(result):
+def _classify_result(result):
+    """运行统计与旧文件恢复共用状态分类，保留既有错误判定优先级。"""
     status = result.get("status_code") or 0
     error = result.get("error_type")
     completed = bool(result.get("completed"))
@@ -3171,7 +3665,7 @@ def _legacy_task_from_file(path, fallback_cfg):
                 if not isinstance(result, dict):
                     continue
                 done += 1
-                category, label, css = _classify_history_result(result)
+                category, label, css = _classify_result(result)
                 counters[category] += 1
                 if result.get("ttft_ms") is not None:
                     try: ttft.append(float(result["ttft_ms"]))
@@ -3255,14 +3749,15 @@ def _legacy_task_from_file(path, fallback_cfg):
         "cur_step": 1, "target_rpm": float(cfg.get("rpm") or 0), "schedule_step": 1,
         "schedule_target_rpm": float(cfg.get("rpm") or 0), "counters": counters,
         "success_pct": counters["ok"] * 100 / done if done else None,
-        "ttft": {"n": len(ttft), "p50": percentile(ttft, .5), "p95": percentile(ttft, .95)},
-        "total_ms": {"n": len(total_ms), "p50": percentile(total_ms, .5), "p95": percentile(total_ms, .95), "avg": avg},
+        "ttft": {"n": len(ttft), **_latency_percentiles(ttft)},
+        "total_ms": {"n": len(total_ms), **_latency_percentiles(total_ms), "avg": avg},
         "rpm": {"live": 0, "avg": done * 60 / elapsed, "capacity_estimate": (legacy_concurrency * 60000 / avg) if avg else None},
-        "schedule_lag": {"p50": percentile(lag, .5), "p95": percentile(lag, .95)},
+        "schedule_lag": _latency_percentiles(lag),
         "phase": f"历史结果 · 已完成全部 {done} 条请求", "recent": list(reversed(recent)),
         "timeline": timeline, "out_path": path, "write_error": None, "created": created,
         "started_at": started_at, "finished_at": finished_at, "stopped_at": None, "elapsed": elapsed,
         "planned_duration": elapsed, "planned_count": done, "history_only": True,
+        "repeat_unavailable": "旧结果文件没有完整的原测试配置，不能准确复测；请新建测试",
     }
     return _restore_task_snapshot(snapshot, out_path=path)
 

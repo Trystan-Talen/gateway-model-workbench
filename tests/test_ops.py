@@ -225,11 +225,52 @@ class TemplateTests(unittest.TestCase):
     def test_every_builtin_config_passes_validation(self):
         for item in self.store.list():
             # 模板只包含「怎么压」的参数；目标是使用时才填的，所以这里补一个地址和模型再校验。
-            cfg = {"url": "http://127.0.0.1:9/v1", "model": "gpt-4o-mini", **item["config"]}
+            cfg = {"url": "http://127.0.0.1:9/v1", "model": "fixture-model",
+                   "api_key": "fixture-key-not-real", **item["config"]}
             validated = ui.validate_config(cfg, require_secret=False)
             steps, total = ui.build_plan(validated)
             self.assertGreater(total, 0, f"{item['id']} 的请求量为 0")
             self.assertTrue(steps, f"{item['id']} 没有生成计划步骤")
+
+    def test_all_builtin_pressure_defaults_are_100(self):
+        for item in self.store.list():
+            with self.subTest(template=item["id"]):
+                cfg = item["config"]
+                self.assertEqual(cfg["concurrency"], 100)
+                self.assertEqual(cfg["rpm"], 100)
+
+    def test_ramp_builtins_start_at_100_and_preserve_step_shape(self):
+        expected = {
+            "ramp-find-knee": ([100, 200, 300, 400, 500], 180),
+            "ramp-conservative": ([100, 200, 400, 600], 300),
+        }
+        for template_id, (rates, duration) in expected.items():
+            with self.subTest(template=template_id):
+                cfg = self.store.get(template_id)["config"]
+                self.assertEqual(cfg["mode"], "ramp")
+                self.assertEqual([int(rate) for rate in cfg["ramps"].split(",")], rates)
+                self.assertEqual(cfg["duration"], duration)
+                self.assertGreater(len(set(rates)), 1)
+
+    def test_pressure_defaults_survive_store_reload_without_rewriting_custom_templates(self):
+        custom_cfg = {"mode": "smoke", "concurrency": 7, "rpm": 321, "iterations": 45}
+        custom = self.store.save({"name": "自定义压力", "config": custom_cfg})
+        reopened = test_plan.TemplateStore(os.path.join(self.tmp, "templates.json"))
+        for item in reopened.list():
+            if item["builtin"]:
+                self.assertEqual(item["config"]["concurrency"], 100)
+                self.assertEqual(item["config"]["rpm"], 100)
+        self.assertEqual(reopened.get(custom["id"])["config"], custom_cfg)
+
+    def test_fixed_templates_preserve_sample_counts_and_durations(self):
+        for template_id, field, value in (
+            ("smoke-baseline", "iterations", 30),
+            ("smoke-verify-10x", "iterations", 300),
+            ("soak-30m", "duration", 1800),
+            ("soak-short-10m", "duration", 600),
+        ):
+            with self.subTest(template=template_id):
+                self.assertEqual(self.store.get(template_id)["config"][field], value)
 
     def test_builtin_configs_do_not_carry_secrets(self):
         for item in self.store.list():

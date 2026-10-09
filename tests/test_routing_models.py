@@ -1,8 +1,9 @@
-"""Routing discovery uses each supplied connection without saving its secret."""
+"""Routing discovery uses supplied or saved connections without exposing secrets."""
 import asyncio
 import http.client
 import json
 import threading
+import tempfile
 import unittest
 from http.server import ThreadingHTTPServer
 from unittest.mock import patch
@@ -17,9 +18,10 @@ class RoutingModelsTests(unittest.TestCase):
             patch.object(ui, '_current_user', lambda handler: {'role': 'user'}
                          if handler.headers.get('X-Test-Auth') == 'yes' else None),
             patch.object(ui.Handler, '_note'),
-            patch.object(ui, '_load_api_key'),
-            patch.object(ui, '_save_api_key'),
+            patch.object(ui, '_load_api_key', return_value=''),
+            patch.object(ui, '_save_api_key', return_value=True),
             patch.object(ui, 'save_config'),
+            patch.object(ui, '_keychain_available', return_value=True),
         ]
         self.mocks = [item.start() for item in self.patches]
         self.server = ThreadingHTTPServer(('127.0.0.1', 0), ui.Handler)
@@ -31,12 +33,9 @@ class RoutingModelsTests(unittest.TestCase):
         self.server.shutdown()
         self.server.server_close()
         self.thread.join(2)
-        try:
-            for mock in self.mocks[2:]:
-                mock.assert_not_called()
-        finally:
-            for item in reversed(self.patches):
-                item.stop()
+        self.mocks[4].assert_not_called()
+        for item in reversed(self.patches):
+            item.stop()
 
     def request(self, body=None, *, authenticated=True, origin=None):
         conn = http.client.HTTPConnection('127.0.0.1', self.server.server_port, timeout=5)
@@ -57,7 +56,7 @@ class RoutingModelsTests(unittest.TestCase):
             self.assertEqual(self.request(origin='https://foreign.invalid')[0], 403)
             fetch.assert_not_called()
 
-    def test_fetches_with_supplied_key_without_persistence(self):
+    def test_fetches_and_saves_supplied_key_without_plaintext_config(self):
         for url in ('https://synthetic.invalid', 'https://synthetic.invalid/v1',
                     'https://synthetic.invalid/v1/chat/completions'):
             with self.subTest(url=url):
@@ -72,11 +71,12 @@ class RoutingModelsTests(unittest.TestCase):
                 with patch.object(ui.httpx, 'AsyncClient', lambda **kwargs: client(transport=httpx.MockTransport(upstream), **kwargs)):
                     status, data = self.request({**self.connection, 'url': url})
                 self.assertEqual(status, 200, data)
-                self.assertEqual(data, {'ok': True, 'models': ['model-a', 'model-b']})
+                self.assertEqual(data, {'ok': True, 'models': ['model-a', 'model-b'], 'saved': True, 'storage_available': True})
+                self.mocks[3].assert_called_with(url, 'synthetic-routing-key')
                 self.assertTrue(all(request.method == 'GET' for request in requests))
                 self.assertEqual(str(requests[-1].url), 'https://synthetic.invalid/v1/models')
 
-    def test_invalid_connections_do_not_discover_or_load_saved_keys(self):
+    def test_invalid_connections_do_not_discover_or_save_keys(self):
         invalid = [{}, {'url': self.connection['url']}, {**self.connection, 'api_key': '  '},
                    *({**self.connection, 'url': url} for url in (
                        'file:///tmp/models', 'https://name:password@synthetic.invalid/v1',
@@ -87,6 +87,7 @@ class RoutingModelsTests(unittest.TestCase):
                 with self.subTest(body=body):
                     self.assertEqual(self.request(body)[0], 400)
             fetch.assert_not_called()
+            self.mocks[3].assert_not_called()
 
     def test_upstream_failure_is_readable_and_redacted(self):
         with patch.object(ui, 'fetch_models_detailed_sync', return_value={
@@ -99,7 +100,27 @@ class RoutingModelsTests(unittest.TestCase):
 
     def test_empty_list_does_not_fabricate_models(self):
         with patch.object(ui, 'fetch_models_detailed_sync', return_value={'ok': True, 'models': []}):
-            self.assertEqual(self.request(), (200, {'ok': True, 'models': []}))
+            self.assertEqual(self.request(), (200, {'ok': True, 'models': [], 'saved': True, 'storage_available': True}))
+
+    def test_empty_key_reuses_side_scoped_saved_key(self):
+        with tempfile.TemporaryDirectory() as folder, patch.object(ui, 'TASKS_FILE', folder + '/config.json'):
+            self.mocks[2].side_effect = lambda ref: 'synthetic-saved-key' if ref.startswith('routing:candidate:') else ''
+            with patch.object(ui, 'fetch_models_detailed_sync', return_value={'ok': True, 'models': ['saved-model']}) as fetch:
+                status, data = self.request({'side': 'candidate', 'url': self.connection['url'], 'api_key': ''})
+            self.assertEqual(status, 200)
+            self.assertTrue(data['saved'])
+            self.assertEqual(fetch.call_args.args[1], {'Authorization': 'Bearer synthetic-saved-key'})
+            self.assertNotIn('synthetic-saved-key', json.dumps(data))
+            self.mocks[3].assert_called_with('routing:candidate:' + self.connection['url'], 'synthetic-saved-key')
+
+    def test_unavailable_secure_store_does_not_claim_saved(self):
+        self.mocks[3].return_value = False
+        self.mocks[5].return_value = False
+        with patch.object(ui, 'fetch_models_detailed_sync', return_value={'ok': True, 'models': ['m']}):
+            status, data = self.request()
+        self.assertEqual(status, 200)
+        self.assertFalse(data['saved'])
+        self.assertFalse(data['storage_available'])
 
     def test_timeout_has_a_retryable_message(self):
         with patch.object(ui, 'fetch_models_detailed_sync', side_effect=TimeoutError) as fetch:

@@ -4,15 +4,13 @@
  */
 const {chromium} = require('playwright');
 const assert = require('node:assert/strict');
-const fs = require('node:fs'), path = require('node:path'), os = require('node:os');
+const fs = require('node:fs'), path = require('node:path');
 const {execFileSync} = require('node:child_process');
-const root = process.env.UI_PROJECT_ROOT || path.resolve(__dirname,'../..');
+const {projectRoot:root,output,env}=require('./artifacts.cjs').browserArtifacts('fingerprint');
 const assets = process.env.UI_ASSET_ROOT || path.join(root,'static');
-const output = process.env.UI_ARTIFACT_DIR || fs.mkdtempSync(path.join(os.tmpdir(),'fingerprint-ui-'));
-fs.mkdirSync(output,{recursive:true});
 const python = process.env.PYTHON || 'python3';
-const html = process.env.UI_HTML ? fs.readFileSync(process.env.UI_HTML,'utf8') : execFileSync(python,['-c','import route_test_ui; print(route_test_ui.INDEX_HTML)'],{cwd:root,encoding:'utf8',env:{...process.env,PYTHONDONTWRITEBYTECODE:'1'}});
-const fixture = JSON.parse(execFileSync(python,['-c','import json; from fingerprint_protocol import catalog,make_protocol; print(json.dumps({"catalog":catalog(),"protocol":make_protocol({"preset":"quick","samples_per_cell":10,"concurrency":2})}))'],{cwd:root,encoding:'utf8',env:{...process.env,PYTHONDONTWRITEBYTECODE:'1'}}));
+const html = process.env.UI_HTML ? fs.readFileSync(process.env.UI_HTML,'utf8') : execFileSync(python,['-c','import route_test_ui; print(route_test_ui.INDEX_HTML)'],{cwd:root,encoding:'utf8',env});
+const fixture = JSON.parse(execFileSync(python,['-c','import json; from fingerprint_protocol import catalog,make_protocol; print(json.dumps({"catalog":catalog(),"protocol":make_protocol({"preset":"quick","samples_per_cell":10,"concurrency":2})}))'],{cwd:root,encoding:'utf8',env}));
 const origin = 'http://127.0.0.1:18769';
 const errors = [], unexpected = [], assertions = [], allSubmissions = [];
 const clone = x => JSON.parse(JSON.stringify(x));
@@ -56,14 +54,14 @@ async function fillEndpoint(page,name='合成通道自检') {
       page.on('pageerror',e=>errors.push({width,message:e.message}));
       page.on('dialog',async d=>{errors.push({width,message:'Unexpected dialog: '+d.message()});await d.dismiss()});
       await context.route('**/*',async route=>{
-    if(await require('./assets.cjs').serveAsset(route,root))return;
+    if(await require('./assets.cjs').serveAsset(route,root,{fingerprintRoot:assets}))return;
         const req=route.request(), url=new URL(req.url()), endpoint=url.pathname, method=req.method();
         if(url.origin!==origin){unexpected.push(req.url());return route.abort()}
         if(endpoint==='/')return route.fulfill({contentType:'text/html',body:html});
-        if(endpoint==='/assets/fingerprint.js'||endpoint==='/assets/fingerprint.css')return route.fulfill({contentType:endpoint.endsWith('.js')?'text/javascript':'text/css',body:fs.readFileSync(path.join(assets,path.basename(endpoint)),'utf8')});
         let data;
         if(endpoint==='/auth/status')data={authenticated:true,user:{username:'合成回归',role:'user'}};
         else if(endpoint==='/config')data={config:{url:'https://unrelated.invalid/v1',model:'unrelated'}};
+        else if(endpoint==='/connections'&&method==='GET')data={connections:[],storage_available:true};
         else if(endpoint==='/templates')data={templates:[]};
         else if(endpoint==='/routing-corpus')data={tiers:[{tier:1000,bursts:10,note:'合成测试集'}],metrics:[]};
         else if(endpoint==='/tasks')data={tasks:[],comparisons:[],quality_tests:[],routing_comparisons:[],fingerprint_runs:runs.map(r=>{const x={...r};delete x.artifact;return x}),fingerprint_storage_warnings:[]};

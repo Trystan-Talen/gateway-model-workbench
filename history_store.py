@@ -60,7 +60,9 @@ class HistoryStore:
             with db:
                 db.execute("INSERT INTO metadata VALUES ('generation',?)", (uuid.uuid4().hex,))
             row = db.execute("SELECT value FROM metadata WHERE key='generation'").fetchone()
-        key = str(self.path)
+        # Different relative paths or symlinked directories can name one database.
+        # They must share committed digests or a writer may skip a needed update.
+        key = str(self.path.resolve())
         cached = _COMMITTED.get(key)
         if cached is None or cached[0] != row[0]:
             state = {kind: {} for kind in KINDS}
@@ -97,7 +99,7 @@ class HistoryStore:
                 committed.update(pending)
             except Exception:
                 # 事务已回滚：丢弃缓存，下次从数据库重建，避免摘要与磁盘不一致。
-                _COMMITTED.pop(str(self.path), None)
+                _COMMITTED.pop(str(self.path.resolve()), None)
                 raise
             finally:
                 db.close()

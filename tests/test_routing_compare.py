@@ -141,6 +141,17 @@ class InterleavedExecutionTests(unittest.TestCase):
         patch = mock.patch("routing_compare._results_dir", return_value=folder.name)
         patch.start()
         self.addCleanup(patch.stop)
+        # 本机模拟接口必须直连：macOS 即使清除代理环境变量，urllib 仍可能
+        # 读取系统代理。只在测试中关闭环境继承，不改变生产请求的代理行为。
+        client_type = routing_compare.httpx.AsyncClient
+
+        def local_client(*args, **kwargs):
+            kwargs["trust_env"] = False
+            return client_type(*args, **kwargs)
+
+        client_patch = mock.patch("routing_compare.httpx.AsyncClient", side_effect=local_client)
+        client_patch.start()
+        self.addCleanup(client_patch.stop)
 
     def _run(self, tier=PROD_TIER, baseline_url=None, candidate_url=None, rpm=60000):
         comparison = routing_compare.RouteComparison({

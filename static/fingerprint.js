@@ -1,9 +1,9 @@
-/* Model fingerprint workspace. No credentials are persisted or read from saved connections. */
+/* Model fingerprint workspace. Named connections are resolved by the server; no secrets are loaded into the form. */
 (() => {
   'use strict';
   const $ = id => document.getElementById(id);
   const UI = window.UI;
-  const html = value => String(value ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+  const html = UI.esc;
   const finite = value => value !== null && value !== undefined && value !== '' && Number.isFinite(Number(value));
   const number = (value, digits = 0) => finite(value) ? Number(value).toLocaleString('zh-CN', {maximumFractionDigits:digits, minimumFractionDigits:digits}) : '未知';
   const percent = value => finite(value) ? `${number(Number(value) * 100, 1)}%` : '未知';
@@ -22,6 +22,27 @@
   const s = {initialized:false,epoch:0,runs:[],references:[],catalog:null,catalogError:'',referenceError:'',catalogPending:false,referencesPending:false,catalogPromise:null,referencesPromise:null,storageWarnings:[],referencesLoaded:false,referencesAt:0,view:'runs',selected:null,tab:'overview',detail:null,detailError:'',detailPending:false,detailSignature:'',selection:0,referenceArtifacts:new Map(),samplePage:null,sampleError:'',samplePending:false,sampleOffset:0,sampleSequence:0,drawerOpen:false,drawerSession:0,submitting:false,modalOpen:false,modalSession:0,modalBusy:false,opener:null,modalOpener:null,refOpen:null,formProtocol:null,modelInputMode:'list',modelOptions:[],modelDiscoverySequence:0,modelDiscoveryPending:false,modelDiscoveryStatus:'',modelDiscoveryTone:'',adapterManual:false,adapterAuto:null};
   const active = () => typeof activeModule !== 'undefined' && activeModule === 'fingerprint';
   const signedIn = () => typeof authenticated === 'undefined' || authenticated;
+  let connectionId = '';
+  function connectionPickerHtml() {
+    const profiles = window.ConnectionUI?.list() || [];
+    const options = [['','手动填写地址和密钥'],...profiles.map(p => [p.id,`${p.name} · ${p.url}${p.api_key_saved?'':' · 密钥不可用'}`])];
+    if (connectionId && !profiles.some(p => p.id === connectionId)) options.push([connectionId,'已选择的连接不可用，请重新选择']);
+    return UI.field({id:'fpSavedConnection',label:'常用连接',controlHtml:UI.select({id:'fpSavedConnection',options,value:connectionId}).replace('<select ','<select data-change-action="selectFingerprintConnection" ')+UI.textButton('保存当前连接',{action:'saveFingerprintConnection'})+UI.textButton('管理常用连接',{action:'manageSavedConnections'}),hint:'选择本地保存的连接后，密钥留空复用；也可手动填写。'});
+  }
+  function renderConnectionPicker() {const host=$('fpConnectionPicker');if(host)host.innerHTML=connectionPickerHtml()}
+  function selectConnection(node) {
+    const id=node?.value||'',profile=(window.ConnectionUI?.list()||[]).find(p=>p.id===id);
+    if(id&&!profile){toastMessage('连接不可用，请刷新后重新选择。');return}
+    connectionId=id;
+    if(profile){$('fpUrl').value=profile.url;$('fpKey').value='';$('fpKey').type='password'}
+    $('fpKey').placeholder=id?'已选择常用连接，密钥留空复用':'本地免鉴权服务可留空';
+    invalidateModelConnection();$('fpRiskAck').checked=false;updateAdapterHint();
+  }
+  function saveConnection() {
+    if(connectionId)return window.ConnectionUI?.openEdit(connectionId);
+    const url=$('fpUrl')?.value.trim();if(!url)return toastMessage('请先填写要保存的请求地址。');
+    window.ConnectionUI?.openCreate({name:$('fpName')?.value.trim()||'',url,api_key:$('fpKey')?.value||''});
+  }
   const comparedReference = run => run?.comparison?.reference_id || (run?.mode === 'verify' ? run.reference_id : null);
   const running = run => ['waiting','running','stopping'].includes(run?.status);
   const date = value => {
@@ -68,6 +89,7 @@
     document.addEventListener('change', onChange);
     document.addEventListener('input', onInput);
     document.addEventListener('keydown', onKeydown, true);
+    window.addEventListener('connections-changed',()=>{if(s.drawerOpen){renderConnectionPicker();if(connectionId)invalidateModelConnection()}});
     $('fpCreateForm').addEventListener('submit', submitCreate);
     hide();
   }
@@ -172,8 +194,16 @@
     const expanded = same ? [...host.querySelectorAll('details[open][data-fp-details]')].map(el => el.dataset.fpDetails) : [];
     host.dataset.fpKey = key;
     host.innerHTML = (s.storageWarnings.length ? `<div class="fp-storage-warning">${notice('本地记录恢复提示：' + s.storageWarnings.join('；'),'warn')}</div>` : '') + content;
-    for (const [id,left,top] of tableScrolls) { const el = [...host.querySelectorAll('[data-fp-scroll]')].find(n => n.dataset.fpScroll === id); if (el) { el.scrollLeft = left; el.scrollTop = top; } }
-    for (const id of expanded) { const el = [...host.querySelectorAll('[data-fp-details]')].find(n => n.dataset.fpDetails === id); if (el) el.open = true; }
+    if (tableScrolls.length) {
+      const regions = new Map();
+      for (const el of host.querySelectorAll('[data-fp-scroll]')) if (!regions.has(el.dataset.fpScroll)) regions.set(el.dataset.fpScroll,el);
+      for (const [id,left,top] of tableScrolls) { const el = regions.get(id); if (el) { el.scrollLeft = left; el.scrollTop = top; } }
+    }
+    if (expanded.length) {
+      const details = new Map();
+      for (const el of host.querySelectorAll('[data-fp-details]')) if (!details.has(el.dataset.fpDetails)) details.set(el.dataset.fpDetails,el);
+      for (const id of expanded) { const el = details.get(id); if (el) el.open = true; }
+    }
     if (focusKey?.action) [...host.querySelectorAll('[data-fp-action]')].find(el => el.dataset.fpAction === focusKey.action && el.dataset.fpId === focusKey.id && el.dataset.fpTab === focusKey.tab && el.dataset.fpOffset === focusKey.offset)?.focus({preventScroll:true});
     else if (focusKey?.click) [...host.querySelectorAll('[data-click-action]')].find(el => el.dataset.clickAction === focusKey.click && el.dataset.arg1 === focusKey.arg)?.focus({preventScroll:true});
     main.scrollTop = scroll;
@@ -237,7 +267,7 @@
       UI.pageHeader({kicker:`模型指纹 · ${MODES[run.mode] || '分布采集'}`,title:run.name,
         description:'固定问题独立多次发送，观察回答分布；原始证据只保存在本机，导出前请留意目标地址与回答原文。',
         meta:[STATUSES[run.status] || run.status,run.endpoint?.model || '模型未记录',date(run.created),`${number(run.protocol?.cells?.length)} 格问题`,`每格 ${number(run.protocol?.samples_per_cell)} 次`,`并发 ${number(run.protocol?.concurrency)}`],
-        statusLabel:verdict.title,statusNote:verdict.note,statusTone:verdict.tone}),
+        statusLabel:verdict.title,statusNote:verdict.note,statusTone:verdict.tone,actionsHtml:window.RepeatUI?.button('fingerprint',run)||''}),
       UI.tabs({label:'模型指纹详情标签页',items:tabs,active:s.tab,action:'setFingerprintTab',ownerId:run.id}),
       progress,
       s.detailError ? notice('记录详情读取失败：' + s.detailError,'warn') + button('retry-detail','重新加载详情') : '',
@@ -345,11 +375,12 @@
     $('fpName').focus({preventScroll:true});
   }
   function buildCreate(mode, referenceId) {
+    connectionId='';
     resetModelDiscovery(); s.adapterManual = false; s.adapterAuto = null;
     const c = s.catalog, presets = c.presets || [], initial = findPreset('standard') || presets[0];
-    $('fpCreateBody').innerHTML = `<fieldset class="fp-mode-picker"><legend>本次要做什么</legend>${Object.entries(MODES).map(([id,label]) => `<label class="fp-mode-choice"><input type="radio" name="fpMode" value="${id}" ${id === mode ? 'checked' : ''}><span><b>${label}</b><small>${id === 'selfcheck' ? '无需参考，检查自身稳定性' : id === 'reference' ? '从已确认来源建立参考指纹' : '沿用参考协议采集目标通道'}</small></span></label>`).join('')}</fieldset><div class="fp-field"><label for="fpName">记录名称 <em>必填</em></label><input id="fpName" name="name" maxlength="120" required placeholder="例如：主通道 · 9 月稳定性自检" autocomplete="off"></div><section id="fpReferenceSection" class="fp-form-section" hidden><div class="fp-field"><label for="fpReference">选择参考指纹 <em>必填</em></label><select id="fpReference"><option value="">请选择一份当前有效的参考</option>${s.references.map(ref => { const h = referenceHealth(ref); return `<option value="${html(ref.id)}" ${h.usable ? '' : 'disabled'}>${html(ref.name)} · ${html(h.text)}</option>`; }).join('')}</select><p class="fp-field-hint">只采集目标通道；参考侧复用本地证据。</p></div><div id="fpReferenceNotice"></div></section><div class="fp-form-section"><h2>目标连接</h2><div class="fp-field"><label for="fpUrl">接口地址 <em>必填</em></label><input id="fpUrl" name="url" type="url" required placeholder="https://api.example.com/v1" autocomplete="off" spellcheck="false"><p class="fp-field-hint">填写兼容 OpenAI（模型服务商）聊天接口的基础地址或完整端点。</p></div><div class="fp-field"><label for="fpKey">接口密钥 <span>本次运行使用</span></label><div class="fp-secret"><input id="fpKey" name="api_key" type="password" placeholder="本地免鉴权服务可留空" autocomplete="new-password" spellcheck="false"><button type="button" class="btn" data-fp-action="toggle-key" aria-label="显示接口密钥" aria-pressed="false">显示</button></div></div><div class="fp-field fp-model-field"><label id="fpModelLabel" for="fpModelSelect">请求模型 <em>必填</em></label><div id="fpModelListPanel" class="model-row fp-model-row"><select id="fpModelSelect" required disabled aria-describedby="fpModelHelp fpModelStatus"><option value="">请先填写地址和密钥，再获取模型</option></select><button id="fpFetchModels" class="icon-btn" type="button" data-fp-action="fetch-models" title="从当前接口获取可用模型列表">获取模型</button></div><div class="model-fallback fp-model-fallback"><button id="fpManualModelToggle" class="text-btn" type="button" data-fp-action="model-input-mode" data-fp-model-mode="manual" aria-expanded="false" aria-controls="fpModelManualPanel">无法获取列表？手动指定模型</button></div><div id="fpModelManualPanel" hidden><input id="fpModel" name="model" maxlength="256" placeholder="填写服务商支持的准确模型名称" autocomplete="off" spellcheck="false" disabled aria-describedby="fpModelManualHelp fpModelStatus"><p id="fpModelManualHelp" class="fp-field-hint">仅在接口不支持模型列表时使用；请填写准确模型名称，系统不会自动验证名称是否存在。</p></div><p id="fpModelStatus" class="fp-model-status" role="status" hidden></p><p id="fpModelHelp" class="fp-field-hint">填写地址和密钥后获取列表，不会启动采集。本次只采集一个选定模型；接口不支持列表时可手动填写。</p></div></div><div class="fp-form-section"><h2>采集协议</h2><div class="fp-field"><label for="fpPreset">采集范围</label><select id="fpPreset">${presets.map(p => `<option value="${html(p.id)}" ${p.id === initial?.id ? 'selected' : ''}>${html(p.id === 'quick' ? '快速采集' : p.label)} · ${presetCells(p)} 格</option>`).join('')}</select></div><div class="fp-form-grid"><div class="fp-field"><label for="fpSamples">每格请求数</label><input id="fpSamples" type="number" min="10" max="100" step="1" required value="${Number(initial?.samples_per_cell || 20)}"></div><div class="fp-field"><label for="fpConcurrency">并发数</label><input id="fpConcurrency" type="number" min="1" max="8" step="1" required value="1"></div><div class="fp-field"><label for="fpTimeout">单次超时（秒）</label><input id="fpTimeout" type="number" min="5" max="120" step="1" required value="30"></div><div class="fp-field"><label for="fpAdapter">接口适配</label><select id="fpAdapter" aria-describedby="fpAdapterHint">${(c.adapters || [{id:'standard'}]).map(a => `<option value="${html(a.id)}">${html(adapterLabel(a.id))}</option>`).join('')}</select></div></div><div id="fpAdapterHint" class="fp-notice" role="status" hidden></div><div id="fpProtocolLock" class="fp-field-hint"></div><details class="fp-details" id="fpProbePreview"></details><details class="fp-details"><summary>固定项与适配说明</summary><p>温度 1.0、核采样 1.0、输出令牌上限 16、不重试。每次只有系统与用户两条消息，系统提示词固定、无历史记忆、无工具调用。</p><p>接口适配只使用预定义请求字段。更换适配器、样本数、并发或超时都会改变协议，不能与旧参考直接对照。</p><p>若服务不支持这些采样参数，请保留错误证据并选择合适适配，不自动降级参数。</p></details></div><section id="fpSourceSection" class="fp-form-section" hidden><h2>参考来源</h2><div class="fp-field"><label for="fpSourceNote">可追溯的来源说明 <em>必填</em></label><textarea id="fpSourceNote" maxlength="1000" rows="3" placeholder="例如：供应商官方账户直连，已核对模型版本和后台配置"></textarea></div><label class="fp-checkbox"><input type="checkbox" id="fpTrusted"><span>我已独立确认来源可信，并接受系统仅记录此声明。</span></label></section><section class="fp-budget" aria-live="polite"><div class="fp-budget-top"><div><span>本次实际请求</span><strong id="fpRequestCount">—</strong></div><span id="fpBudgetFormula"></span></div><p id="fpBudgetNote"></p><label class="fp-checkbox"><input type="checkbox" id="fpRiskAck" required><span id="fpRiskLabel">我确认本次采集会向目标发出请求，并可能产生上游费用。</span></label></section>`;
+    $('fpCreateBody').innerHTML = `<fieldset class="fp-mode-picker"><legend>本次要做什么</legend>${Object.entries(MODES).map(([id,label]) => `<label class="fp-mode-choice"><input type="radio" name="fpMode" value="${id}" ${id === mode ? 'checked' : ''}><span><b>${label}</b><small>${id === 'selfcheck' ? '无需参考，检查自身稳定性' : id === 'reference' ? '从已确认来源建立参考指纹' : '沿用参考协议采集目标通道'}</small></span></label>`).join('')}</fieldset><div class="fp-field"><label for="fpName">记录名称 <em>必填</em></label><input id="fpName" name="name" maxlength="120" required placeholder="例如：主通道 · 9 月稳定性自检" autocomplete="off"></div><section id="fpReferenceSection" class="fp-form-section" hidden><div class="fp-field"><label for="fpReference">选择参考指纹 <em>必填</em></label><select id="fpReference"><option value="">请选择一份当前有效的参考</option>${s.references.map(ref => { const h = referenceHealth(ref); return `<option value="${html(ref.id)}" ${h.usable ? '' : 'disabled'}>${html(ref.name)} · ${html(h.text)}</option>`; }).join('')}</select><p class="fp-field-hint">只采集目标通道；参考侧复用本地证据。</p></div><div id="fpReferenceNotice"></div></section><div class="fp-form-section"><h2>目标连接</h2><div id="fpConnectionPicker"></div><div class="fp-field"><label for="fpUrl">接口地址 <em>必填</em></label><input id="fpUrl" name="url" type="url" required placeholder="https://api.example.com/v1" autocomplete="off" spellcheck="false"><p class="fp-field-hint">填写兼容 OpenAI（模型服务商）聊天接口的基础地址或完整端点。</p></div><div class="fp-field"><label for="fpKey">接口密钥 <span>本次运行使用</span></label><div class="fp-secret"><input id="fpKey" name="api_key" type="password" placeholder="本地免鉴权服务可留空" autocomplete="new-password" spellcheck="false"><button type="button" class="btn" data-fp-action="toggle-key" aria-label="显示接口密钥" aria-pressed="false">显示</button></div></div><div class="fp-field fp-model-field"><label id="fpModelLabel" for="fpModelSelect">请求模型 <em>必填</em></label><div id="fpModelListPanel" class="model-row fp-model-row"><select id="fpModelSelect" required disabled aria-describedby="fpModelHelp fpModelStatus"><option value="">请先填写地址和密钥，再获取模型</option></select><button id="fpFetchModels" class="icon-btn" type="button" data-fp-action="fetch-models" title="从当前接口获取可用模型列表">获取模型</button></div><div class="model-fallback fp-model-fallback"><button id="fpManualModelToggle" class="text-btn" type="button" data-fp-action="model-input-mode" data-fp-model-mode="manual" aria-expanded="false" aria-controls="fpModelManualPanel">无法获取列表？手动指定模型</button></div><div id="fpModelManualPanel" hidden><input id="fpModel" name="model" maxlength="256" placeholder="填写服务商支持的准确模型名称" autocomplete="off" spellcheck="false" disabled aria-describedby="fpModelManualHelp fpModelStatus"><p id="fpModelManualHelp" class="fp-field-hint">仅在接口不支持模型列表时使用；请填写准确模型名称，系统不会自动验证名称是否存在。</p></div><p id="fpModelStatus" class="fp-model-status" role="status" hidden></p><p id="fpModelHelp" class="fp-field-hint">填写地址和密钥后获取列表，不会启动采集。本次只采集一个选定模型；接口不支持列表时可手动填写。</p></div></div><div class="fp-form-section"><h2>采集协议</h2><div class="fp-field"><label for="fpPreset">采集范围</label><select id="fpPreset">${presets.map(p => `<option value="${html(p.id)}" ${p.id === initial?.id ? 'selected' : ''}>${html(p.id === 'quick' ? '快速采集' : p.label)} · ${presetCells(p)} 格</option>`).join('')}</select></div><div class="fp-form-grid"><div class="fp-field"><label for="fpSamples">每格请求数</label><input id="fpSamples" type="number" min="10" max="100" step="1" required value="${Number(initial?.samples_per_cell || 20)}"></div><div class="fp-field"><label for="fpConcurrency">并发数</label><input id="fpConcurrency" type="number" min="1" max="8" step="1" required value="1"></div><div class="fp-field"><label for="fpTimeout">单次超时（秒）</label><input id="fpTimeout" type="number" min="5" max="120" step="1" required value="30"></div><div class="fp-field"><label for="fpAdapter">接口适配</label><select id="fpAdapter" aria-describedby="fpAdapterHint">${(c.adapters || [{id:'standard'}]).map(a => `<option value="${html(a.id)}">${html(adapterLabel(a.id))}</option>`).join('')}</select></div></div><div id="fpAdapterHint" class="fp-notice" role="status" hidden></div><div id="fpProtocolLock" class="fp-field-hint"></div><details class="fp-details" id="fpProbePreview"></details><details class="fp-details"><summary>固定项与适配说明</summary><p>温度 1.0、核采样 1.0、输出令牌上限 16、不重试。每次只有系统与用户两条消息，系统提示词固定、无历史记忆、无工具调用。</p><p>接口适配只使用预定义请求字段。更换适配器、样本数、并发或超时都会改变协议，不能与旧参考直接对照。</p><p>若服务不支持这些采样参数，请保留错误证据并选择合适适配，不自动降级参数。</p></details></div><section id="fpSourceSection" class="fp-form-section" hidden><h2>参考来源</h2><div class="fp-field"><label for="fpSourceNote">可追溯的来源说明 <em>必填</em></label><textarea id="fpSourceNote" maxlength="1000" rows="3" placeholder="例如：供应商官方账户直连，已核对模型版本和后台配置"></textarea></div><label class="fp-checkbox"><input type="checkbox" id="fpTrusted"><span>我已独立确认来源可信，并接受系统仅记录此声明。</span></label></section><section class="fp-budget" aria-live="polite"><div class="fp-budget-top"><div><span>本次实际请求</span><strong id="fpRequestCount">—</strong></div><span id="fpBudgetFormula"></span></div><p id="fpBudgetNote"></p><label class="fp-checkbox"><input type="checkbox" id="fpRiskAck" required><span id="fpRiskLabel">我确认本次采集会向目标发出请求，并可能产生上游费用。</span></label></section>`;
     if (referenceId && [...$('fpReference').options].some(o => o.value === referenceId && !o.disabled)) $('fpReference').value = referenceId;
-    paintModelControls(); applyMode();
+    renderConnectionPicker();window.ConnectionUI?.refresh().then(()=>{if(s.drawerOpen)renderConnectionPicker()}).catch(()=>{});paintModelControls(); applyMode();
   }
   const createMode = () => document.querySelector('input[name="fpMode"]:checked')?.value || 'selfcheck';
   function updateCreateHeading(mode) {
@@ -418,7 +449,7 @@
     (mode === 'manual' ? $('fpModel') : s.modelOptions.length ? $('fpModelSelect') : $('fpFetchModels'))?.focus({preventScroll:true});
   }
   function modelDiscoveryCurrent(request) {
-    return s.drawerOpen && signedIn() && request.sequence === s.modelDiscoverySequence && request.session === s.drawerSession && request.epoch === s.epoch && $('fpUrl')?.value.trim() === request.connection.url && $('fpKey')?.value === request.connection.api_key;
+    return s.drawerOpen && signedIn() && request.sequence === s.modelDiscoverySequence && request.session === s.drawerSession && request.epoch === s.epoch && $('fpUrl')?.value.trim() === request.connection.url && $('fpKey')?.value === request.connection.api_key && connectionId === (request.connection.connection_id||'');
   }
   async function discoverModels() {
     if (!s.drawerOpen || s.modelDiscoveryPending) return;
@@ -429,7 +460,7 @@
     if (invalid) {
       s.modelDiscoveryStatus = invalid; s.modelDiscoveryTone = 'warn'; paintModelControls(); $('fpUrl')?.focus(); return;
     }
-    const request = {sequence:++s.modelDiscoverySequence,session:s.drawerSession,epoch:s.epoch,connection:{url,api_key:$('fpKey').value}};
+    const request = {sequence:++s.modelDiscoverySequence,session:s.drawerSession,epoch:s.epoch,connection:{url,api_key:$('fpKey').value,...(connectionId?{connection_id:connectionId}:{})}};
     s.modelInputMode = 'list'; s.modelOptions = []; s.modelDiscoveryPending = true;
     s.modelDiscoveryStatus = '仅请求一次模型目录；不会发送采集题目。'; s.modelDiscoveryTone = '';
     $('fpModelSelect').value = ''; $('fpRiskAck').checked = false; paintModelControls();
@@ -547,7 +578,7 @@
     if (mode === 'reference' && (!$('fpTrusted').checked || !$('fpSourceNote').value.trim())) return formError('建立参考需要来源说明与可信来源声明。','fpSourceNote');
     const ref = s.references.find(r => r.id === $('fpReference').value);
     if (mode === 'verify' && (!ref || !referenceHealth(ref).usable || !matchPreset(protocolOf(ref)))) return formError('请选择当前协议可用且未过期的参考。','fpReference');
-    const config = {name,mode,endpoint:{url,model,api_key:$('fpKey').value},preset:$('fpPreset').value,samples_per_cell:Number($('fpSamples').value),concurrency:Number($('fpConcurrency').value),timeout_seconds:Number($('fpTimeout').value),adapter:$('fpAdapter').value,risk_acknowledged:true};
+    const config = {name,mode,endpoint:{url,model,api_key:$('fpKey').value,...(connectionId?{connection_id:connectionId}:{})},preset:$('fpPreset').value,samples_per_cell:Number($('fpSamples').value),concurrency:Number($('fpConcurrency').value),timeout_seconds:Number($('fpTimeout').value),adapter:$('fpAdapter').value,risk_acknowledged:true};
     if (mode === 'reference') { config.trusted_source = true; config.source_note = $('fpSourceNote').value.trim(); }
     if (mode === 'verify') config.reference_id = $('fpReference').value;
     const session = s.drawerSession; s.submitting = true; $('fpSubmit').disabled = true; $('fpSubmit').textContent = '正在创建…'; $('fpFormError').hidden = true;
@@ -694,7 +725,7 @@
   function onInput(event) {
     if (s.drawerOpen && $('fpCreateForm').contains(event.target) && event.target.id !== 'fpRiskAck') {
       if (['fpSamples','fpConcurrency','fpTimeout','fpUrl','fpModel','fpModelSelect','fpKey'].includes(event.target.id)) $('fpRiskAck').checked = false;
-      if (['fpUrl','fpKey'].includes(event.target.id)) invalidateModelConnection();
+      if (['fpUrl','fpKey'].includes(event.target.id)) {connectionId='';renderConnectionPicker();invalidateModelConnection()}
       if (event.target.id === 'fpSamples') updateBudget();
       if (event.target.id === 'fpUrl') updateAdapterHint();
     }
@@ -702,7 +733,7 @@
   function onChange(event) {
     const el = event.target;
     if (el.name === 'fpMode') applyMode();
-    if (['fpUrl','fpKey'].includes(el.id) && s.drawerOpen) invalidateModelConnection();
+    if (['fpUrl','fpKey'].includes(el.id) && s.drawerOpen) {connectionId='';renderConnectionPicker();invalidateModelConnection()}
     if (el.id === 'fpModelSelect' || el.id === 'fpModel') $('fpRiskAck').checked = false;
     if (el.id === 'fpReference') { $('fpRiskAck').checked = false; applyReference(); }
     if (el.id === 'fpPreset') { const preset = findPreset(el.value); if (preset) $('fpSamples').value = preset.samples_per_cell; $('fpRiskAck').checked = false; updateBudget(); }
@@ -712,6 +743,7 @@
     if (el.id === 'fpCompareReference') updateCompareNotice();
   }
   function onKeydown(event) {
+    if(window.ConnectionUI?.isOpen())return;
     const overlay = s.modalOpen ? $('fingerprintModal') : s.drawerOpen ? $('fingerprintDrawer') : null;
     if (overlay) {
       if (event.key === 'Escape') { event.preventDefault(); event.stopImmediatePropagation(); if (s.modalOpen) closeModal(); else closeCreate(); return; }
@@ -725,5 +757,5 @@
       return;
     }
   }
-  window.FingerprintUI = Object.freeze({init,setRuns,updateChrome,render,openCreate,closeCreate,hide,onAuthLost,select,setTab});
+  window.FingerprintUI = Object.freeze({init,setRuns,updateChrome,render,openCreate,closeCreate,hide,onAuthLost,select,setTab,selectConnection,saveConnection,getSelectedId:()=>s.selected});
 })();

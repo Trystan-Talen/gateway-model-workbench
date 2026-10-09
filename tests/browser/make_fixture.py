@@ -1,7 +1,10 @@
 """Generate synthetic UI fixtures; never reads user data or calls an upstream."""
-import json, time, sys
+import json, time, sys, os
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+out=Path(sys.argv[1]).resolve();out.mkdir(parents=True,exist_ok=True)
+os.environ['ROUTE_TEST_DATA_DIR']=str(out/'data')
+os.environ['ROUTE_TEST_DISABLE_CREDENTIAL_STORE']='1'
 import route_test_ui as ui
 cfg = ui.validate_config({'url':'https://example.test/v1','api_key':'fixture-not-a-real-key','model':'model-fixture','mode':'smoke','name':'单次压测 · 界面验收','concurrency':40})
 steps, total = ui.build_plan(cfg); t = ui.Task(cfg, steps, total); t.id='single-fixture';t.status='finished';t.started_at=time.time()-20;t.finished_at=time.time();t.done=t.total;t.scheduled=t.total;t.started=t.total;t.counters['ok']=t.total;t.ttft.extend([110,150,180]);t.total_ms.extend([450,500,520]);t.recent.append({'id':1,'step':1,'status':200,'cls':'ok','label':'成功','ttft':110,'total':450,'reason':''});t.timeline.extend([{'rpm':30,'target_rpm':60},{'rpm':60,'target_rpm':60}])
@@ -17,7 +20,5 @@ quality.id='quality-fixture';quality.status='finished';quality.results=[{
     'summary':{'total_cases':2,'passed_cases':2,'score':1,'percentage':100,'pass_rate':1}
 } for name in ['资源 A','资源 B']]
 fixture={'tasks':[s]+[dict(s,id=f'single-{n}',name=f'界面验收 · 历史记录 {n}') for n in range(20)],'comparisons':[c.snap()],'quality_tests':[quality.snap()]}
-out=Path(sys.argv[1]);out.mkdir(parents=True,exist_ok=True)
 (out/'fixture.json').write_text(json.dumps(fixture,ensure_ascii=False))
 (out/'index.html').write_text(ui.INDEX_HTML)
-

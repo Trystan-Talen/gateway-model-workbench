@@ -71,6 +71,28 @@ def unlink_artifact(path):
         return False
 
 
+def _iter_artifacts(base_dir, *, excluded_names=()):
+    """单次目录扫描中读取候选产物的元数据。"""
+    try:
+        entries = os.scandir(base_dir)
+    except OSError:
+        return
+    with entries:
+        for entry in entries:
+            try:
+                if entry.name in excluded_names or not is_artifact_name(entry.name) or not entry.is_file():
+                    continue
+                stat = entry.stat()
+            except OSError:
+                continue
+            yield {
+                "name": entry.name,
+                "path": entry.path,
+                "size": stat.st_size,
+                "mtime": stat.st_mtime,
+            }
+
+
 def scan_orphans(base_dir, referenced_names):
     """列出结果目录里存在、但没有被任何任务引用的产物。
 
@@ -79,27 +101,7 @@ def scan_orphans(base_dir, referenced_names):
     本函数只报告，不删除。
     """
     referenced = {os.path.basename(str(x)) for x in (referenced_names or ()) if x}
-    orphans = []
-    try:
-        entries = os.scandir(base_dir)
-    except OSError:
-        return orphans
-    with entries:
-        for entry in entries:
-            try:
-                if not entry.is_file() or not is_artifact_name(entry.name):
-                    continue
-                if entry.name in referenced:
-                    continue
-                stat = entry.stat()
-            except OSError:
-                continue
-            orphans.append({
-                "name": entry.name,
-                "path": entry.path,
-                "size": stat.st_size,
-                "mtime": stat.st_mtime,
-            })
+    orphans = list(_iter_artifacts(base_dir, excluded_names=referenced))
     orphans.sort(key=lambda item: item["mtime"], reverse=True)
     return orphans
 
@@ -113,27 +115,20 @@ def storage_summary(base_dir, referenced, orphan_scan_limit=50):
     total_bytes = 0
     artifact_count = 0
     referenced_bytes = 0
+    referenced_names = {os.path.basename(str(name)) for name in referenced if name}
+    orphans = []
     largest = None
-    try:
-        entries = os.scandir(base_dir)
-    except OSError:
-        entries = None
-    if entries is not None:
-        with entries:
-            for entry in entries:
-                try:
-                    if not entry.is_file() or not is_artifact_name(entry.name):
-                        continue
-                    size = entry.stat().st_size
-                except OSError:
-                    continue
-                artifact_count += 1
-                total_bytes += size
-                if entry.name in referenced:
-                    referenced_bytes += size
-                if largest is None or size > largest["size"]:
-                    largest = {"name": entry.name, "size": size}
-    orphans = scan_orphans(base_dir, referenced.keys())
+    for item in _iter_artifacts(base_dir):
+        size = item["size"]
+        artifact_count += 1
+        total_bytes += size
+        if item["name"] in referenced:
+            referenced_bytes += size
+        if largest is None or size > largest["size"]:
+            largest = {"name": item["name"], "size": size}
+        if item["name"] not in referenced_names:
+            orphans.append(item)
+    orphans.sort(key=lambda item: item["mtime"], reverse=True)
     orphan_bytes = sum(item["size"] for item in orphans)
     return {
         "artifact_count": artifact_count,

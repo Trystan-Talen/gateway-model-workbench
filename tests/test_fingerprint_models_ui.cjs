@@ -7,7 +7,7 @@ const vm = require('node:vm');
 const assert = require('node:assert/strict');
 const asset = process.env.UI_FINGERPRINT_JS || path.resolve(__dirname,'../static/fingerprint.js');
 const original = fs.readFileSync(asset,'utf8');
-const source = original.replace('window.FingerprintUI = Object.freeze({init,setRuns,updateChrome,render,openCreate,closeCreate,hide,onAuthLost,select,setTab});','window.__modelTest = {s,referenceLibrary,welcome,defaultCreateMode,updateCreateHeading,selectedModel,paintModelControls,invalidateModelConnection,setModelInputMode,discoverModels,resetModelDiscovery,updateAdapterHint,isDeepseekOfficial,onInput,onChange,closeCreate,onAuthLost};');
+const source = original.replace(/window\.FingerprintUI = Object\.freeze\(\{[^}]+\}\);/,'window.__modelTest = {s,referenceLibrary,welcome,defaultCreateMode,updateCreateHeading,selectedModel,paintModelControls,invalidateModelConnection,setModelInputMode,discoverModels,resetModelDiscovery,updateAdapterHint,isDeepseekOfficial,onInput,onChange,closeCreate,onAuthLost,selectConnection,renderConnectionPicker};');
 const nodes = new Map();
 let focused = null; let formMode = 'selfcheck';
 function element(id) {

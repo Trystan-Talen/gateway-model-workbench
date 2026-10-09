@@ -2,20 +2,14 @@
  * NODE_PATH=<directory containing playwright> node tests/browser/workflow.cjs
  */
 const {chromium}=require('playwright');
-const fs=require('fs'),path=require('path'),os=require('os'),assert=require('node:assert/strict');
-const {spawn}=require('child_process');
-const output=process.env.UI_ARTIFACT_DIR||fs.mkdtempSync(path.join(os.tmpdir(),'route-workflow-'));
-fs.mkdirSync(output,{recursive:true});
-const failures=[],children=[];
-async function start(){
- const child=spawn(process.env.PYTHON||'python3',['-u',path.join(__dirname,'workflow_server.py'),output]);children.push(child);
- child.stderr.on('data',chunk=>fs.appendFileSync(path.join(output,'server.log'),chunk));
- const endpoints=await new Promise((resolve,reject)=>{let text='';child.stdout.on('data',b=>{text+=b;try{resolve(JSON.parse(text.split('\n')[0]))}catch{}});child.on('error',reject);child.on('exit',code=>reject(new Error('server exit '+code)));});
- return {...endpoints,child};
-}
+const path=require('path'),assert=require('node:assert/strict');
+const artifacts=require('./artifacts.cjs').browserArtifacts('workflow');
+const {output}=artifacts;
+const servers=require('./server.cjs').browserServers(artifacts);
+const failures=[];
 async function eventually(fn,message){const until=Date.now()+20000;while(Date.now()<until){if(await fn())return;await new Promise(r=>setTimeout(r,40))}throw Error(message)}
 (async()=>{
- let server=await start();
+ let server=await servers.start();
  const browser=await chromium.launch({headless:true,executablePath:process.env.CHROME_PATH||undefined});
  try{
  const context=await browser.newContext({viewport:{width:1440,height:1000}});
@@ -87,10 +81,26 @@ async function eventually(fn,message){const until=Date.now()+20000;while(Date.no
  }
  const markup=await page.evaluate(()=>({off:comparisonGroupHtml({config:{capture_raw:false}},{summary:{recent:[{id:0}]}}),missing:comparisonGroupHtml({config:{capture_raw:true}},{summary:{recent:[{id:0}]}})}));
  assert.ok(!markup.off.includes('raw-link'));assert.ok(markup.missing.includes('暂不可用'));assert.ok(!markup.missing.includes('data-click-action="showRaw'));
+ // Exercise repetition through real managers and the loopback upstream, including credential fallback.
+ const originalComparison=await call('/comparison/'+comparison),originalFailed=await call('/quality-test/'+bad);
+ const preview=await call('/repeats/prepare',{source_kind:'comparison',source_id:comparison});
+ assert.equal(preview.connections[0].saved,false);assert.equal(preview.preflight.planned_requests,4);
+ const {comparison_id:repeatedComparison}=await call('/repeats',{source_kind:'comparison',source_id:comparison,keys:{main:'synthetic-key-only'}});
+ assert.notEqual(repeatedComparison,comparison);
+ let repeated;await eventually(async()=>{repeated=await call('/comparison/'+repeatedComparison);return repeated.status==='finished'},'repeated comparison final state');
+ assert.deepEqual(repeated.groups.map(g=>[g.role,g.concurrency,g.rpm,g.iterations]),originalComparison.groups.map(g=>[g.role,g.concurrency,g.rpm,g.iterations]));
+ for(let i=0;i<2;i++){assert.notEqual(repeated.groups[i].task_id,originalComparison.groups[i].task_id);assert.notEqual(repeated.groups[i].summary.out_path,originalComparison.groups[i].summary.out_path)}
+ assert.deepEqual((await call('/comparison/'+comparison)).groups,originalComparison.groups,'original comparison evidence stays intact');
+ const {quality_test_id:repeatedQuality}=await call('/repeats',{source_kind:'quality',source_id:bad,keys:{'resource-0':'synthetic-key-only'}});
+ assert.notEqual(repeatedQuality,bad);
+ let repeatedQ;await eventually(async()=>{repeatedQ=await call('/quality-test/'+repeatedQuality);return repeatedQ.status==='finished_with_errors'},'repeated quality final state');
+ assert.equal(repeatedQ.planned_cases,originalFailed.planned_cases);assert.equal(repeatedQ.config.suite_manifest.fingerprint,originalFailed.config.suite_manifest.fingerprint);
+ assert.deepEqual(repeatedQ.resources[0].case_results.map(r=>r.case_id),originalFailed.resources[0].case_results.map(r=>r.case_id));
+ assert.deepEqual((await call('/quality-test/'+bad)).resources,originalFailed.resources,'original quality evidence stays intact');
  // Restart the isolated server, then read disk-backed task evidence through HTTP and UI.
- server.child.kill('SIGTERM');server=await start();
+ await servers.stop(server.child);server=await servers.start();
  await call('/auth/login',{username:'regression',password:'local-test-888@'});
- await page.goto(server.base);await page.waitForFunction(()=>qualityTests.length===2&&!refreshing);await page.evaluate(()=>clearInterval(refreshTimer));
+ await page.goto(server.base);await page.waitForFunction(()=>qualityTests.length===3&&!refreshing);await page.evaluate(()=>clearInterval(refreshTimer));
  assert.equal((await call('/tasks')).tasks.length,0,'comparison children must stay out of standalone list after restart');
  q=await call('/quality-test/'+id);assert.equal(q.progress,1);assert.equal(q.resources[0].case_results[0].response,'PONG');
  await page.evaluate(async id=>{setModule('quality');setRecordFilter('compare');await selectQuality(id)},id);
@@ -99,6 +109,6 @@ async function eventually(fn,message){const until=Date.now()+20000;while(Date.no
  await page.setViewportSize({width:390,height:844});
  await page.screenshot({path:path.join(output,'quality-mobile.png')});
  assert.deepEqual(failures,[]);
- console.log(JSON.stringify({passed:true,progress:[0,10,20,30,40,50,60,70,80,90,100],rawGroups:2,qualityRestart:true,pageErrors:failures,output},null,2));
- }finally{await browser.close();for(const child of children)child.kill('SIGTERM')}
-})().catch(e=>{console.error(e);for(const child of children)child.kill('SIGTERM');process.exitCode=1});
+ console.log(JSON.stringify({passed:true,progress:[0,10,20,30,40,50,60,70,80,90,100],rawGroups:2,repeats:['comparison','quality'],qualityRestart:true,pageErrors:failures,output},null,2));
+ }finally{try{await browser.close()}finally{await servers.close()}}
+})().catch(async e=>{console.error(e);process.exitCode=1;await servers.close()});

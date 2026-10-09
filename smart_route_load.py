@@ -13,6 +13,7 @@ import codecs
 import json
 import math
 import os
+import re
 import sys
 import time
 import urllib.parse
@@ -29,6 +30,7 @@ CHAT_PATH = "/v1/chat/completions"
 DONE_SENTINEL = "[DONE]"
 RAW_CAPTURE_LIMIT = int(os.environ.get("ROUTE_TEST_RAW_LIMIT", str(1024 * 1024)))
 PARSE_BUFFER_LIMIT = 2 * 1024 * 1024
+USAGE_RETRY_POLICY = "explicit-unsupported-v2"
 
 
 SMOKE_PROMPTS = (
@@ -195,6 +197,55 @@ def classify_failure(status_code, body_text="", header_text="", fallback_pattern
     if 400 <= status_code < 500:
         return "HTTP_4XX", False, False
     return "HTTP_OTHER", False, False
+
+
+def _usage_options_rejected(status_code, body_text):
+    """只识别上游明确拒绝流式用量参数的校验错误，不把限流或鉴权当作兼容问题。
+
+    错误正文仅在内存中分类；调用方只得到布尔事实，不回显上游错误正文。
+    """
+    if status_code not in (400, 422):
+        return False
+    target_field = re.compile(r"\b(?:stream_options|include_usage)\b", re.IGNORECASE)
+
+    def rejected(error):
+        if isinstance(error, list):
+            # 不把一个字段的未知错误与另一个字段的普通校验错误拼成降级证据。
+            return any(rejected(item) for item in error)
+        if isinstance(error, dict):
+            nested = error.get("error") or error.get("detail") or error.get("errors")
+            if nested is not None:
+                return rejected(nested)
+            field = error.get("param") or error.get("parameter") or error.get("loc")
+            if field is not None and not target_field.search(json.dumps(field)):
+                return False
+            # 只看错误字段，响应中的请求回显不能成为兼容性证据。
+            error = {key: error[key] for key in
+                     ("message", "msg", "code", "type", "param", "parameter", "loc")
+                     if key in error}
+            detail = json.dumps(error, ensure_ascii=False).lower()
+        else:
+            detail = str(error or "").lower()
+        if not target_field.search(detail):
+            return False
+        return any(marker in detail for marker in (
+            "unsupported", "not supported", "does not support", "doesn't support",
+            "unknown", "unrecognized", "unexpected", "not allowed", "not permitted",
+            "extra_forbidden", "不支持", "未知字段", "不允许",
+        ))
+
+    try:
+        parsed = json.loads(str(body_text or ""))
+    except (TypeError, ValueError):
+        parsed = body_text
+    return rejected(parsed)
+
+
+def should_retry_without_usage(result, include_usage, stream=True):
+    """有明确兼容证据才允许去掉 usage 参数重试一次。"""
+    return bool(include_usage and stream and not result.get("usage_seen")
+                and result.get("status_code") in (400, 422)
+                and result.get("_usage_options_rejected"))
 
 
 def new_blank_result():
@@ -473,6 +524,9 @@ async def do_request(client, item, payload, headers, timeout_cfg, fb_patterns=No
                         raw_truncated = raw_truncated or len(chunk) > remain
                 error_type = classify_failure(status_code)[0]
                 reason = f"HTTP {status_code}"
+                # 私有标记只供当前 worker 决定是否降级；逐条结果存储会忽略它。
+                result["_usage_options_rejected"] = _usage_options_rejected(
+                    status_code, "".join(parse_parts))
             else:
                 line_buffer = ""
                 event_parser = new_sse_event_parser()
@@ -657,6 +711,7 @@ async def run(args):
         headers["Authorization"] = f"Bearer {args.api_key}"
     headers.setdefault("Accept", "text/event-stream")
     client = httpx.AsyncClient(http2=args.http2, verify=not args.insecure)
+    out = None
     chat_url = _chat_url(args.url, args.chat_url)
     try:
         if args.dry_run:
@@ -726,14 +781,15 @@ async def run(args):
                                               {"connect": args.connect_timeout, "read": args.read_timeout,
                                                "write": args.write_timeout, "pool": args.connect_timeout},
                                               chat_url=chat_url, include_usage=usage_mode[0])
-                    # 网关不认 stream_options.include_usage 时通常直接 400；这时整轮
-                    # 降级为「不带 usage 参数」再请求一次，避免把兼容性差异记成失败。
-                    if usage_mode[0] and 400 <= (result.get("status_code") or 0) < 500 and not result.get("usage_seen"):
+                    # 仅在上游明确拒绝 usage 参数时降级；429 等失败保留且不追加请求。
+                    if should_retry_without_usage(result, usage_mode[0], args.stream):
                         usage_mode[0] = False
                         result = await do_request(client, item, payload, headers,
                                                   {"connect": args.connect_timeout, "read": args.read_timeout,
                                                    "write": args.write_timeout, "pool": args.connect_timeout},
                                                   chat_url=chat_url, include_usage=False)
+                    result.pop("_usage_options_rejected", None)
+                    result["usage_retry_policy"] = USAGE_RETRY_POLICY
                     if out:
                         async with write_lock:
                             out.write(json.dumps(result, ensure_ascii=False) + "\n")
@@ -746,11 +802,16 @@ async def run(args):
 
         producer_task = asyncio.create_task(producer())
         workers = [asyncio.create_task(worker()) for _ in range(args.concurrency)]
-        await producer_task
-        await q.join()
-        await asyncio.gather(*workers)
-        if out:
-            out.close()
+        pending = [producer_task, *workers]
+        try:
+            # 同时观察生产者和工作协程；否则队列满时工作协程失败会永久等入队。
+            await asyncio.gather(*pending)
+        except BaseException:
+            for task in pending:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*pending, return_exceptions=True)
+            raise
         if usage_mode[0]:
             print("usage 计量：已启用 stream_options.include_usage")
         else:
@@ -758,9 +819,11 @@ async def run(args):
         print(f"完成：{done}/{total}" + (f"，结果：{args.out}" if args.out else ""))
         return 0
     finally:
-        if out:
-            out.close()
-        await client.aclose()
+        try:
+            if out:
+                out.close()
+        finally:
+            await client.aclose()
 
 
 def main():

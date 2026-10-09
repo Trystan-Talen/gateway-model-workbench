@@ -24,7 +24,8 @@ Wilson 区间在样本量小的时候不会像正态近似那样给出越界或�
 本模块会把这个排除数量单独报出来，让读者知道结论建立在多少条证据上。
 """
 import math
-from collections import Counter
+import re
+from collections import Counter, deque
 
 
 # 归因等级：本次观测能不能支撑「差异来自路由」这句话。
@@ -32,12 +33,21 @@ ATTRIBUTION_OK = "attributable"
 ATTRIBUTION_WEAK = "not_attributable"
 ATTRIBUTION_UNKNOWN = "insufficient_evidence"
 
+# 新增的序列统计另行标版本，不改已有报告的成功率、缓存与显著性口径。
+STABILITY_PROTOCOL_VERSION = "routing-stability-v1"
+TTFT_EWMA_WINDOW = 5
+TTFT_EWMA_ALPHA = 0.5
+
 # 报告里固定出现的指标口径说明。界面直接读这里，避免前后端各写一份、慢慢对不上。
 METRIC_LABELS = [
     {"key": "success", "label": "成功率", "basis": "完整 2xx 响应 / 已收到结果"},
     {"key": "cache", "label": "缓存命中率", "basis": "usage.cached_tokens>0 / 返回了 usage 的请求"},
     {"key": "ttft", "label": "TTFT p95（首字耗时）", "basis": "仅统计成功请求"},
     {"key": "total_latency", "label": "总耗时 p95", "basis": "仅统计成功请求"},
+    {"key": "max_consecutive_failures", "label": "最大连续失败次数",
+     "basis": "按请求清单序号；未返回结果与编号间断打断连续性"},
+    {"key": "ttft_ewma_max", "label": "TTFT（首字耗时）最大 EWMA（指数加权移动平均）",
+     "basis": "连续 5 条有效成功请求；窗口首值初始化，平滑系数 0.5，取窗口最终值最大"},
     {"key": "reliability", "label": "配对一致性", "basis": "按 item_id 配对，未配对整对剔除"},
 ]
 
@@ -85,9 +95,11 @@ def fisher_exact_two_sided(a, b, c, d):
             return float("-inf")
         return _log_factorial(n) - _log_factorial(k) - _log_factorial(n - k)
 
+    log_normalizer = _log_choose(total, row1)
+
     def _prob(x):
         return math.exp(_log_choose(col1, x) + _log_choose(total - col1, row1 - x)
-                        - _log_choose(total, row1))
+                        - log_normalizer)
 
     lo = max(0, row1 - (total - col1))
     hi = min(row1, col1)
@@ -214,13 +226,17 @@ def cache_hit_rate(records):
     没有 usage 的请求不进分母，单独计数。这个口径必须与 ``analyze.cache_stats``
     和在线累加器三方一致，任何一处漂移都会让缓存结论失真。
     """
-    eligible = [r for r in records if r.get("cached_tokens") is not None]
-    hits = sum(1 for r in eligible if (r.get("cached_tokens") or 0) > 0)
+    eligible = hits = 0
+    for record in records:
+        cached = record.get("cached_tokens")
+        if cached is not None:
+            eligible += 1
+            hits += int((cached or 0) > 0)
     return {
         "hits": hits,
-        "eligible": len(eligible),
+        "eligible": eligible,
         "total": len(records),
-        "no_usage": len(records) - len(eligible),
+        "no_usage": len(records) - eligible,
     }
 
 
@@ -265,6 +281,11 @@ def compare_cache(baseline_records, candidate_records):
     """比较两侧缓存命中率，并把「无 usage」当作不可比而非未命中。"""
     base = cache_hit_rate(baseline_records)
     cand = cache_hit_rate(candidate_records)
+    return _compare_cache_counts(base, cand, baseline_records, candidate_records)
+
+
+def _compare_cache_counts(base, cand, baseline_records, candidate_records):
+    """最终报告复用侧汇总的计数，段首污染判定仍读取完整记录。"""
     cold = {"baseline": cold_start_hits(baseline_records), "candidate": cold_start_hits(candidate_records)}
     contaminated = [side for side, stat in cold.items()
                     if stat["unexplained"] >= CONTAMINATION_MIN_HITS
@@ -328,6 +349,11 @@ def compare_latency(baseline_values, candidate_values, ratio=0.95):
     """比较延迟分位数。延迟不报 p 值——分布形状未知，用区间会假装精确。"""
     base = percentile(baseline_values, ratio)
     cand = percentile(candidate_values, ratio)
+    return _compare_latency_points(base, cand, ratio)
+
+
+def _compare_latency_points(base, cand, ratio=0.95):
+    """复用已算出的分位点；差值仍用未四舍五入的值计算。"""
     return {
         "ratio": ratio,
         "baseline_ms": None if base is None else round(base, 1),
@@ -338,41 +364,258 @@ def compare_latency(baseline_values, candidate_values, ratio=0.95):
     }
 
 
+def _record_ok(record):
+    """沿用历史报告的完整响应口径，实时观测与最终报告共用。"""
+    if record.get("ok") is not None:
+        return bool(record.get("ok"))
+    cls = record.get("class") or record.get("cls")
+    if cls is not None:
+        return cls == "ok"
+    status = record.get("status_code")
+    return bool(status and 200 <= status < 300 and record.get("completed"))
+
+
+def request_index(record):
+    """读取清单序号；旧记录只从可验证的路由语料编号恢复，不推测完成顺序。"""
+    for field in ("index", "request_index"):
+        value = record.get(field)
+        if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+            return value
+    item_id = record.get("item_id")
+    match = re.fullmatch(r"routing-ab-v[0-9]+-([0-9]{6,12})", item_id) if isinstance(item_id, str) else None
+    return int(match.group(1)) if match else None
+
+
+def ordered_records(records):
+    """按清单序号排列；未知序号放末尾，不能据其位置统计连续性。"""
+    def order_key(record):
+        index = request_index(record)
+        return (index is None, index if index is not None else 0)
+    return sorted(records, key=order_key)
+
+
+def stability_protocol():
+    """返回独立的统计口径说明，供实时、最终报告与界面共用。"""
+    return {
+        "version": STABILITY_PROTOCOL_VERSION,
+        "order_by": "index",
+        "failure_basis": "same_as_success_rate",
+        "missing_result_policy": "break_sequence",
+        "unordered_result_policy": "excluded",
+        "duplicate_index_policy": "excluded",
+        "ttft_ewma": {
+            "window_size": TTFT_EWMA_WINDOW,
+            "alpha": TTFT_EWMA_ALPHA,
+            "seed": "first_sample",
+            "max_basis": "final_value_of_each_complete_window",
+            "sample_basis": "consecutive_successful_requests_with_finite_nonnegative_ttft",
+        },
+    }
+
+
+def sequence_stability(records):
+    """按清单序号算连续失败与 5 次首字耗时平滑峰值，不跨越尚未返回的请求。
+
+    并发结果按完成顺序落盘，因此必须先恢复请求顺序。未知编号与重复编号不具备
+    唯一的请求位置，不能拿落盘位置冒充清单位置；重复编号的全部结果均排除。
+    每个窗口的平滑值从首个有效样本初始化，只比较第 5 次递推后的最终值。
+    """
+    indexed = [(request_index(record), record) for record in records]
+    index_counts = Counter(index for index, _ in indexed if index is not None)
+    ordered = sorted((index, record) for index, record in indexed
+                     if index is not None and index_counts[index] == 1)
+    unordered_count = sum(index is None for index, _ in indexed)
+    duplicate_count = sum(count for count in index_counts.values() if count > 1)
+    previous_index = None
+    consecutive_failures = max_failures = eligible_ttft = window_count = 0
+    ttft_window = deque(maxlen=TTFT_EWMA_WINDOW)
+    maximum_ewma = None
+    for index, record in ordered:
+        if previous_index is None or index != previous_index + 1:
+            consecutive_failures = 0
+            ttft_window.clear()
+        previous_index = index
+        if not _record_ok(record):
+            consecutive_failures += 1
+            max_failures = max(max_failures, consecutive_failures)
+            ttft_window.clear()
+            continue
+        consecutive_failures = 0
+        ttft = record.get("ttft_ms")
+        if not isinstance(ttft, (int, float)) or isinstance(ttft, bool):
+            ttft_window.clear()
+            continue
+        try:
+            ttft = float(ttft)
+        except OverflowError:
+            ttft_window.clear()
+            continue
+        if not math.isfinite(ttft) or ttft < 0:
+            ttft_window.clear()
+            continue
+        eligible_ttft += 1
+        ttft_window.append(ttft)
+        if len(ttft_window) < TTFT_EWMA_WINDOW:
+            continue
+        window_count += 1
+        smoothed = ttft_window[0]
+        for sample in list(ttft_window)[1:]:
+            smoothed = TTFT_EWMA_ALPHA * sample + (1 - TTFT_EWMA_ALPHA) * smoothed
+        maximum_ewma = smoothed if maximum_ewma is None else max(maximum_ewma, smoothed)
+    return {
+        "max_consecutive_failures": max_failures if ordered else None,
+        "ttft_ewma_max_ms": None if maximum_ewma is None else round(maximum_ewma, 1),
+        "ordered_requests": len(ordered),
+        "unordered_requests": unordered_count,
+        "excluded_duplicate_requests": duplicate_count,
+        "ttft_eligible_requests": eligible_ttft,
+        "ttft_ewma_windows": window_count,
+    }
+
+
+def _stability_comparison(baseline, candidate):
+    return {"baseline": baseline, "candidate": candidate, "protocol": stability_protocol(),
+            "note": "按请求清单序号统计；未返回请求不作失败，编号间断打断连续性。"}
+
+
+def response_diagnostics(records):
+    """只汇总可验证的状态和失败类型；绝不返回请求地址、正文或异常详情。"""
+    statuses, failures = Counter(), Counter()
+    http_2xx = complete_2xx = completed_responses = 0
+    known_types = {"TIMEOUT", "NETWORK", "PROTOCOL", "HTTP_429", "HTTP_5XX",
+                   "HTTP_4XX", "HTTP_OTHER"}
+    for record in records:
+        status = record.get("status_code")
+        if not isinstance(status, int) or isinstance(status, bool) or not 100 <= status <= 599:
+            status = None
+        statuses[str(status) if status is not None else "no_status"] += 1
+        is_2xx = status is not None and 200 <= status < 300
+        completed = bool(record.get("completed"))
+        http_2xx += int(is_2xx)
+        complete_2xx += int(is_2xx and completed)
+        completed_responses += int(completed)
+        if _record_ok(record):
+            continue
+        error_type = record.get("error_type")
+        if error_type not in known_types:
+            if is_2xx:
+                error_type = "PROTOCOL"
+            elif status == 408:
+                error_type = "TIMEOUT"
+            elif status == 429:
+                error_type = "HTTP_429"
+            elif status is not None and status >= 500:
+                error_type = "HTTP_5XX"
+            elif status is not None and status >= 400:
+                error_type = "HTTP_4XX"
+            elif status is not None:
+                error_type = "HTTP_OTHER"
+            else:
+                error_type = "UNKNOWN"
+        failures[error_type] += 1
+    return {
+        "http_2xx": http_2xx,
+        "complete_2xx": complete_2xx,
+        "incomplete_2xx": http_2xx - complete_2xx,
+        "completed_responses": completed_responses,
+        "failures": sum(failures.values()),
+        "failure_types": dict(sorted(failures.items())),
+        "status_codes": dict(sorted(statuses.items())),
+    }
+
+
+def _summarize_side(records):
+    """实时与最终报告共用侧统计，每条成功请求只收集一次延迟。"""
+    successes = 0
+    ttft_values, total_values = [], []
+    for record in records:
+        if _record_ok(record):
+            successes += 1
+            ttft_values.append(record.get("ttft_ms"))
+            total_values.append(record.get("total_ms"))
+    ttft = percentile(ttft_values, .95)
+    total = percentile(total_values, .95)
+    cache = cache_hit_rate(records)
+    stability = sequence_stability(records)
+    return {
+        "ttft": ttft, "total": total, "cache_counts": cache,
+        "public": {
+            "requests": len(records),
+            "success": public_rate(rate_stat(successes, len(records))),
+            "cache": public_rate(rate_stat(cache["hits"], cache["eligible"])),
+            "ttft_p95_ms": None if ttft is None else round(ttft, 1),
+            "total_p95_ms": None if total is None else round(total, 1),
+            "diagnostics": response_diagnostics(records),
+            "max_consecutive_failures": stability["max_consecutive_failures"],
+            "ttft_ewma_max_ms": stability["ttft_ewma_max_ms"],
+            "stability": stability,
+        },
+    }
+
+
+def build_live_comparison(baseline_records, candidate_records):
+    """运行中已返回结果的描述统计；不检验显著性，也不作路由归因。
+
+    两侧完成速度可能不同，因此各侧用自己的已返回结果作分母，未返回请求不算失败。
+    保留最终报告常用的字段形状，便于界面展示同一组指标。
+    """
+    summaries = {side: _summarize_side(records) for side, records in (
+        ("baseline", baseline_records), ("candidate", candidate_records))}
+    sides = {side: summary["public"] for side, summary in summaries.items()}
+    cache_counts = {side: summary["cache_counts"] for side, summary in summaries.items()}
+
+    def observed_rate(metric):
+        base, cand = sides["baseline"][metric], sides["candidate"][metric]
+        base_rate = base["successes"] / base["total"] if base["total"] else None
+        cand_rate = cand["successes"] / cand["total"] if cand["total"] else None
+        return {"baseline": base, "candidate": cand,
+                "delta_pct": (round((cand_rate - base_rate) * 100, 2)
+                              if base_rate is not None and cand_rate is not None else None),
+                "note": "按各侧已返回结果统计；运行中样本不完整，差值仅为当前观测。"}
+
+    cache = observed_rate("cache")
+    for side in ("baseline", "candidate"):
+        cache[f"{side}_no_usage"] = cache_counts[side]["no_usage"]
+        cache[f"{side}_total"] = cache_counts[side]["total"]
+    if not cache_counts["baseline"]["eligible"] or not cache_counts["candidate"]["eligible"]:
+        cache["note"] = "至少一侧尚无可用缓存统计，缓存命中率暂不可比；无用量记录不计为未命中。"
+    return {
+        **sides,
+        "success": observed_rate("success"),
+        "cache": cache,
+        "ttft": _compare_latency_points(summaries["baseline"]["ttft"], summaries["candidate"]["ttft"]),
+        "total_latency": _compare_latency_points(summaries["baseline"]["total"], summaries["candidate"]["total"]),
+        "stability": _stability_comparison(sides["baseline"]["stability"], sides["candidate"]["stability"]),
+        "method": {"statistics_protocol": STABILITY_PROTOCOL_VERSION},
+    }
+
+
 def build_comparison(baseline_records, candidate_records):
     """把一次 A/B 两侧的逐条结果汇总成报告数据。
 
     ``baseline_records`` / ``candidate_records`` 都是 ``smart_route_load`` 产出的
     结果字典序列，必须带 ``item_id`` 以便配对。
     """
-    def _ok(record):
-        if record.get("ok") is not None:
-            return bool(record.get("ok"))
-        cls = record.get("class") or record.get("cls")
-        if cls is not None:
-            return cls == "ok"
-        status = record.get("status_code")
-        return bool(status and 200 <= status < 300 and record.get("completed"))
-
     baseline_by_id = {r.get("item_id"): r for r in baseline_records if r.get("item_id")}
     candidate_by_id = {r.get("item_id"): r for r in candidate_records if r.get("item_id")}
     shared_ids = sorted(set(baseline_by_id) & set(candidate_by_id))
 
     pairs = [{"item_id": item_id,
-              "baseline_ok": _ok(baseline_by_id[item_id]),
-              "candidate_ok": _ok(candidate_by_id[item_id])} for item_id in shared_ids]
+              "baseline_ok": _record_ok(baseline_by_id[item_id]),
+              "candidate_ok": _record_ok(candidate_by_id[item_id])} for item_id in shared_ids]
 
-    base_ok = sum(1 for r in baseline_records if _ok(r))
-    cand_ok = sum(1 for r in candidate_records if _ok(r))
+    base_summary = _summarize_side(baseline_records)
+    cand_summary = _summarize_side(candidate_records)
+    base_ok = base_summary["public"]["success"]["successes"]
+    cand_ok = cand_summary["public"]["success"]["successes"]
     paired = pair_outcomes(pairs)
     mcnemar = mcnemar_exact(paired["baseline_only_ok"], paired["candidate_only_ok"])
 
-    base_ttft = [r.get("ttft_ms") for r in baseline_records if _ok(r)]
-    cand_ttft = [r.get("ttft_ms") for r in candidate_records if _ok(r)]
-    base_total = [r.get("total_ms") for r in baseline_records if _ok(r)]
-    cand_total = [r.get("total_ms") for r in candidate_records if _ok(r)]
-
     success = compare_rates(base_ok, len(baseline_records), cand_ok, len(candidate_records))
-    cache = compare_cache(baseline_records, candidate_records)
+    cache = _compare_cache_counts(base_summary["cache_counts"], cand_summary["cache_counts"],
+                                  baseline_records, candidate_records)
+    base_stability = base_summary["public"]["stability"]
+    cand_stability = cand_summary["public"]["stability"]
 
     reliability = {
         "paired_total": paired["paired_total"],
@@ -403,24 +646,13 @@ def build_comparison(baseline_records, candidate_records):
         limitations.insert(0, "成功率差异未通过归因判定：不要据此宣布智能路由更优或更差。")
 
     return {
-        "baseline": {
-            "requests": len(baseline_records),
-            "success": public_rate(rate_stat(base_ok, len(baseline_records))),
-            "ttft_p95_ms": None if percentile(base_ttft, .95) is None else round(percentile(base_ttft, .95), 1),
-            "total_p95_ms": None if percentile(base_total, .95) is None else round(percentile(base_total, .95), 1),
-            "cache": cache["baseline"],
-        },
-        "candidate": {
-            "requests": len(candidate_records),
-            "success": public_rate(rate_stat(cand_ok, len(candidate_records))),
-            "ttft_p95_ms": None if percentile(cand_ttft, .95) is None else round(percentile(cand_ttft, .95), 1),
-            "total_p95_ms": None if percentile(cand_total, .95) is None else round(percentile(cand_total, .95), 1),
-            "cache": cache["candidate"],
-        },
+        "baseline": base_summary["public"],
+        "candidate": cand_summary["public"],
         "success": success,
         "cache": cache,
-        "ttft": compare_latency(base_ttft, cand_ttft, .95),
-        "total_latency": compare_latency(base_total, cand_total, .95),
+        "ttft": _compare_latency_points(base_summary["ttft"], cand_summary["ttft"]),
+        "total_latency": _compare_latency_points(base_summary["total"], cand_summary["total"]),
+        "stability": _stability_comparison(base_stability, cand_stability),
         "reliability": reliability,
         "metrics": [item["label"] for item in METRIC_LABELS],
         "method": {
@@ -430,6 +662,7 @@ def build_comparison(baseline_records, candidate_records):
             "test": "Fisher 精确检验 / McNemar 精确检验",
             "cache_basis": "usage.cached_tokens>0",
             "cache_isolation": "每侧每次运行独立前缀标记；段首命中用于检测外部预热",
+            "statistics_protocol": STABILITY_PROTOCOL_VERSION,
         },
         "limitations": limitations,
     }

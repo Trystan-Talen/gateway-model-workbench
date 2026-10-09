@@ -1,18 +1,13 @@
 /** Isolated 120/240-question browser acceptance; all upstream requests are loopback simulations. */
 const {chromium}=require('playwright');
-const fs=require('fs'),path=require('path'),os=require('os'),assert=require('node:assert/strict');
-const {spawn}=require('child_process');
-const output=process.env.UI_ARTIFACT_DIR||fs.mkdtempSync(path.join(os.tmpdir(),'quality-v2-'));
-fs.mkdirSync(output,{recursive:true});
-const children=[],errors=[];
-async function start(){
- const child=spawn('python3',['-u',path.join(__dirname,'workflow_server.py'),output]);children.push(child);
- child.stderr.on('data',x=>fs.appendFileSync(path.join(output,'server.log'),x));
- return new Promise((resolve,reject)=>{let text='';child.stdout.on('data',x=>{text+=x;try{resolve({...JSON.parse(text.split('\n')[0]),child})}catch{}});child.on('error',reject);child.on('exit',c=>reject(Error('server '+c)))});
-}
+const fs=require('fs'),path=require('path'),assert=require('node:assert/strict');
+const artifacts=require('./artifacts.cjs').browserArtifacts('quality_v2');
+const {output}=artifacts;
+const servers=require('./server.cjs').browserServers(artifacts);
+const errors=[];
 async function until(fn,label,ms=90000){const end=Date.now()+ms;while(Date.now()<end){if(await fn())return;await new Promise(r=>setTimeout(r,80))}throw Error(label)}
 (async()=>{
- let server=await start();
+ let server=await servers.start();
  const browser=await chromium.launch({headless:true,executablePath:process.env.CHROME_PATH||undefined});
  try{
   const context=await browser.newContext({viewport:{width:1440,height:1000}});
@@ -137,7 +132,7 @@ async function until(fn,label,ms=90000){const end=Date.now()+ms;while(Date.now()
   assert.ok(stopped.completed_cases<120);assert.ok(stopped.completed_cases>=18);assert.equal(stopped.report.evidence.complete,false);
   const finalCount=stopped.completed_cases;await page.waitForTimeout(350);assert.equal((await call('/quality-test/'+stoppedId)).completed_cases,finalCount);
   // Restore historical evidence after real process restart.
-  server.child.kill('SIGTERM');server=await start();await call('/auth/login',{username:'regression',password:'local-test-888@'});
+  await servers.stop(server.child);server=await servers.start();await call('/auth/login',{username:'regression',password:'local-test-888@'});
   const restored=await call('/quality-test/'+pairId);assert.deepEqual(restored.report,pair.report);
   assert.equal(restored.resources[1].case_results.length,120);
   await page.goto(server.base);await page.waitForFunction(()=>qualityTests.length===3&&!refreshing);await page.evaluate(()=>clearInterval(refreshTimer));
@@ -153,5 +148,5 @@ async function until(fn,label,ms=90000){const end=Date.now()+ms;while(Date.now()
   await page.screenshot({path:path.join(output,'evidence-mobile.png')});
   assert.deepEqual(errors,[]);
   console.log(JSON.stringify({passed:true,singleQuestions:120,pairedRequests:240,regressions:11,stopAt:finalCount,download:true,scroll:true,restart:true,pageErrors:errors,output},null,2));
- }finally{await browser.close();children.forEach(c=>c.kill('SIGTERM'))}
-})().catch(e=>{console.error(e);children.forEach(c=>c.kill('SIGTERM'));process.exitCode=1});
+ }finally{try{await browser.close()}finally{await servers.close()}}
+})().catch(async e=>{console.error(e);process.exitCode=1;await servers.close()});
