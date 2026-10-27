@@ -39,7 +39,9 @@ import httpx
 
 import routing_ab
 import routing_corpus
-from smart_route_load import CHAT_PATH, USAGE_RETRY_POLICY, do_request, should_retry_without_usage
+from run_timing import RunClock, restored_timing, request_evidence
+from time_record import normalize_timing_tree
+from smart_route_load import CHAT_PATH, USAGE_RETRY_POLICY, attempt_timing, do_request, should_retry_without_usage
 
 
 def _now():
@@ -67,6 +69,7 @@ def _duration(steps):
 
 _REQUEST_SIDES = ("baseline", "candidate")
 _FAILURE_REASONS = {
+    "CANCELLED": "客户端已取消请求",
     "TIMEOUT": "请求超时", "NETWORK": "网络连接失败", "PROTOCOL": "响应不完整或协议异常",
     "HTTP_429": "请求被限流", "HTTP_5XX": "上游服务错误", "HTTP_4XX": "请求被拒绝",
     "HTTP_OTHER": "非成功状态码", "UNKNOWN": "失败原因不可得",
@@ -126,12 +129,19 @@ def public_request_record(record):
         "error_type": error_type, "reason": "完整成功响应" if ok else _FAILURE_REASONS[error_type],
         "ttft_ms": _safe_number(record.get("ttft_ms")),
         "total_ms": _safe_number(record.get("total_ms")),
+        "timing": request_evidence(record),
         "usage_seen": record.get("usage_seen") is True,
         "usage_source": record.get("usage_source") if record.get("usage_source") in ("stream", "body") else None,
         "usage_level": record.get("usage_level") if record.get("usage_level") in ("NONE", "HIT_ONLY", "FULL") else None,
         "cache_hit": record.get("cache_hit") if isinstance(record.get("cache_hit"), bool) else None,
         "burst_first": record.get("burst_first") if isinstance(record.get("burst_first"), bool) else None,
     }
+    attempts = record.get("attempts")
+    if isinstance(attempts, list):
+        result["attempts"] = [{"attempt_index": _safe_number(a.get("attempt_index"), integer=True),
+            "status_code": _safe_number(a.get("status_code"), integer=True),
+            "error_type": a.get("error_type") if a.get("error_type") in _FAILURE_REASONS else None,
+            "timing": request_evidence(a)} for a in attempts if isinstance(a, dict)]
     for key in ("prompt_tokens", "cached_tokens", "completion_tokens", "total_tokens"):
         result[key] = _safe_number(record.get(key), integer=True)
     return result
@@ -223,6 +233,8 @@ class RouteComparison:
         self.repeat_corpus = routing_corpus.corpus_manifest(config["tier"])
         self.status = "draft"
         self.created = _now()
+        self._clock = RunClock(self.created)
+        self._restored_timing = None
         self.started_at = None
         self.finished_at = None
         self.error = None
@@ -259,6 +271,7 @@ class RouteComparison:
         索引不保存密钥，恢复后的原记录保持只读。完整冻结参数配合当前可用
         凭据，可由复测接口创建独立记录；中断状态降为 error，不恢复旧执行。
         """
+        snapshot = normalize_timing_tree(snapshot)
         run = cls.__new__(cls)
         run.id = str(snapshot.get("id") or uuid.uuid4().hex[:12])
         run.name = str(snapshot.get("name") or "历史路由对照")
@@ -280,6 +293,7 @@ class RouteComparison:
         run.created = float(snapshot.get("created") or _now())
         run.started_at = snapshot.get("started_at")
         run.finished_at = snapshot.get("finished_at")
+        run._restored_timing = restored_timing(snapshot, interrupted=snapshot.get("status") in ("running", "waiting", "stopping"))
         run.error = snapshot.get("error") or ("服务在路由对照完成前重启，已保留结果文件，未自动继续执行。"
                                               if snapshot.get("status") in ("running", "waiting", "stopping") else None)
         run.lock = threading.RLock()
@@ -318,6 +332,8 @@ class RouteComparison:
         with self.lock:
             if self.status in ("finished", "stopped", "error"):
                 return
+            self._clock.mark("stop_requested_at")
+            self._clock.mark("dispatch_ended_at")
             self._stop_event.set()
             self.status = "stopping"
             loop, event = self._execution_loop, self._async_stop_event
@@ -369,7 +385,7 @@ class RouteComparison:
             "status_code", "completed", "error_type", "error_detail", "ttft_ms",
             "total_ms", "reason", "usage_seen", "usage_source", "usage_level",
             "prompt_tokens", "cached_tokens", "completion_tokens", "total_tokens",
-            "cache_hit", "burst_first")}
+            "cache_hit", "burst_first", "timing", "attempts")}
         clean["index"] = routing_ab.request_index(result)
         clean["route_side"] = side
         stored = dict(clean)
@@ -404,20 +420,36 @@ class RouteComparison:
                                    "write": cfg["write_timeout"], "pool": cfg["connect_timeout"]}
                     job = {"id": item["item_id"], "index": item["index"],
                            "mode": "routing", "profile": "routing",
-                           "step_index": item.get("burst_index", 0)}
+                           "step_index": item.get("burst_index", 0),
+                           **{k: item[k] for k in ("scheduled_at", "enqueued_at", "_scheduled_mono", "_enqueued_mono") if k in item}}
                     include_usage = bool(cfg.get("include_usage", True))
-                    result = await do_request(
-                        client, job, payload, headers, timeout_cfg,
-                        chat_url=cfg["chat_url"], include_usage=include_usage,
-                        capture_raw=bool(cfg.get("capture_raw")))
-                    # 只在明确拒绝 usage 参数时重试，避免限流后再次请求放大压力。
-                    if not self._stop_event.is_set() \
-                            and should_retry_without_usage(result, include_usage, cfg["stream"]):
-                        cfg["include_usage"] = False
+                    attempts = []
+                    try:
+                        self._clock.dispatched()
                         result = await do_request(
                             client, job, payload, headers, timeout_cfg,
-                            chat_url=cfg["chat_url"], include_usage=False,
+                            chat_url=cfg["chat_url"], include_usage=include_usage,
                             capture_raw=bool(cfg.get("capture_raw")))
+                        attempts.append(attempt_timing(result, 1))
+                        if not self._stop_event.is_set() and should_retry_without_usage(result, include_usage, cfg["stream"]):
+                            cfg["include_usage"] = False
+                            retry_job = {k: v for k, v in job.items() if k not in ("scheduled_at", "enqueued_at", "_scheduled_mono", "_enqueued_mono")}
+                            self._clock.dispatched()
+                            result = await do_request(
+                                client, retry_job, payload, headers, timeout_cfg,
+                                chat_url=cfg["chat_url"], include_usage=False,
+                                capture_raw=bool(cfg.get("capture_raw")))
+                            attempts.append(attempt_timing(result, 2))
+                    except asyncio.CancelledError as exc:
+                        result = getattr(exc, "request_result", None)
+                        if result is not None:
+                            attempts.append(attempt_timing(result, len(attempts) + 1))
+                            result.update(attempts=attempts, index=item["index"])
+                            self._record(side, result)
+                            with self.lock:
+                                self.progress["done"] += 1
+                        raise
+                    result["attempts"] = attempts
                     # 段首请求在本侧、本次运行里没有任何先行者，理应未命中；
                     # 报告用它检测「实验之外的缓存预热」。
                     result["index"] = item["index"]
@@ -451,6 +483,7 @@ class RouteComparison:
 
         async def producer():
             base = loop.time()
+            wall_base, mono_base = time.time(), time.monotonic()
             for index, item in enumerate(corpus):
                 if self._stop_event.is_set():
                     break
@@ -465,7 +498,10 @@ class RouteComparison:
                     break
                 order = ("baseline", "candidate") if index % 2 == 0 else ("candidate", "baseline")
                 for side in order:
-                    await queues[side].put(item)
+                    queued = {**item, "scheduled_at": wall_base + index / rps,
+                              "_scheduled_mono": mono_base + index / rps,
+                              "enqueued_at": time.time(), "_enqueued_mono": time.monotonic()}
+                    await queues[side].put(queued)
                     with self.lock:
                         self.progress["scheduled"] += 1
                         self.progress["inflight"] += 1
@@ -513,23 +549,31 @@ class RouteComparison:
         try:
             with self.lock:
                 self.status = "stopping" if self._stop_event.is_set() else "running"
-                self.started_at = _now()
+                if not self._stop_event.is_set():
+                    self.started_at = self._clock.mark("started_at")
             self._notify_change()
             if not self._stop_event.is_set():
                 self._open_outputs()
                 asyncio.run(self._execute_async())
+        except asyncio.CancelledError:
+            self._clock.mark("stop_requested_at")
+            self._clock.mark("dispatch_ended_at")
+            self._stop_event.set()
+            self.status = "stopping"
         except Exception as exc:  # noqa: BLE001 —— 执行失败必须变成任务状态，不是崩溃
             with self.lock:
                 self.status = "error"
                 self.error = clean_error(exc)
         finally:
             self._close_outputs()
+            self._clock.finish_dispatch()
+            self.finished_at = self._clock.mark("ended_at")
             with self.lock:
                 if self.status == "error":
                     self.finished_at = self.finished_at or _now()
                 else:
                     self.status = "stopped" if self._stop_event.is_set() else "finished"
-                    self.finished_at = _now()
+                    self.finished_at = self._clock.mark("ended_at")
                 try:
                     self._report = routing_ab.build_comparison(
                         self.records["baseline"], self.records["candidate"])
@@ -667,8 +711,8 @@ class RouteComparison:
                 "created": self.created,
                 "started_at": self.started_at,
                 "finished_at": self.finished_at,
-                "elapsed": (max(0, (self.finished_at or _now()) - self.started_at)
-                            if self.started_at else 0),
+                "timing": self._restored_timing if self.history_only else self._clock.snapshot(),
+                "elapsed": ((self._restored_timing or {}).get("elapsed_ms") or 0) / 1000 if self.history_only else self._clock.elapsed(),
                 "tier": self.config["tier"],
                 "config": {"capture_raw": bool(self.config["baseline"].get("capture_raw"))},
                 "repeat_config": {"name": self.name, "tier": self.config["tier"], "rpm": self.config.get("rpm"),
@@ -764,7 +808,7 @@ def validate_config(raw):
             raise ValueError(f"对照实验两侧的 {key} 必须相同，当前为 {base.get(key)!r} / {cand.get(key)!r}")
 
     tier = validate_tier(raw.get("tier"))
-    rpm = ui.safe_float(raw.get("rpm", base.get("rpm") or 600), "计划调度 RPM", 0.01, 600000)
+    rpm = ui.safe_float(raw.get("rpm", base.get("rpm") or 100), "计划调度 RPM", 0.01, 600000)
     return {
         "name": str(raw.get("name") or "路由对照").strip()[:80] or "路由对照",
         "tier": tier,

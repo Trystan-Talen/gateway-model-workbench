@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import AsyncExitStack
+from concurrent.futures import CancelledError as FutureCancelledError
+from datetime import datetime
 from quality_methodology import methodology_snapshot
 import copy
 import json
@@ -16,6 +18,7 @@ import hmac
 import ipaddress
 import secrets
 import signal
+from functools import lru_cache
 from http.cookies import SimpleCookie
 import threading
 import time
@@ -30,9 +33,11 @@ from app_paths import CODE_DIR, DATA_DIR
 from app_version import APP_VERSION
 from session_store import SessionStore
 from history_store import HistoryStore, quality_index
+from run_timing import RunClock, restored_timing, request_evidence
+from time_record import request_timing, normalize_timing_tree, singapore_timestamp, SINGAPORE_TIMEZONE
 import credential_store
 from connection_profiles import ConnectionStore, ConnectionStorageError
-from smart_route_load import CHAT_PATH, USAGE_RETRY_POLICY, build_payload, do_request, fetch_models, fetch_models_detailed, should_retry_without_usage
+from smart_route_load import CHAT_PATH, USAGE_RETRY_POLICY, attempt_timing, build_payload, do_request, fetch_models, fetch_models_detailed, should_retry_without_usage
 from quality_test import QualityRun, QualityCase, load_suite, suite_manifest, run_quality_probe
 from quality_report import build_quality_report, render_quality_markdown
 import storage
@@ -52,7 +57,8 @@ import routing_ab
 import routing_compare
 import routing_corpus
 import fingerprint_protocol
-from fingerprint_service import FingerprintManager, discover_models as discover_fingerprint_models
+from fingerprint_service import FingerprintManager, discover_models as discover_fingerprint_models, validate_endpoint_protocol
+import tpm_service
 
 
 def preflight_payload(cfg, *, kind="run"):
@@ -61,6 +67,25 @@ def preflight_payload(cfg, *, kind="run"):
     和 GET /preflight 的区别：这里吃的是表单里的当前草稿，而不是上一次保存的配置，
     所以用户改了目标地址能立刻看到「目标疑似生产环境」的提示。
     """
+    if kind == "comparison":
+        groups = [preflight_payload({**cfg["shared_config"], **group, "mode": "smoke"})
+                  for group in cfg["groups"]]
+        result = copy.deepcopy(groups[0])
+        for field in ("planned_requests", "min_seconds", "estimated_bytes"):
+            result[field] = sum(item[field] for item in groups)
+        result["min_seconds"] = round(result["min_seconds"], 1)
+        findings = []
+        seen = set()
+        for item in groups:
+            for finding in item.get("findings", []):
+                signature = (finding.get("code"), finding.get("detail"))
+                if signature not in seen:
+                    seen.add(signature)
+                    findings.append(finding)
+        result["findings"] = findings
+        result["level"] = risk_level(findings, production_like=result["target"].get("production_like", False))
+        result["requires_confirmation"] = any(item.get("requires_confirmation") for item in groups)
+        return result
     if kind == "quality":
         cases = cfg.get("case_count")
         if cases is None:
@@ -84,6 +109,8 @@ def preflight_or_degrade(cfg, *, kind="run"):
     try:
         if kind == "routing":
             cfg = routing_compare.validate_config(cfg)
+        elif kind == "comparison":
+            cfg = validate_comparison_config(cfg, require_secret=False)
         elif kind != "quality":
             cfg = validate_config(cfg, require_secret=False)
         return preflight_payload(cfg, kind=kind)
@@ -343,6 +370,9 @@ def _config_with_connections(raw, *, kind="run"):
         if isinstance(cfg.get("resources"), list):
             cfg["resources"] = [_connection_with_credentials(item) if isinstance(item, dict) else item
                                 for item in cfg["resources"]]
+    elif kind == "comparison":
+        if isinstance(cfg.get("shared_config"), dict):
+            cfg["shared_config"] = _connection_with_credentials(cfg["shared_config"])
     else:
         cfg = _connection_with_credentials(cfg)
     return cfg
@@ -360,9 +390,22 @@ _SECRET_FIELD_NAMES = {
 }
 
 
+@lru_cache(maxsize=1024)
+def _cached_field_name(name: str):
+    """Cache only schema names; never cache response values or credentials."""
+    return name.strip().lower().replace("-", "_")
+
+
+def _normalized_field_name(name: str):
+    # Unknown upstream usage may contain arbitrary keys; bound retained key size.
+    if len(name) <= 128:
+        return _cached_field_name(name)
+    return name.strip().lower().replace("-", "_")
+
+
 def _is_secret_field(name):
     """判断字段名是否可能承载凭据，避免未知字段绕过脱敏。"""
-    normalized = str(name).strip().lower().replace("-", "_")
+    normalized = _normalized_field_name(str(name))
     return normalized in _SECRET_FIELD_NAMES or normalized.endswith("_token")
 
 
@@ -535,14 +578,14 @@ def validate_config(raw, require_secret=True):
     if cfg["mode"] not in ("smoke", "ramp", "soak"):
         raise ValueError("测试模式无效")
     cfg["rpm"] = safe_float(cfg.get("rpm", 100), "计划调度 RPM", 0.01, 600000)
-    cfg["concurrency"] = safe_int(cfg.get("concurrency", 100), "并发上限", 1, 2000)
+    cfg["concurrency"] = safe_int(cfg.get("concurrency", 20), "并发上限", 1, 2000)
     cfg["iterations"] = safe_int(cfg.get("iterations", 50), "请求条数", 1, 10000000)
     cfg["duration"] = safe_int(cfg.get("duration", 60), "持续时间", 1, 86400)
     cfg["connect_timeout"] = safe_float(cfg.get("connect_timeout", 10), "连接超时", 0.1, 3600)
     cfg["read_timeout"] = safe_float(cfg.get("read_timeout", 60), "读取超时", 0.1, 3600)
     cfg["write_timeout"] = safe_float(cfg.get("write_timeout", 30), "写入超时", 0.1, 3600)
     cfg["profile"] = str(cfg.get("profile") or "smoke")
-    if cfg["profile"] not in ("smoke", "short", "long"):
+    if cfg["profile"] not in ("smoke", "short", "long", "cache"):
         raise ValueError("请求内容类型无效")
     cfg["stream"] = parse_bool(cfg.get("stream", True), "stream", True)
     cfg["capture_raw"] = parse_bool(cfg.get("capture_raw", False), "记录原始数据开关", False)
@@ -671,13 +714,15 @@ class Task(ArtifactMixin):
 
     def __init__(self, config, steps, total):
         self.id = uuid.uuid4().hex[:12]
-        self.name = config.get("name") or f"测试-{time.strftime('%m%d-%H%M%S')}-{self.id[-4:]}"
+        self.name = config.get("name") or f"测试-{datetime.fromtimestamp(time.time(), SINGAPORE_TIMEZONE).strftime('%m%d-%H%M%S')}-{self.id[-4:]}"
         self.config = dict(config)
         self.public_config = public_config(config)
         self.steps = steps
         self.status = "waiting"
         self.error = None
         self.created = time.time()
+        self._clock = RunClock(self.created)
+        self._restored_timing = None
         self.started_at = None
         self.finished_at = None
         self.stopped_at = None
@@ -694,6 +739,7 @@ class Task(ArtifactMixin):
         # 缓存命中统计：分母只算「上游确实返回了 cached_tokens」的请求。
         # 无 usage 的请求单独计数，避免把「网关不回 usage」误读成未命中。
         self.cache_stat = {"eligible": 0, "hits": 0, "no_usage": 0}
+        self.cache_token_stat = {"prompt_tokens": 0.0, "cached_tokens": 0.0, "token_eligible": 0}
         self.recent = deque(maxlen=100)
         self.timeline = deque(maxlen=900)
         self.current_step = 1
@@ -725,9 +771,7 @@ class Task(ArtifactMixin):
         return {"smoke": "冒烟验证", "ramp": "阶梯加压", "soak": "稳定性长跑"}.get(self.config["mode"], self.config["mode"])
 
     def _elapsed(self):
-        if not self.started_at:
-            return 0
-        return max(0, (self.finished_at or time.time()) - self.started_at)
+        return self._clock.elapsed()
 
     def _live_rpm(self):
         if self.status != "running":
@@ -766,6 +810,7 @@ class Task(ArtifactMixin):
             identity = {
                 "id": self.id, "name": self.name, "status": self.status,
                 "status_label": status_label(self.status), "created": self.created,
+                "timing": self._clock.snapshot(),
                 "mode": self._mode_label(), "concurrency": self.config.get("concurrency"),
                 "target_rpm": self.current_target_rpm, "done": self.done, "total": self.total,
                 "progress": min(1, self.done / self.total) if self.total else 0,
@@ -781,7 +826,8 @@ class Task(ArtifactMixin):
             planned_duration = sum(step["duration"] for step in self.steps)
             capacity_rpm = (self.config["concurrency"] * 60000 / average_total_ms) if average_total_ms else None
             cache = self.cache_stat
-            cache_rate = (cache["hits"] * 100 / cache["eligible"]) if cache["eligible"] else None
+            cache_rate = (cache["hits"] * 100 / self.done) if self.done else None
+            eligible_cache_rate = (cache["hits"] * 100 / cache["eligible"]) if cache["eligible"] else None
             return {
                 **identity, "error": self.error,
                 "model": self.public_config.get("model"),
@@ -800,8 +846,14 @@ class Task(ArtifactMixin):
                         "capacity_estimate": capacity_rpm},
                 "schedule_lag": _latency_percentiles(lag_values),
                 "cache": {"eligible": cache["eligible"], "hits": cache["hits"],
-                          "no_usage": cache["no_usage"], "rate_pct": cache_rate,
-                          "basis": "usage.cached_tokens>0"},
+                          "no_usage": cache["no_usage"], "request_total": self.done,
+                          "rate_pct": cache_rate, "eligible_rate_pct": eligible_cache_rate,
+                          "prompt_tokens": self.cache_token_stat["prompt_tokens"], "cached_tokens": self.cache_token_stat["cached_tokens"],
+                          "token_eligible": self.cache_token_stat["token_eligible"],
+                          "token_rate_pct": (self.cache_token_stat["cached_tokens"] * 100 / self.cache_token_stat["prompt_tokens"]
+                                             if self.cache_token_stat["prompt_tokens"] > 0 else None),
+                          "basis": "usage.cached_tokens>0",
+                          "token_basis": "usage.cached_tokens/usage.prompt_tokens"},
                 "phase": self._phase(), "recent": list(reversed(self.recent)),
                 "timeline": list(self.timeline), "out_path": self.out_path,
                 "write_error": self.write_error,
@@ -841,12 +893,16 @@ class Task(ArtifactMixin):
         status = result.get("status_code") or 0
         category, label, css = _classify_result(result)
         secret = self.config.get("api_key")
+        # item_id 在单次任务内由调度器递增；把任务 ID 一并写入，便于把
+        # 页面摘要、JSONL（逐行 JSON）和审计日志中的同一条请求对应起来。
+        request_id = str(result.get("request_id") or f"{self.id}:{result.get('item_id')}")
         clean = {k: _redact_secret(result.get(k), secret) for k in (
-            "schema_version", "ts", "item_id", "mode", "profile", "step_index", "grade",
+            "schema_version", "ts", "request_id", "item_id", "mode", "profile", "step_index", "grade",
             "status_code", "completed", "error_type", "error_detail", "ttft_ms", "total_ms",
-            "schedule_lag_ms", "reason",
+            "schedule_lag_ms", "reason", "timing", "attempts",
             "usage_seen", "usage_source", "usage_level", "prompt_tokens", "cached_tokens",
             "completion_tokens", "total_tokens", "cache_hit")}
+        clean["request_id"] = request_id
         if self.config.get("capture_raw"):
             clean["raw_input"] = _redact_secret(result.get("raw_input"), secret)
             clean["raw_output"] = _redact_secret(result.get("raw_output"), secret)
@@ -867,17 +923,41 @@ class Task(ArtifactMixin):
                 if result.get("total_ms") is not None:
                     self.total_ms.append(result["total_ms"])
                 cached = result.get("cached_tokens")
-                if cached is None:
+                try:
+                    cached_number = None if isinstance(cached, bool) or cached is None else float(cached)
+                    if cached_number is not None and not math.isfinite(cached_number):
+                        cached_number = None
+                except (TypeError, ValueError):
+                    cached_number = None
+                prompt = result.get("prompt_tokens")
+                try:
+                    prompt_number = None if isinstance(prompt, bool) or prompt is None else float(prompt)
+                    if prompt_number is not None and (not math.isfinite(prompt_number) or prompt_number <= 0):
+                        prompt_number = None
+                except (TypeError, ValueError):
+                    prompt_number = None
+                if cached_number is None:
                     self.cache_stat["no_usage"] += 1
                 else:
                     self.cache_stat["eligible"] += 1
-                    if cached > 0:
+                    if cached_number > 0:
                         self.cache_stat["hits"] += 1
+                    if prompt_number is not None and cached_number >= 0:
+                        self.cache_token_stat["prompt_tokens"] += prompt_number
+                        self.cache_token_stat["cached_tokens"] += cached_number
+                        self.cache_token_stat["token_eligible"] += 1
                 self.recent.append({
-                    "id": result.get("item_id"), "step": result.get("step_index"),
+                    "id": result.get("item_id"), "request_id": request_id,
+                    "step": result.get("step_index"),
                     "status": status, "cat": category, "cls": css, "label": label,
                     "ttft": result.get("ttft_ms"), "total": result.get("total_ms"),
-                    "reason": result.get("reason"),
+                    "error_type": result.get("error_type"),
+                    "error_detail": result.get("error_detail"),
+                    "reason": result.get("reason"), "timing": request_evidence(result),
+                    "usage_seen": bool(result.get("usage_seen")),
+                    "cached_tokens": result.get("cached_tokens"),
+                    "cache_hit": result.get("cache_hit"),
+                    "attempts": clean.get("attempts"),
                 })
         except Exception as exc:
             self.write_error = f"结果写入失败：{exc}"
@@ -904,7 +984,7 @@ class Task(ArtifactMixin):
 
 
 
-def validate_comparison_config(raw):
+def validate_comparison_config(raw, *, require_secret=True):
     """校验一个对照实验；公共配置只保存非密钥字段，组配置不含 API Key。"""
     if not isinstance(raw, dict):
         raise ValueError("对照实验请求体必须是 JSON 对象")
@@ -913,7 +993,7 @@ def validate_comparison_config(raw):
         raise ValueError("对照实验 shared_config 必须是 JSON 对象")
     shared = dict(shared_value)
     shared["name"] = str(raw.get("name") or shared.get("name") or "对照实验").strip()[:80]
-    base = validate_config({**shared, "mode": "smoke", "iterations": 1, "rpm": 600}, require_secret=True)
+    base = validate_config({**shared, "mode": "smoke", "iterations": 1, "rpm": 100}, require_secret=require_secret)
     groups = raw.get("groups") or []
     if not isinstance(groups, list) or not 2 <= len(groups) <= 4:
         raise ValueError("对照实验必须包含 2 到 4 个实验组")
@@ -924,7 +1004,7 @@ def validate_comparison_config(raw):
         if not isinstance(item, dict):
             raise ValueError("实验组配置无效")
         concurrency = safe_int(item.get("concurrency", 20), f"实验组 {index} 并发上限", 1, 2000)
-        rpm = safe_float(item.get("rpm", 600), f"实验组 {index} 计划调度 RPM", 0.01, 600000)
+        rpm = safe_float(item.get("rpm", 100), f"实验组 {index} 计划调度 RPM", 0.01, 600000)
         iterations = safe_int(item.get("iterations", 20), f"实验组 {index} 请求条数", 1, 10000000)
         group_id = str(item.get("id") or f"group-{index}").strip()
         if group_id in group_ids:
@@ -967,6 +1047,8 @@ class ComparisonRun:
         self.config = config
         self.status = "draft"
         self.created = time.time()
+        self._clock = RunClock(self.created)
+        self._restored_timing = None
         self.started_at = None
         self.finished_at = None
         self.group_results = []
@@ -1237,7 +1319,7 @@ class ComparisonRun:
             "status_label": status_label(status),
             "created": self.created, "started_at": started_at,
             "finished_at": finished_at,
-            "elapsed": max(0, (finished_at or time.time()) - started_at) if started_at else 0,
+            "elapsed": self._clock.elapsed(), "timing": self._clock.snapshot(),
             "execution_policy": config.get("execution_policy", "serial"),
             "config": public_config(config["shared_config"]),
             "groups": groups, "report": report,
@@ -1267,7 +1349,7 @@ class ComparisonManager:
         try:
             with run.lock:
                 run.status = "running"
-                run.started_at = time.time()
+                run.started_at = run._clock.mark("started_at")
             last_persist_at = 0.0
             for group in run.config["groups"]:
                 shared = dict(run.config["shared_config"])
@@ -1284,7 +1366,7 @@ class ComparisonManager:
                         run.group_results.append({"id": group["id"], "name": group["name"], "task_id": task.id,
                                                   "role": group.get("role"), "concurrency": group["concurrency"], "rpm": group["rpm"], "iterations": group["iterations"],
                                                   "status": task.status, "progress": 0, "done": 0, "total": group["iterations"]})
-                    while task.status in ("waiting", "running"):
+                    while task.status in ("waiting", "running", "stopping"):
                         snapshot = task.snap()
                         with run.lock:
                             current = next((item for item in run.group_results if item.get("id") == group["id"]), None)
@@ -1318,7 +1400,7 @@ class ComparisonManager:
                         run.status = "error"
                     break
             with run.lock:
-                run.finished_at = time.time()
+                run.finished_at = run._clock.mark("ended_at")
                 run.current_group_id = None
                 run.current_group_name = None
                 if run.status not in ("error", "finished_with_errors"):
@@ -1511,6 +1593,8 @@ class QualityTask(ArtifactMixin):
         self.public_config = _quality_public_config(config)
         self.status = "waiting"
         self.created = time.time()
+        self._clock = RunClock(self.created)
+        self._restored_timing = None
         self.started_at = None
         self.finished_at = None
         self.error = None
@@ -1546,7 +1630,8 @@ class QualityTask(ArtifactMixin):
                 "status_label": status_label(self.status),
                 "created": self.created, "started_at": self.started_at,
                 "finished_at": self.finished_at,
-                "elapsed": max(0, (self.finished_at or time.time()) - self.started_at) if self.started_at else 0,
+                "timing": self._restored_timing if self.history_only else self._clock.snapshot(),
+                "elapsed": ((self._restored_timing or {}).get("elapsed_ms") or 0) / 1000 if self.history_only else self._clock.elapsed(),
                 "error": self.error, "config": copy.deepcopy(self.public_config),
                 "case_count": self.config.get("case_count", 0),
                 "resources": copy.deepcopy(self.results) if include_details else [{k: v for k, v in item.items() if k not in {"case_results", "request_errors"}} for item in self.results],
@@ -1621,10 +1706,9 @@ class QualityManager:
 
     def _launch(self, task):
         with task.lock:
-            if task.status != "stopped":
-                apply_transition(task, "running", force=True)
-                task.phase = "running"
-            task.started_at = task.started_at or time.time()
+            if task.status == "stopped":
+                _clear_secret_fields(task.config)
+                return
         coroutine = run_quality_task(task)
         try:
             future = asyncio.run_coroutine_threadsafe(coroutine, LOOP)
@@ -1633,7 +1717,7 @@ class QualityManager:
             with task.lock:
                 task.error = task.error or _redact_secrets(str(exc), _secret_values(task.config))
                 apply_transition(task, "error", force=True)
-                task.finished_at = time.time()
+                task.finished_at = task._clock.mark("ended_at")
                 task.phase = "error"
                 _clear_secret_fields(task.config)
             persist_history()
@@ -1642,11 +1726,19 @@ class QualityManager:
         def done(fut):
             try:
                 fut.result()
+            except FutureCancelledError:
+                with task.lock:
+                    task._clock.mark("stop_requested_at")
+                    task._clock.mark("dispatch_ended_at")
+                    task.finished_at = task._clock.mark("ended_at")
+                    apply_transition(task, "stopped", force=True)
+                    task.phase = "stopped"
+                    task.persist()
             except Exception as exc:
                 with task.lock:
                     task.error = task.error or _redact_secrets(str(exc), _secret_values(task.config))
                     apply_transition(task, "error", force=True)
-                    task.finished_at = time.time()
+                    task.finished_at = task._clock.mark("ended_at")
             finally:
                 # 无论题集加载、网络请求还是评分阶段如何失败，都不能把密钥留在内存。
                 with task.lock:
@@ -1684,6 +1776,8 @@ class QualityManager:
             if not task:
                 return "质量评测不存在"
             if task.status in ("running", "stopping"):
+                task._clock.mark("stop_requested_at")
+                task._clock.mark("dispatch_ended_at")
                 task.stop_event.set()
                 apply_transition(task, "stopping", force=True)
                 task.phase = "stopping"
@@ -1691,6 +1785,9 @@ class QualityManager:
                 return None
             if task.status == "waiting":
                 # 还没开始执行：直接判定为已停止，不需要发停止信号。
+                task._clock.mark("stop_requested_at")
+                task._clock.mark("dispatch_ended_at")
+                task.finished_at = task._clock.mark("ended_at")
                 task.stop_event.set()
                 apply_transition(task, "stopped", force=True)
                 task.phase = "stopped"
@@ -1716,10 +1813,11 @@ async def run_quality_task(task):
         cases = tuple(QualityCase.from_dict(c, i) for i, c in enumerate(frozen)) if frozen else load_suite(task.config.get("suite_path"))
         with task.lock:
             # 排队期间被停止的任务可能永远不进入 running；这里只在确实该跑的时候改状态。
-            if task.status != "stopped":
-                apply_transition(task, "running", force=True)
-                task.phase = "running"
-            task.started_at = task.started_at or time.time()
+            if task.status == "stopped":
+                return
+            task.started_at = task._clock.mark("started_at")
+            apply_transition(task, "running", force=True)
+            task.phase = "running"
             task.config["case_count"] = task.public_config["case_count"] = len(cases)
             for resource in task.results:
                 resource["planned_cases"] = len(cases)
@@ -1760,13 +1858,23 @@ async def run_quality_task(task):
                 payload = {"model": resource["model"], "messages": [{"role": "user", "content": case.prompt}], "stream": False}
                 payload.update(dict(case.request))
                 payload["model"] = resource["model"]
-                item = {"id": index, "mode": "quality", "profile": case.category, "step_index": 1}
+                item = {"id": index, "mode": "quality", "profile": case.category, "step_index": 1,
+                        "enqueued_at": time.time(), "_enqueued_mono": time.monotonic()}
+                request_started_at, request_started_mono = time.time(), time.monotonic()
+                task._clock.dispatched()
+                cancelled = None
                 try:
                     result = await do_request(clients[resource_index], item, payload, headers, timeout_cfg,
                                               chat_url=strip_url(resource["url"]), capture_raw=task.config["capture_raw"])
+                except asyncio.CancelledError as exc:
+                    cancelled = exc
+                    result = getattr(exc, "request_result", {"status_code": 0, "completed": False, "error_type": "CANCELLED"})
                 except Exception as exc:
                     result = {"status_code": 0, "completed": False, "error_type": "NETWORK",
                               "reason": str(exc), "response_text": "", "ttft_ms": None, "total_ms": None}
+                if not result.get("timing"):
+                    result["timing"] = request_timing(started_at=request_started_at, ended_at=time.time(),
+                        total_ms=(time.monotonic() - request_started_mono) * 1000, source="partial")
                 result = _redact_secrets(result, secrets)
                 response = result.get("response_text") or ""
                 request_ok = bool(result.get("completed")) and not result.get("error_type") and 200 <= (result.get("status_code") or 0) < 300
@@ -1782,7 +1890,8 @@ async def run_quality_task(task):
                     "reference_answer": case.reference_answer, "rationale": case.rationale,
                     "evaluator": dict(case.evaluator), "weight": case.weight,
                     "benchmark_refs": list(case.benchmark_refs), "input_chars": len(case.prompt),
-                    "execution_sequence": sequence,
+                    "execution_sequence": sequence, "timing": request_evidence(result),
+                    "attempts": result.get("attempts"),
                     "status_code": result.get("status_code"), "completed": request_ok,
                     "ttft_ms": result.get("ttft_ms"), "total_ms": result.get("total_ms"),
                     "response_preview": response[:240], "error": result.get("reason"),
@@ -1812,6 +1921,9 @@ async def run_quality_task(task):
                             resource_result["request_errors"].pop()
                         raise
                 persist_history()
+                if cancelled is not None:
+                    raise cancelled
+            task._clock.finish_dispatch()
             with task.lock:
                 for resource_result in task.results:
                     if resource_result["status"] == "error":
@@ -1833,17 +1945,31 @@ async def run_quality_task(task):
                 for result in task.results:
                     if result["status"] in ("running", "waiting", "stopping"):
                         result["status"] = "stopped"
-            task.finished_at = time.time()
+            task.finished_at = task._clock.mark("ended_at")
             task.refresh_artifact(verify=False)
             task.persist()
+    except asyncio.CancelledError:
+        with task.lock:
+            task._clock.mark("stop_requested_at")
+            task._clock.mark("dispatch_ended_at")
+            task.finished_at = task._clock.mark("ended_at")
+            apply_transition(task, "stopped", force=True)
+            task.phase = "stopped"
+            task.current_case = task.current_resource = None
+            for resource in task.results:
+                if resource["status"] in ("running", "waiting", "stopping"):
+                    resource["status"] = "stopped"
+            task.persist()
+        raise
     except Exception as exc:
         with task.lock:
             task.error = _redact_secrets(str(exc), secrets)
+            task._clock.finish_dispatch()
             apply_transition(task, "error", force=True)
             task.phase = "error"
             task.current_case = None
             task.current_resource = None
-            task.finished_at = time.time()
+            task.finished_at = task._clock.mark("ended_at")
             try:
                 task.persist()
             except OSError:
@@ -1902,11 +2028,12 @@ class TaskManager:
                     LIMITER.release(pending_id)
                     continue
                 self.running_ids.append(task.id)
-                apply_transition(task, "running", force=True)
+                task.status = "running"
                 try:
                     task.open_output()
                 except Exception as exc:
                     task.error = f"无法创建结果文件：{exc}"
+                    task.finished_at = task._clock.mark("ended_at")
                     apply_transition(task, "error", force=True)
                     task.close_output()
                     if task.id in self.running_ids:
@@ -1929,6 +2056,7 @@ class TaskManager:
             self.finish(task)
 
     def finish(self, task):
+        task.finished_at = task._clock.mark("ended_at")
         task.close_output()
         with self.lock:
             if task.id in self.running_ids:
@@ -1945,10 +2073,14 @@ class TaskManager:
             if not task:
                 return "任务不存在"
             if task.status == "running":
+                task._clock.mark("stop_requested_at")
                 task._stopped.set()
                 apply_transition(task, "stopping", force=True)
             elif task.status == "waiting":
                 self.queue = deque(x for x in self.queue if x != task_id)
+                task._clock.mark("stop_requested_at")
+                task._clock.mark("dispatch_ended_at")
+                task.finished_at = task._clock.mark("ended_at")
                 apply_transition(task, "stopped", force=True)
             else:
                 return "任务已经结束"
@@ -2007,10 +2139,38 @@ class _FingerprintLimiter:
 
 FINGERPRINTS = FingerprintManager(BASE_DIR, limiter=_FingerprintLimiter())
 
+# Admission is serialized with existing HTTP task creation. Gateway/fingerprint
+# workers also share the exclusive limiter, including previously queued work.
+RESOURCE_ADMISSION_LOCK = threading.RLock()
+
+
+def _acquire_tpm(identifier):
+    with RESOURCE_ADMISSION_LOCK:
+        for manager, collection in ((MANAGER, 'tasks'), (QUALITY, 'tasks'),
+                                    (COMPARISONS, 'runs'), (ROUTING_COMPARISONS, 'runs')):
+            with manager.lock:
+                if any(item.status not in TASK_TERMINAL_STATES
+                       for item in getattr(manager, collection).values()):
+                    return False
+        return LIMITER.acquire_exclusive(identifier)
+
+
+TPM = tpm_service.TpmManager(BASE_DIR, loop=lambda: LOOP, acquire=_acquire_tpm,
+                             release=lambda identifier: _FingerprintLimiter().release(identifier),
+                             persist=lambda: persist_history(), resolve=_connection_with_credentials)
+
+
+def _task_creation_path(path, query):
+    return (path in {'/tasks', '/fingerprints', '/repeats', '/tpm/runs'}
+            or not query and path in {'/comparisons', '/routing-comparisons', '/quality-tests'}
+            or path.startswith('/task/') and query == 'retry')
+
 
 
 async def run_task(task):
     cfg = task.config
+    task.started_at = task._clock.mark("started_at")
+    persist_history()
     headers = {"Authorization": f"Bearer {cfg['api_key']}", "Accept": "text/event-stream"}
     timeout_cfg = {"connect": cfg["connect_timeout"], "read": cfg["read_timeout"],
                    "write": cfg["write_timeout"], "pool": cfg["connect_timeout"]}
@@ -2050,6 +2210,7 @@ async def run_task(task):
         while not task._stopped.is_set():
             await asyncio.sleep(.05)
         task._stop_event.set()
+        task._clock.mark("dispatch_ended_at")
         if producer_task and not producer_task.done():
             producer_task.cancel()
         await stop_workers_after_cancel()
@@ -2059,6 +2220,7 @@ async def run_task(task):
         offset = 0.0
         loop = asyncio.get_running_loop()
         base = loop.time()
+        wall_base, mono_base = time.time(), time.monotonic()
         for step in task.steps:
             step_start = base + offset
             with task.lock:
@@ -2072,9 +2234,11 @@ async def run_task(task):
                 wait = due - loop.time()
                 if wait > 0:
                     await asyncio.sleep(wait)
-                item = {"id": item_id, "step_index": step["index"], "scheduled_at": due,
+                item = {"id": item_id, "step_index": step["index"], "scheduled_at": wall_base + due - base,
+                        "_scheduled_mono": mono_base + due - base,
                         "mode": cfg["mode"], "profile": cfg["profile"], "grade": cfg.get("grade")}
                 await queue.put(item)
+                item.update(enqueued_at=time.time(), _enqueued_mono=time.monotonic())
                 with task.lock:
                     task.scheduled += 1
                     task.queue_depth = queue.qsize()
@@ -2097,19 +2261,33 @@ async def run_task(task):
                     task.current_step = item["step_index"]
                     step = task.steps[item["step_index"] - 1]
                     task.current_target_rpm = step["rpm"]
-                    schedule_lag_ms = max(0, int((loop.time() - item["scheduled_at"]) * 1000))
+                    schedule_lag_ms = max(0, int((time.monotonic() - item["_scheduled_mono"]) * 1000))
                     task.schedule_lag_ms.append(schedule_lag_ms)
                 payload = build_payload(cfg["model"], cfg["profile"], None, None, None, cfg["stream"], request_index=item["id"])
                 include_usage = cfg.get("include_usage", True)
-                result = await do_request(client, item, payload, headers, timeout_cfg,
-                                          chat_url=strip_url(cfg["url"]), capture_raw=cfg["capture_raw"],
-                                          include_usage=include_usage)
-                # 只有明确拒绝 usage 参数的校验错误才降级，限流或鉴权失败不重发。
-                if should_retry_without_usage(result, include_usage, cfg["stream"]):
-                    cfg["include_usage"] = False
+                attempts = []
+                try:
+                    task._clock.dispatched()
                     result = await do_request(client, item, payload, headers, timeout_cfg,
                                               chat_url=strip_url(cfg["url"]), capture_raw=cfg["capture_raw"],
-                                              include_usage=False)
+                                              include_usage=include_usage)
+                    attempts.append(attempt_timing(result, 1))
+                    if not task._stopped.is_set() and should_retry_without_usage(result, include_usage, cfg["stream"]):
+                        cfg["include_usage"] = False
+                        retry_item = {k: v for k, v in item.items() if k not in ("scheduled_at", "enqueued_at", "_scheduled_mono", "_enqueued_mono")}
+                        task._clock.dispatched()
+                        result = await do_request(client, retry_item, payload, headers, timeout_cfg,
+                                                  chat_url=strip_url(cfg["url"]), capture_raw=cfg["capture_raw"],
+                                                  include_usage=False)
+                        attempts.append(attempt_timing(result, 2))
+                except asyncio.CancelledError as exc:
+                    result = getattr(exc, "request_result", None)
+                    if result is not None:
+                        attempts.append(attempt_timing(result, len(attempts) + 1))
+                        result["attempts"] = attempts
+                        task.record(result)
+                    raise
+                result["attempts"] = attempts
                 result["schedule_lag_ms"] = schedule_lag_ms
                 task.record(result)
             finally:
@@ -2129,7 +2307,7 @@ async def run_task(task):
                 raise real_errors[0]
             with task.lock:
                 task.dropped = max(0, task.total - task.done)
-                task.finished_at = time.time()
+                task.finished_at = task._clock.mark("ended_at")
                 # 终态由状态机统一决定：计划跑完但仍有失败/异常结果时必须是
                 # 「部分完成」，不能对外显示成干净的「已完成」。
                 failed_requests = task.total_requests_failed()
@@ -2146,12 +2324,20 @@ async def run_task(task):
                 task.stopped_at = task.finished_at if task.status == "stopped" else None
     except asyncio.CancelledError:
         with task.lock:
+            task._clock.mark("stop_requested_at")
+            task._clock.mark("dispatch_ended_at")
             apply_transition(task, "stopped", force=True)
     except Exception as exc:
         with task.lock:
             task.error = task.error or str(exc)
             apply_transition(task, "error", force=True)
     finally:
+        for pending in [producer_task, *workers]:
+            if pending and not pending.done():
+                pending.cancel()
+        await asyncio.gather(*(x for x in [producer_task, *workers] if x), return_exceptions=True)
+        task._clock.finish_dispatch()
+        task.finished_at = task._clock.mark("ended_at")
         task._stopped.set()
         # 任务结束后立即从内存配置中移除密钥；重测必须重新输入。
         task.config["api_key"] = ""
@@ -2162,7 +2348,7 @@ async def run_task(task):
 
 
 def list_snapshot(item):
-    keep = {"id", "name", "status", "status_label", "created", "mode", "concurrency", "target_rpm",
+    keep = {"id", "name", "status", "status_label", "created", "timing", "mode", "concurrency", "target_rpm",
             "progress", "done", "total", "case_count", "planned_cases", "completed_cases", "failed_cases",
             "successful_responses", "progress_pct", "total_requests", "completed_requests", "planned_requests", "total_groups", "tier"}
     result = {key: value for key, value in item.items() if key in keep}
@@ -2249,6 +2435,10 @@ def _repeat_frozen_config(kind, source):
         if not fingerprint_protocol._protocol_valid(protocol):
             raise RepeatError("原采集的冻结协议已不受支持，不能自动替换当前方案复测")
         _repeat_require_fields(source.get("endpoint"), {"url", "model"})
+        try:
+            validate_endpoint_protocol(source["endpoint"], protocol)
+        except ValueError as exc:
+            raise RepeatError(str(exc)) from exc
         if source.get("mode") == "reference" and not source.get("trusted_source"):
             raise RepeatError("原参考采集缺少可信来源声明，不能准确复测")
         if source.get("mode") == "verify" and not FINGERPRINTS.get_reference(source.get("reference_id")):
@@ -2348,24 +2538,20 @@ def _repeat_resolve_connections(kind, config, supplied=None):
 def _repeat_preflight(kind, config):
     if kind == "fingerprint":
         protocol = config["_protocol"]
-        return {"level": "warn", "requires_confirmation": True, "planned_requests": len(protocol["cells"]) * protocol["samples_per_cell"],
-                "concurrency": protocol["concurrency"], "findings": [{"level": "warn", "title": "再次采集会发送请求并可能计费", "detail": "沿用原冻结协议，每次采集都需要重新确认请求数量及潜在费用。"}]}
+        rate = protocol.get("rpm")
+        pacing = f"每分钟最多开始 {rate} 请求" if rate is not None else "原协议未限制每分钟请求数"
+        planned = len(protocol["cells"]) * protocol["samples_per_cell"]
+        cap = protocol["max_tokens"]
+        reasoning = protocol["version"] == fingerprint_protocol.REASONING_METHOD_VERSION
+        scope = "（含思考与最终回答）" if reasoning else ""
+        caution = "保留思考协议只做探索性对照，不沿用直接回答协议的判断阈值。" if reasoning else ""
+        return {"level": "warn", "requires_confirmation": True, "planned_requests": planned,
+                "concurrency": protocol["concurrency"], "planned_rpm": rate,
+                "max_output_tokens": cap, "max_total_output_tokens": cap * planned,
+                "findings": [{"level": "warn", "title": "再次采集会发送请求并可能计费",
+                              "detail": f"沿用原冻结协议：并发上限 {protocol['concurrency']}，{pacing}。每请求输出硬上限 {cap:,} Token（令牌）{scope}，本轮 {planned} 次最多 {cap * planned:,} 输出令牌，另计输入费用。{caution}请重新确认请求数量及潜在费用。"}]}
     if kind == "comparison":
-        groups = [preflight_payload({**config["shared_config"], **group, "mode": "smoke"}) for group in config["groups"]]
-        result = copy.deepcopy(groups[0])
-        for field in ("planned_requests", "min_seconds", "estimated_bytes"):
-            result[field] = sum(item[field] for item in groups)
-        findings = []
-        seen = set()
-        for item in groups:
-            for finding in item.get("findings", []):
-                signature = (finding.get("code"), finding.get("detail"))
-                if signature not in seen:
-                    seen.add(signature)
-                    findings.append(finding)
-        result["findings"] = findings
-        result["level"] = risk_level(findings, production_like=result["target"].get("production_like", False))
-        return result
+        return preflight_payload(config, kind="comparison")
     if kind == "quality":
         result = preflight_payload(config, kind="quality")
         # The legacy estimator describes the first resource. Repetition checks
@@ -2521,6 +2707,7 @@ class Handler(BaseHTTPRequestHandler):
             "/static/app.js": ("app.js", "text/javascript; charset=utf-8"),
             "/static/connections.js": ("connections.js", "text/javascript; charset=utf-8"),
             "/static/repeat.js": ("repeat.js", "text/javascript; charset=utf-8"),
+            "/static/tpm.js": ("tpm.js", "text/javascript; charset=utf-8"),
             "/static/app.css": ("app.css", "text/css; charset=utf-8"),
             "/static/actions.js": ("actions.js", "text/javascript; charset=utf-8"),
             "/static/ui-kit.js": ("ui-kit.js", "text/javascript; charset=utf-8"),
@@ -2686,7 +2873,7 @@ class Handler(BaseHTTPRequestHandler):
         path = parsed.path
         if path == "/":
             return self._html()
-        if path in {"/assets/fingerprint.js", "/assets/fingerprint.css", "/static/app.js", "/static/connections.js", "/static/repeat.js", "/static/app.css", "/static/actions.js", "/static/ui-kit.js", "/static/tokens.css"}:
+        if path in {"/assets/fingerprint.js", "/assets/fingerprint.css", "/static/app.js", "/static/connections.js", "/static/repeat.js", "/static/tpm.js", "/static/app.css", "/static/actions.js", "/static/ui-kit.js", "/static/tokens.css"}:
             return self._asset(path)
         if path == "/auth/status":
             user = _current_user(self)
@@ -2699,6 +2886,13 @@ class Handler(BaseHTTPRequestHandler):
             return self._json({"error": "请先登录"}, 401)
         if path == "/health":
             return self._json({"ok": True, "version": APP_VERSION, "started": SERVER_STARTED})
+        if path.startswith('/tpm/'):
+            try:
+                data, status = tpm_service.get_response(TPM, path)
+                headers = {'Content-Disposition': 'attachment; filename="tpm-report.json"'} if path.endswith('/export') else None
+                return self._json(data, status, headers=headers)
+            except tpm_service.TpmError as exc:
+                return self._json({'error': str(exc)}, exc.status)
         if path == "/favicon.ico":
             # 内联图标：放在鉴权闸门之外——登录页也要显示它，而它本身不含任何业务数据。
             blob = FAVICON_SVG.encode("utf-8")
@@ -2880,7 +3074,7 @@ class Handler(BaseHTTPRequestHandler):
                         except ValueError:
                             continue
                         if item.get("item_id") == wanted:
-                            return self._json(item)
+                            return self._json(normalize_timing_tree(item))
             except OSError as exc:
                 return self._internal_error(exc)
             return self._json({"error": "记录不存在"}, 404)
@@ -2926,7 +3120,13 @@ class Handler(BaseHTTPRequestHandler):
         try:
             if not self._same_origin():
                 return self._json({"error": "已拒绝跨站状态变更请求"}, 403)
-            result = self._do_post(parsed, path)
+            if _task_creation_path(path, parsed.query):
+                with RESOURCE_ADMISSION_LOCK:
+                    if path != '/tpm/runs' and TPM.active_id and _current_user(self):
+                        return self._json({'error': 'TPM（每分钟词元）压测正在独占本机资源，请先停止并等待收尾。'}, 409)
+                    result = self._do_post(parsed, path)
+            else:
+                result = self._do_post(parsed, path)
             self._note()
             return result
         except ValueError as exc:
@@ -2985,6 +3185,14 @@ class Handler(BaseHTTPRequestHandler):
             user = _current_user(self)
             if path not in ("/health",) and not user:
                 return self._json({"error": "请先登录"}, 401)
+            if path.startswith('/tpm/'):
+                try:
+                    data, status = tpm_service.post_response(TPM, path, body, self._actor())
+                    if path != '/tpm/preview':
+                        self._audit('tpm.' + path.rsplit('/', 1)[-1], target=data.get('id'))
+                    return self._json(data, status)
+                except tpm_service.TpmError as exc:
+                    return self._json({'error': str(exc)}, exc.status)
             if path in {"/fingerprints", "/fingerprint"} or path.startswith(("/fingerprints/", "/fingerprint/")):
                 return self._fingerprint_post(path, body)
             if path in {"/repeats/prepare", "/repeats"}:
@@ -3403,7 +3611,7 @@ def _history_safe_snapshot(value):
     if isinstance(value, dict):
         clean = {}
         for key, item in value.items():
-            normalized = str(key).strip().lower().replace("-", "_")
+            normalized = _normalized_field_name(str(key))
             if _is_secret_field(key) or normalized in {"raw_input", "raw_output", "response"}:
                 continue
             clean[key] = _history_safe_snapshot(item)
@@ -3427,6 +3635,8 @@ def referenced_artifacts():
     对照实验的子任务也在这里登记，避免它们的文件被误判成孤儿。
     """
     referenced = {}
+    for item in TPM.ordered(summary=True):
+        referenced[f'tpm_run_{item["id"]}.jsonl'] = f'TPM（每分钟词元）压测「{item.get("name") or item["id"]}」'
     for task in MANAGER.tasks.values():
         path = task.artifact_path or task.out_path
         if path:
@@ -3460,11 +3670,13 @@ def persist_history():
             # 正文是批量合成文本，写进索引只会把每次启动都拖慢。
             routing_comparisons = [_routing_history_snapshot(item) for item in ROUTING_COMPARISONS.ordered()]
             _history_write({"tasks": tasks, "comparisons": comparisons, "quality_tests": quality_tests,
-                            "routing_comparisons": routing_comparisons})
+                            "routing_comparisons": routing_comparisons,
+                            "tpm_runs": [_history_safe_snapshot(item) for item in TPM.ordered()]})
+            return True
         except Exception as exc:
             # Evidence persists independently; index errors must be diagnosable.
             EVENTS.log("history.write_failed", level="error", error_type=type(exc).__name__)
-            return
+            return False
 
 
 def _routing_history_snapshot(snapshot):
@@ -3480,7 +3692,7 @@ def _routing_history_snapshot(snapshot):
         "error": snapshot.get("error"),
         "created": snapshot.get("created"),
         "started_at": snapshot.get("started_at"),
-        "finished_at": snapshot.get("finished_at"),
+        "finished_at": snapshot.get("finished_at"), "timing": snapshot.get("timing"),
         "tier": snapshot.get("tier"),
         "rpm": snapshot.get("rpm"),
         "concurrency": snapshot.get("concurrency"),
@@ -3561,6 +3773,7 @@ def _history_config(snapshot, fallback=None):
 
 def _restore_task_snapshot(snapshot, out_path=None):
     """从历史摘要恢复一个只读 Task（任务）对象，不恢复执行状态和密钥。"""
+    snapshot = normalize_timing_tree(snapshot)
     cfg = _history_config(snapshot)
     try:
         steps, total = build_plan(cfg)
@@ -3580,7 +3793,7 @@ def _restore_task_snapshot(snapshot, out_path=None):
         task.error = snapshot.get("error")
     task.created = float(snapshot.get("created") or time.time())
     task.started_at = snapshot.get("started_at")
-    task.finished_at = snapshot.get("finished_at") or task.created
+    task.finished_at = snapshot.get("finished_at")
     task.stopped_at = snapshot.get("stopped_at")
     task.total = int(snapshot.get("total") or total)
     task.scheduled = int(snapshot.get("scheduled") or task.total)
@@ -3615,6 +3828,8 @@ def _restore_task_snapshot(snapshot, out_path=None):
     task.parent_comparison_id = snapshot.get("parent_comparison_id")
     task.parent_group_id = snapshot.get("parent_group_id")
     task._history_snapshot = _history_safe_snapshot(snapshot)
+    task._history_snapshot["timing"] = restored_timing(snapshot, interrupted=snapshot.get("status") in ("running", "waiting", "stopping"))
+    task._history_snapshot.update(status=task.status, status_label=status_label(task.status), error=task.error)
     task._history_snapshot["out_path"] = task.out_path
     task.public_config = public_config(cfg)
     return task
@@ -3648,12 +3863,13 @@ def _legacy_task_from_file(path, fallback_cfg):
     lag = []
     buckets = {}
     recent = deque(maxlen=100)
-    first_ts = last_ts = None
     profile = None
     mode = None
     model = None
     target_url = None
     capture_raw = False
+    cache_stat = {"eligible": 0, "hits": 0, "no_usage": 0,
+                  "prompt_tokens": 0.0, "cached_tokens": 0.0, "token_eligible": 0}
     done = 0
     try:
         with open(path, encoding="utf-8") as f:
@@ -3676,11 +3892,10 @@ def _legacy_task_from_file(path, fallback_cfg):
                 if result.get("schedule_lag_ms") is not None:
                     try: lag.append(float(result["schedule_lag_ms"]))
                     except (TypeError, ValueError): pass
-                ts = result.get("ts")
-                if isinstance(ts, (int, float)):
-                    first_ts = ts if first_ts is None else min(first_ts, ts)
-                    last_ts = ts if last_ts is None else max(last_ts, ts)
-                    bucket = int(ts // 1000)
+                timing = request_evidence(result)
+                # 旧 ts 是发送开始，不能重建成“完成吞吐”的时间曲线。
+                if timing["ended_at"] is not None:
+                    bucket = int(datetime.fromisoformat(timing["ended_at"].replace("Z", "+00:00")).timestamp())
                     bucket_data = buckets.setdefault(bucket, {"count": 0, "ok": 0, "failed": 0})
                     bucket_data["count"] += 1
                     if category == "ok": bucket_data["ok"] += 1
@@ -3690,10 +3905,39 @@ def _legacy_task_from_file(path, fallback_cfg):
                 model = model or result.get("model")
                 target_url = target_url or result.get("url") or result.get("target_url")
                 capture_raw = capture_raw or "raw_input" in result or "raw_output" in result
+                cached = result.get("cached_tokens")
+                try:
+                    cached_number = None if isinstance(cached, bool) or cached is None else float(cached)
+                    if cached_number is not None and not math.isfinite(cached_number):
+                        cached_number = None
+                except (TypeError, ValueError):
+                    cached_number = None
+                if cached_number is None:
+                    cache_stat["no_usage"] += 1
+                else:
+                    cache_stat["eligible"] += 1
+                    if cached_number > 0:
+                        cache_stat["hits"] += 1
+                    prompt = result.get("prompt_tokens")
+                    try:
+                        prompt_number = None if isinstance(prompt, bool) or prompt is None else float(prompt)
+                        if prompt_number is not None and (not math.isfinite(prompt_number) or prompt_number <= 0):
+                            prompt_number = None
+                    except (TypeError, ValueError):
+                        prompt_number = None
+                    if prompt_number is not None and cached_number >= 0:
+                        cache_stat["prompt_tokens"] += prompt_number
+                        cache_stat["cached_tokens"] += cached_number
+                        cache_stat["token_eligible"] += 1
                 recent.append({"id": result.get("item_id"), "step": result.get("step_index"),
+                               "request_id": result.get("request_id"),
                                "status": result.get("status_code") or 0, "cat": category, "cls": css,
                                "label": label, "ttft": result.get("ttft_ms"), "total": result.get("total_ms"),
-                               "reason": result.get("reason")})
+                               "error_type": result.get("error_type"), "error_detail": result.get("error_detail"),
+                               "reason": result.get("reason"), "timing": timing,
+                               "usage_seen": bool(result.get("usage_seen")),
+                               "cached_tokens": result.get("cached_tokens"), "cache_hit": result.get("cache_hit"),
+                               "attempts": result.get("attempts")})
     except (OSError, UnicodeError):
         return None
     if not done:
@@ -3703,13 +3947,7 @@ def _legacy_task_from_file(path, fallback_cfg):
         created = stat.st_ctime
     except OSError:
         created = time.time()
-    if first_ts is not None:
-        started_at = first_ts / 1000
-        finished_at = (last_ts or first_ts) / 1000
-    else:
-        started_at = created
-        finished_at = created
-    elapsed = max(0.001, finished_at - started_at)
+    started_at = finished_at = elapsed = None
     cfg = dict(fallback_cfg or {})
     cfg.update({"mode": mode or cfg.get("mode", "smoke"), "profile": profile or cfg.get("profile", "smoke"),
                 "iterations": done, "capture_raw": capture_raw})
@@ -3730,7 +3968,7 @@ def _legacy_task_from_file(path, fallback_cfg):
     task_id = Path(path).stem.rsplit("_", 1)[-1]
     if len(task_id) < 8:
         task_id = uuid.uuid4().hex[:12]
-    name = cfg.get("name") or f"历史结果 · {time.strftime('%m-%d %H:%M:%S', time.localtime(created))}"
+    name = cfg.get("name") or f"历史结果 · {datetime.fromtimestamp(created, SINGAPORE_TIMEZONE).strftime('%m-%d %H:%M:%S')}"
     avg = sum(total_ms) / len(total_ms) if total_ms else None
     timeline = []
     for second in sorted(buckets):
@@ -3751,11 +3989,24 @@ def _legacy_task_from_file(path, fallback_cfg):
         "success_pct": counters["ok"] * 100 / done if done else None,
         "ttft": {"n": len(ttft), **_latency_percentiles(ttft)},
         "total_ms": {"n": len(total_ms), **_latency_percentiles(total_ms), "avg": avg},
-        "rpm": {"live": 0, "avg": done * 60 / elapsed, "capacity_estimate": (legacy_concurrency * 60000 / avg) if avg else None},
+        "rpm": {"live": 0, "avg": None, "capacity_estimate": (legacy_concurrency * 60000 / avg) if avg else None},
         "schedule_lag": _latency_percentiles(lag),
+        "cache": {"eligible": cache_stat["eligible"], "hits": cache_stat["hits"],
+                  "no_usage": cache_stat["no_usage"],
+                  "request_total": done,
+                  "rate_pct": (cache_stat["hits"] * 100 / done if done else None),
+                  "eligible_rate_pct": (cache_stat["hits"] * 100 / cache_stat["eligible"]
+                                        if cache_stat["eligible"] else None),
+                  "prompt_tokens": cache_stat["prompt_tokens"], "cached_tokens": cache_stat["cached_tokens"],
+                  "token_eligible": cache_stat["token_eligible"],
+                  "token_rate_pct": (cache_stat["cached_tokens"] * 100 / cache_stat["prompt_tokens"]
+                                     if cache_stat["prompt_tokens"] > 0 else None),
+                  "basis": "usage.cached_tokens>0",
+                  "token_basis": "usage.cached_tokens/usage.prompt_tokens"},
         "phase": f"历史结果 · 已完成全部 {done} 条请求", "recent": list(reversed(recent)),
         "timeline": timeline, "out_path": path, "write_error": None, "created": created,
         "started_at": started_at, "finished_at": finished_at, "stopped_at": None, "elapsed": elapsed,
+        "timing": restored_timing({}),
         "planned_duration": elapsed, "planned_count": done, "history_only": True,
         "repeat_unavailable": "旧结果文件没有完整的原测试配置，不能准确复测；请新建测试",
     }
@@ -3764,7 +4015,8 @@ def _legacy_task_from_file(path, fallback_cfg):
 
 def restore_history():
     """服务启动时恢复历史和质量证据；绝不自动继续执行中断的任务。"""
-    entries = HistoryStore(HISTORY_FILE).read()
+    entries = normalize_timing_tree(HistoryStore(HISTORY_FILE).read())
+    TPM.restore(entries.get('tpm_runs') or [])
     for snapshot in entries.get("tasks", []) if isinstance(entries.get("tasks", []), list) else []:
         if not isinstance(snapshot, dict):
             continue
@@ -3792,6 +4044,8 @@ def restore_history():
         run.created = float(snapshot.get("created") or time.time()); run.started_at = snapshot.get("started_at"); run.finished_at = snapshot.get("finished_at")
         run.group_results = list(snapshot.get("groups") or []); run.lock = threading.RLock(); run.history_only = True; run._history_snapshot = _history_safe_snapshot(snapshot)
         run.current_group_id = None; run.current_group_name = None
+        run._history_snapshot["timing"] = restored_timing(snapshot, interrupted=snapshot.get("status") in ("running", "waiting", "stopping"))
+        run._history_snapshot.update(status=run.status, status_label=status_label(run.status))
         restored_groups = []
         for item in run.group_results:
             if not isinstance(item, dict):
@@ -3814,7 +4068,7 @@ def restore_history():
                 with open(artifact, encoding="utf-8") as source:
                     evidence = json.load(source)
                 if isinstance(evidence, dict) and evidence.get("id") == task_id:
-                    snapshot = evidence
+                    snapshot = normalize_timing_tree(evidence)
             except (OSError, ValueError):
                 pass
         config = dict(snapshot.get("config") or {})
@@ -3840,9 +4094,14 @@ def restore_history():
         task.status = "error" if interrupted else snapshot.get("status", "error")
         task.created = float(snapshot.get("created") or time.time())
         task.started_at = snapshot.get("started_at")
-        task.finished_at = snapshot.get("finished_at") or (time.time() if interrupted else None)
+        task.finished_at = snapshot.get("finished_at")
+        task._restored_timing = restored_timing(snapshot, interrupted=interrupted)
         task.error = snapshot.get("error") or ("服务在质量评测完成前重启，已保留证据，未自动继续执行。" if interrupted else None)
         task.results = list(snapshot.get("resources") or task.results)
+        for resource in task.results:
+            summary = resource.get("summary") if isinstance(resource, dict) else None
+            if isinstance(summary, dict) and isinstance(summary.get("created_at"), str):
+                summary["created_at"] = singapore_timestamp(summary["created_at"])
         task.history_only = True
         task.phase = "error" if task.status == "error" else "finished"
         with QUALITY.lock: QUALITY.tasks[task.id] = task
@@ -3892,6 +4151,7 @@ def main():
         print("\n已停止。")
     finally:
         SERVER_SHUTTING_DOWN = True
+        TPM.close()
         FINGERPRINTS.close()
         server.server_close(); LOOP.call_soon_threadsafe(LOOP.stop)
 

@@ -56,10 +56,60 @@ async function screenshot(page,name){await page.screenshot({path:path.join(outpu
   await page.locator('#gatewayList .task').first().click();await page.waitForFunction(()=>!refreshing);
   await page.locator('#detail .overview-shell').waitFor();
   const single=await bounds(page,'.overview-shell');
-  await sameEdges(page,'#detail>.cards,#detail>.report-head',single);
+  await sameEdges(page,'#detail>.report-section:not(.report-footer-actions),#detail>.report-head',single);
   const headingSingle=await bounds(page,'#recordTitle'),createSingle=await bounds(page,'#recordCreateButton');
   await checkOverflow(page,'.layout,.main,#detail');
   if([1920,768,390].includes(width))await screenshot(page,`single-${width}`);
+  if([1440,980,390].includes(width))for(const theme of ['light','dark']){
+   await page.evaluate(theme=>document.documentElement.dataset.theme=theme,theme);await screenshot(page,`single-${width}-${theme}`);
+  }
+  await page.evaluate(()=>document.documentElement.dataset.theme='light');
+  assert.equal(await page.locator('#detail .overview-shell .report-metric').count(),4,'the summary has four balanced key metrics');
+  if(width===980){
+   const tiles=await page.locator('#detail .overview-shell .report-metric').evaluateAll(nodes=>nodes.map(node=>{const r=node.getBoundingClientRect();return {top:r.top,left:r.left}}));
+   near(tiles[0].top,tiles[1].top,'first row of balanced metrics');near(tiles[2].top,tiles[3].top,'second row of balanced metrics');
+   assert.ok(tiles[2].top>tiles[0].top,'four metrics use two rows at medium width');
+  }
+  assert.equal(await page.locator('#detail > .report-progress-card:visible').count(),0,'completed progress does not displace the result');
+  if([1440,980,390].includes(width)){
+   const base=fixture.tasks[0];
+   for(const state of ['waiting','running','finished_with_errors','stopped','error','expired']){
+    const active=['waiting','running'].includes(state),empty=state==='waiting'||state==='error',done=empty?0:['stopped','running'].includes(state)?150:300;
+    const record={...base,status:state,name:'缓存压测 · 状态与异常核查',config:{...base.config,profile:'cache'},total:300,done,progress:done/300,phase:state==='running'?'按计划发出请求':state==='waiting'?'等待执行':'已结束',scheduled:done,started:done,inflight:0,pending:0,elapsed:183,planned_duration:180,rpm:{avg:98,live:98},ttft:{p95:7946},success_pct:empty?null:100*(done-2)/done,counters:empty?{}:{ok:done-2,r5xx:2},cache:{rate_pct:empty?null:100*Math.floor(done*.87)/done,hits:Math.floor(done*.87),request_total:done,no_usage:empty?0:2},recent:empty?[]:[{id:1,cls:'ok',label:'成功',status:200,total:8000,ttft:7000},{id:2,cls:'r5xx',label:'服务端错误',status:502,total:100,error_type:'HTTP_5XX',reason:'合成失败示例'}],error:state==='error'?'本地合成连接失败':'',timeline:empty?[]:base.timeline};
+    if(state==='expired'){record.artifact={state:'expired'};record.out_path='/synthetic-expired.jsonl';record.config.capture_raw=true}
+    await page.evaluate(data=>{render(data);document.querySelector('.main').scrollTop=0;document.querySelector('.shell').scrollTop=0},record);
+    assert.equal(await page.locator('#detail > .report-progress-card:visible').count(),active?1:0,'progress follows lifecycle');
+    if(state==='expired'){
+     assert.equal(await page.locator('#detail [data-click-action="download"],#detail [data-click-action="showRaw"]').count(),0,'expired files do not offer dead download or raw-view actions');
+     assert.match(await page.locator('#gatewayRequests').innerText(),/仅保留历史摘要/);
+    }
+    if(state==='finished_with_errors'){
+     await page.locator('#detail .overview-shell [data-click-action="setGatewayRequestFilter"]').click();
+     assert.equal(await page.locator('#gatewayRequests tbody tr').count(),1,'one failing request after filter');
+     assert.match(await page.locator('#gatewayRequests tbody').innerText(),/502/);
+     await page.evaluate(()=>render(window.currentDetail));
+     assert.equal(await page.locator('#gatewayRequests tbody tr').count(),1,'filter survives refresh');
+     await page.locator('#gatewayRequests [data-arg1="all"]').click();
+     await page.locator('#gatewayRequests [data-arg1="all"]').focus();
+     await page.keyboard.press('ArrowRight');
+     await page.evaluate(()=>new Promise(requestAnimationFrame));
+     assert.equal(await page.locator('#gatewayRequests [data-arg1="failed"]').evaluate(el=>el===document.activeElement&&el.getAttribute('aria-selected')==='true'),true,'keyboard focus matches selected request filter after rendering');
+     await page.keyboard.press('ArrowRight');
+     await page.evaluate(()=>new Promise(requestAnimationFrame));
+     assert.equal(await page.locator('#gatewayRequests [data-arg1="all"]').evaluate(el=>el===document.activeElement&&el.getAttribute('aria-selected')==='true'),true,'request filters can cycle without focus reverting');
+    }
+    for(const theme of ['light','dark']){
+     await page.evaluate(async theme=>{setTheme(theme);await new Promise(requestAnimationFrame);document.querySelector('.main').scrollTop=0;document.querySelector('.shell').scrollTop=0},theme);
+     await checkOverflow(page,'.layout,.main,#detail,#detail>.report-section');
+     await page.screenshot({path:path.join(output,`single-${state}-${width}-${theme}.png`),animations:'disabled'});
+    }
+   }
+   await page.evaluate(data=>{render(data);setTheme('light')},base);
+  }
+  const finishedSingle=fixture.tasks[0];fixture.tasks[0]={...finishedSingle,status:'running'};await page.evaluate(()=>refresh());
+  assert.equal(await page.locator('#detail .report-head [data-click-action="stopTask"]').count(),1,'single stop is in the header');
+  assert.equal(await page.locator('#detail [data-click-action="stopTask"]').count(),1,'single stop is not duplicated');
+  fixture.tasks[0]=finishedSingle;await page.evaluate(()=>refresh());
   await page.locator('#gatewaySubnav [data-view="compare"]').click();
   const headingCompare=await bounds(page,'#recordTitle'),createCompare=await bounds(page,'#recordCreateButton');
   near(headingSingle.left,headingCompare.left,'record heading left');near(headingSingle.width,headingCompare.width,'record heading width');
@@ -79,7 +129,9 @@ async function screenshot(page,name){await page.screenshot({path:path.join(outpu
   for(const tab of ['基准组','对比组']){
    await page.getByRole('tab',{name:new RegExp('^'+tab)}).click();
    await page.locator('.group-detail-head').waitFor();
-   await sameEdges(page,'.group-detail,.group-detail-head,.group-progress-card,.group-detail>.report-section',single);
+   await sameEdges(page,'.group-detail,.group-detail-head,.group-detail>.report-section',single);
+   assert.equal(await page.locator('.group-detail>.report-progress-card').count(),0,'finished group puts execution below its result');
+   assert.equal(await page.locator('.group-detail>details[id^="group-process-"]').evaluate(el=>el.open),false,'finished group execution starts collapsed');
    assert.equal((await bounds(page,'.group-detail')).shadow,'none','no nested group shadow');
    assert.equal((await bounds(page,'.group-detail-head')).shadow,single.shadow,'group card shadow');
    assert.equal(await page.locator('.report-overview').count(),0,'group data must not repeat overall report');
@@ -93,7 +145,7 @@ async function screenshot(page,name){await page.screenshot({path:path.join(outpu
   const completedComparison=fixture.comparisons[0];
   fixture.comparisons[0]={...completedComparison,status:'running',completed_requests:5,planned_requests:20,current_group_name:'40 并发基准'};
   await page.evaluate(()=>refresh());
-  assert.equal((await page.locator('.report-progress-line strong').innerText()).trim(),'25%','live request progress');
+  assert.equal((await page.locator('#modulePlaceholder .report-progress-line strong').innerText()).trim(),'25%','live request progress');
   await sameEdges(page,'#modulePlaceholder .report-head,.report-overview',single);
   await checkOverflow(page,'.main,.report-head,.report-overview');
   if(width===1920)await screenshot(page,'running-1920');

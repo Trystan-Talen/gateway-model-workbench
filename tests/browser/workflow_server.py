@@ -6,6 +6,7 @@ import time
 import os
 from pathlib import Path
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import tpm_upstream
 
 os.environ['NO_PROXY'] = os.environ['no_proxy'] = '127.0.0.1,localhost'
 
@@ -25,6 +26,12 @@ ui.ACCOUNTS_FILE = str(folder / 'accounts.json')
 ui._save_api_key = lambda *args: False
 ui._load_api_key = lambda *args: ''
 permits = threading.Semaphore(0)
+if os.environ.get("TPM_BROWSER_MEMORY_CREDENTIALS") == "1":
+    import tpm_credentials
+    ui._save_api_key = tpm_credentials.save
+    ui._load_api_key = tpm_credentials.load
+    ui._delete_api_key = tpm_credentials.delete
+    ui._keychain_available = tpm_credentials.available
 answers = ["PONG", "893", '{"name":"Ada","age":36,"tags":["math","ai"]}',
            "我不能帮助绕过安全控制，也不会提供具体步骤。",
            "项目摘要说明：项目代号：青松，本次批次：17。方案经过评审，支持灰度发布和可回滚，"
@@ -47,6 +54,8 @@ class Upstream(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_GET(self):
+        if (self.path == '/tpm-stats' or os.environ.get("TPM_BROWSER_MEMORY_CREDENTIALS") == "1") and tpm_upstream.handle_get(self):
+            return
         if self.path == '/v1/models':
             return self.reply({'data': [{'id': model} for model in ('quality-oracle','quality-regressed','quality-slow')]})
         return self.reply({'error':'not found'},404)
@@ -55,7 +64,10 @@ class Upstream(BaseHTTPRequestHandler):
         if self.path == '/advance':
             permits.release()
             return self.reply({'ok': True})
-        body = json.loads(self.rfile.read(int(self.headers.get('Content-Length', 0))))
+        body_length = int(self.headers.get('Content-Length', 0))
+        body = json.loads(self.rfile.read(body_length))
+        if tpm_upstream.handle_post(self, body, body_length):
+            return
         if body['model'] == 'quality-fail':
             return self.reply({'error': 'synthetic upstream unavailable'}, 503)
         if body['model'] == 'quality-pass':
@@ -83,6 +95,7 @@ print(json.dumps({'base': f'http://127.0.0.1:{server.server_port}',
 try:
     server.serve_forever()
 finally:
+    ui.TPM.close()
     ui.FINGERPRINTS.close()
     server.server_close()
     upstream.shutdown()

@@ -7,11 +7,50 @@ const {projectRoot:root,output,env}=require('./artifacts.cjs').browserArtifacts(
 const origin='http://127.0.0.1:18763';
 const html=fs.readFileSync(path.join(root,'static/index.html'),'utf8');
 const catalog=JSON.parse(execFileSync(process.env.PYTHON||'python3',['-c','import json; from fingerprint_protocol import catalog; print(json.dumps(catalog()))'],{cwd:root,encoding:'utf8',env}));
-const errors=[],unexpected=[];
+const errors=[],unexpected=[],createScreenshots=[];
 async function fits(page,width){
  assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth>innerWidth+1),false,`page fits ${width}`);
- const overflow=await page.locator('#connectionDrawer,.report-shell,.report-head,.report-section,#config,#fingerprintDrawer').evaluateAll(nodes=>nodes.filter(n=>n.getClientRects().length&&n.scrollWidth>n.clientWidth+1).map(n=>n.id||n.className));
+ const overflow=await page.locator('#connectionDrawer,.report-shell,.report-head,.report-section,#config,#fingerprintDrawer,.quality-resource,.group-row').evaluateAll(nodes=>nodes.filter(n=>n.getClientRects().length&&n.scrollWidth>n.clientWidth+1).map(n=>n.id||n.className));
  assert.deepEqual(overflow,[],`components fit ${width}`);
+}
+async function captureCreate(page,width,kind){
+ for(const theme of ['light','dark']){
+  await page.evaluate(theme=>{setTheme(theme);document.querySelector('#config .drawer-body').scrollTop=0;document.getElementById('toast').classList.remove('show')},theme);
+  await page.waitForFunction(()=>Math.abs(document.getElementById('config').getBoundingClientRect().right-innerWidth)<1);
+  await fits(page,width);
+  const geometry=await page.locator('#config .drawer-body,#config .drawer-footer').evaluateAll(nodes=>nodes.map(node=>({className:node.className,top:node.getBoundingClientRect().top,bottom:node.getBoundingClientRect().bottom,scrollHeight:node.scrollHeight,clientHeight:node.clientHeight})));
+  assert.ok(geometry[0].bottom<=geometry[1].top+1,'footer never covers the scrollable form');
+  const primaryFields={
+   gateway:['#modelSelect','#profile','#rpm','#iterations','#concurrency'],
+   routing:['#routingModel','#routingConcurrency','#routingRpm','#routingTier'],
+   'gateway-compare':['#profile','#groupFields .group-role','#groupFields .group-concurrency','#groupFields .group-rpm','#groupFields .group-iterations'],
+   quality:['#qualityResourceFields .quality-name','#qualityResourceFields .quality-model'],
+   'quality-compare':['#qualityResourceFields .quality-name','#qualityResourceFields .quality-model','#qualityReuse']
+  }[kind]||[],fieldGeometry=[];
+  for(const selector of primaryFields){
+   const fields=page.locator(selector);assert.ok(await fields.count()>0,`${kind}: ${selector} exists`);
+   for(let index=0;index<await fields.count();index++){
+    const field=fields.nth(index);await field.scrollIntoViewIfNeeded();await field.focus();
+    const bounds=await field.evaluate(node=>{
+     const drawer=node.closest('#config'),body=drawer.querySelector('.drawer-body'),footer=drawer.querySelector('.drawer-footer'),rect=element=>{const box=element.getBoundingClientRect();return {top:box.top,bottom:box.bottom,left:box.left,right:box.right}};
+     const box=node.getBoundingClientRect(),hit=document.elementFromPoint(box.left+box.width/2,box.top+box.height/2);
+     return {field:rect(node),body:rect(body),footer:rect(footer),focused:document.activeElement===node,uncovered:hit===node||node.contains(hit)};
+    });
+    const label=`${kind}: ${selector}[${index}] @ ${width}/${theme}`;
+    assert.equal(bounds.focused,true,`${label} receives keyboard focus`);
+    assert.ok(bounds.field.top>=bounds.body.top-1,`${label} is not clipped by the drawer header`);
+    assert.ok(bounds.field.bottom<=Math.min(bounds.body.bottom,bounds.footer.top)+1,`${label} is fully visible above the footer after scrolling`);
+    assert.ok(bounds.field.left>=bounds.body.left-1&&bounds.field.right<=bounds.body.right+1,`${label} stays within the scrollable form`);
+    assert.equal(bounds.uncovered,true,`${label} is not covered by another element`);
+    fieldGeometry.push({selector,index,...bounds});
+   }
+  }
+  const fieldsFile=`create-${kind}-fields-${width}-${theme}.png`;await page.screenshot({path:path.join(output,fieldsFile)});
+  await page.locator('#config .drawer-body').evaluate(node=>{node.scrollTop=0});
+  await page.evaluate(()=>new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve))));
+  const file=`create-${kind}-${width}-${theme}.png`;await page.screenshot({path:path.join(output,file)});
+  createScreenshots.push({kind,width,theme,file,fieldsFile,geometry,fieldGeometry});
+ }
 }
 async function closeTest(page){await page.locator('#config [data-click-action="toggleConfig"]').click();await page.waitForFunction(()=>!document.getElementById('config').classList.contains('mobile-open'))}
 (async()=>{
@@ -82,6 +121,8 @@ async function closeTest(page){await page.locator('#config [data-click-action="t
     await page.evaluate(theme=>setTheme(theme),theme);assert.equal(await page.locator('html').getAttribute('data-theme'),theme);await page.waitForTimeout(300);await fits(page,width);
     await page.screenshot({path:path.join(output,`connections-${width}-${theme}.png`)});
    }
+   assert.equal(await page.locator('.report-head [data-click-action="openConnectionEdit"]').count(),1,'edit action is in the header');
+   assert.equal(await page.locator('#connectionsList .mini-track').count(),0,'static connections never show task progress');
    await page.getByRole('button',{name:'编辑常用连接',exact:true}).click();
    assert.equal(await page.locator('#connectionKey').inputValue(),'');
    await page.locator('#connectionDrawer [data-click-action="revealConnectionKey"]').click();
@@ -100,10 +141,15 @@ async function closeTest(page){await page.locator('#config [data-click-action="t
    assert.deepEqual(routeDiscoveries.slice(-2).map(d=>d.body.connection_id).sort(),[fixed,smart].sort());
    await page.locator('#routingModel').selectOption('shared-model');
    const chosen=await page.evaluate(()=>readRouting());assert.equal(chosen.baseline.connection_id,fixed);assert.equal(chosen.candidate.connection_id,smart);
+   for(const side of ['baseline','candidate'])assert.equal(await page.locator(`#connection-details-routing-${side}`).evaluate(node=>node.open),false,'saved route hides duplicate connection fields');
+   assert.equal(chosen.baseline.concurrency,20);assert.equal(chosen.baseline.rpm,100);
+   await captureCreate(page,width,'routing');
    const draft=await page.locator('#routing-candidate-url').inputValue();
    await page.locator('#routing-candidate-panel [data-click-action="manageSavedConnections"]').click();
    await page.locator('#connectionCreateTitle').filter({hasText:'管理常用连接'}).waitFor();
    assert.equal(await page.locator('#config').evaluate(el=>el.inert),true);
+   assert.equal(await page.locator('#connectionCreateBody table').count(),0,'management has no horizontal table');
+   for(const theme of ['light','dark']){await page.evaluate(theme=>{setTheme(theme);document.getElementById('toast').classList.remove('show')},theme);await page.evaluate(()=>new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve))));await page.waitForTimeout(250);await fits(page,width);await page.screenshot({path:path.join(output,`connections-manage-${width}-${theme}.png`)})}
    await page.keyboard.press('Escape');assert.equal(await page.locator('#config').evaluate(el=>el.inert),false);
    await page.locator('#routing-candidate-panel [data-click-action="saveCurrentConnection"]').click();
    await page.locator('#connectionName').waitFor();assert.equal(await page.locator('#config').evaluate(el=>el.inert),true);
@@ -113,25 +159,48 @@ async function closeTest(page){await page.locator('#config [data-click-action="t
    await page.waitForFunction(()=>document.getElementById('routingModel').value==='');
    assert.equal((await page.evaluate(()=>readRouting())).candidate.connection_id,smart,'key update retains named binding');
    assert.equal(keys[fixed],'synthetic-fixed-secret','same address update preserves other profile key');
+   await page.locator('#connection-details-routing-candidate > summary').click();
    await page.locator('#routing-candidate-key').fill('synthetic-manual-key');assert.equal((await page.evaluate(()=>readRouting())).candidate.connection_id,undefined,'manual key exits binding');
    await page.locator('#saved-connection-routing-candidate').selectOption(smart);
    await closeTest(page);
    await page.locator('[data-module="gateway"]').click();await page.locator('#recordCreateButton').click();
    await page.locator('#saved-connection-gateway-main').selectOption(fixed);
    await page.locator('#loadModels').click();await page.waitForFunction(()=>!document.getElementById('loadModels').disabled);
-   await page.locator('#modelSelect').selectOption('shared-model');await page.locator('#submit').click();
+   await page.locator('#modelSelect').selectOption('shared-model');
+   assert.equal(await page.locator('#connection-details-gateway-main').evaluate(node=>node.open),false);
+   assert.equal(await page.locator('#api_key').isVisible(),false);
+   assert.equal(await page.locator('#templatePickerBody').isVisible(),false);
+   assert.equal(await page.locator('#concurrency').inputValue(),'20');assert.equal(await page.locator('#rpm').inputValue(),'100');
+   await captureCreate(page,width,'gateway');await page.locator('#submit').click();
    await page.waitForFunction(()=>!document.getElementById('config').classList.contains('mobile-open'));
    assert.equal(submissions.find(x=>x.endpoint==='/tasks').body.connection_id,fixed);
-   await page.locator('[data-module="quality"]').click();await page.locator('#recordCreateButton').click();
+   await page.locator('#gatewaySubnav [data-view="compare"]').click();await page.locator('#recordCreateButton').click();
+   assert.deepEqual(await page.locator('#groupFields .group-concurrency').evaluateAll(nodes=>nodes.map(node=>node.value)),['20','20']);
+   assert.deepEqual(await page.locator('#groupFields .group-rpm').evaluateAll(nodes=>nodes.map(node=>node.value)),['100','100']);
+   await captureCreate(page,width,'gateway-compare');await closeTest(page);
+   await page.locator('[data-module="quality"]').click();await page.locator('#qualitySubnav [data-view="single"]').click();await page.locator('#recordCreateButton').click();
    await page.locator('#saved-connection-quality-0').selectOption(smart);
    await page.locator('[data-quality-index="0"] .quality-model-refresh').click();
    await page.waitForFunction(()=>!document.querySelector('[data-quality-index="0"] .quality-model').disabled);
    assert.equal((await page.evaluate(()=>readQuality())).resources[0].connection_id,smart);
-   await closeTest(page);
+   assert.equal(await page.locator('#connection-details-quality-0').evaluate(node=>node.open),false);
+   assert.equal(await page.locator('#qualityCapture').isVisible(),false);
+   await captureCreate(page,width,'quality');await closeTest(page);
+   await page.locator('#qualitySubnav [data-view="compare"]').click();await page.locator('#recordCreateButton').click();
+   for(const [index,id] of [[0,fixed],[1,smart]]){
+    await page.locator(`#saved-connection-quality-${index}`).selectOption(id);
+    await page.locator(`[data-quality-index="${index}"] .quality-model-refresh`).click();
+    await page.waitForFunction(index=>!document.querySelector(`[data-quality-index="${index}"] .quality-model`).disabled,index);
+    assert.equal(await page.locator(`#connection-details-quality-${index}`).evaluate(node=>node.open),false);
+   }
+   assert.equal((await page.evaluate(()=>readQuality())).resources.length,2);
+   await captureCreate(page,width,'quality-compare');await closeTest(page);
    await page.locator('[data-module="fingerprint"]').click();await page.locator('#recordCreateButton').click();
    await page.locator('#fpSavedConnection').waitFor();await page.locator('#fpSavedConnection').selectOption(fixed);
    await page.locator('#fpName').fill('合成指纹');await page.locator('#fpFetchModels').click();
    await page.waitForFunction(()=>!document.getElementById('fpFetchModels').disabled);await page.locator('#fpModelSelect').selectOption('shared-model');
+   await page.evaluate(()=>ConnectionUI.refresh());
+   assert.equal(await page.locator('#fpModelSelect').inputValue(),'shared-model','refreshing unchanged connection metadata preserves the chosen model');
    await page.locator('#fpRiskAck').check();await page.locator('#fpSubmit').click();
    await page.waitForFunction(()=>document.getElementById('fpFormError').textContent.includes('合成验证完成'));
    assert.equal(submissions.find(x=>x.endpoint==='/fingerprints').body.endpoint.connection_id,fixed);
@@ -153,6 +222,7 @@ async function closeTest(page){await page.locator('#config [data-click-action="t
    assert.equal(profiles.length,1);await context.close();
   }
   assert.deepEqual(errors,[]);assert.deepEqual(unexpected,[]);
-  console.log(JSON.stringify({passed:true,viewports:[1440,980,390],themes:['light','dark'],checks:['named CRUD','same URL independent keys','reload','gateway routing quality fingerprint selectors','manual input','model discovery binding','key rotation invalidates models','no implicit reveal','transient reveal','stacked drawer focus','storage error','responsive layout'],output}));
+  fs.writeFileSync(path.join(output,'create-layout.json'),JSON.stringify({createScreenshots,errors,unexpected},null,2));
+  console.log(JSON.stringify({passed:true,viewports:[1440,980,390],themes:['light','dark'],checks:['named CRUD','same URL independent keys','reload','gateway routing quality fingerprint selectors','manual input','model discovery binding','key rotation invalidates models','no implicit reveal','transient reveal','stacked drawer focus','storage error','responsive layout','collapsed saved connection details','20/100 defaults','all new-form layouts'],createScreenshots:createScreenshots.length,output}));
  }finally{await browser.close()}
 })().catch(error=>{console.error(error);process.exitCode=1});

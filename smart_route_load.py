@@ -17,7 +17,10 @@ import re
 import sys
 import time
 import urllib.parse
+from pathlib import Path
 from typing import Any, Dict, Iterable, Optional, Tuple
+
+from time_record import request_timing, task_timing
 
 try:
     import httpx
@@ -58,6 +61,27 @@ LONG_CONTEXT_PARAGRAPHS = (
 )
 
 
+# 缓存压测使用一段固定且足够长的前缀；请求编号和变化内容只出现在末尾问题，
+# 这样连续请求可以复用上游提示缓存。前缀不得包含时间戳、随机数或 request_index。
+CACHE_PROMPT_PREFIX = (
+    "缓存命中率专项压测。请把下面这份固定业务背景作为上下文，后续只回答末尾的问题。"
+    "不要复述背景，不要根据问题改写背景，也不要在回答中输出内部请求编号。\n\n"
+    + "\n\n".join(LONG_CONTEXT_PARAGRAPHS)
+    + "\n\n补充背景：" + "\n\n".join(LONG_CONTEXT_PARAGRAPHS)
+)
+
+CACHE_QUESTIONS = (
+    "问题一：请用一句话说明查询请求的性能目标。",
+    "问题二：请列出库存预占超过时限后的一个处理动作。",
+    "问题三：请指出发布扩量前需要观察的一项指标。",
+    "问题四：请用不超过二十字说明为什么要限制重试次数。",
+    "问题五：请回答统一库存服务负责的四类动作中任意两类。",
+    "问题六：请给出一个缓存不可用时仍需满足的可靠性要求。",
+    "问题七：请说明普通浏览允许的最终一致性时间。",
+    "问题八：请列出一个可用于追踪请求的标识字段。",
+)
+
+
 def build_payload(model, profile, extra_messages, temperature, max_tokens, stream=True,
                   input_estimate_tokens=None, request_index=0):
     """构造可比较且不过度重复的测试请求。
@@ -66,7 +90,11 @@ def build_payload(model, profile, extra_messages, temperature, max_tokens, strea
     组成的稳定语料，而不是重复同一句填充文本。
     """
     index = int(request_index or 0)
-    if profile == "long":
+    if profile == "cache":
+        # 固定前缀必须逐字节稳定；只替换末尾问题，确保缓存命中率可被真实观测。
+        content = CACHE_PROMPT_PREFIX + "\n\n" + CACHE_QUESTIONS[index % len(CACHE_QUESTIONS)]
+        default_max_tokens = 64
+    elif profile == "long":
         shift = index % len(LONG_CONTEXT_PARAGRAPHS)
         paragraphs = LONG_CONTEXT_PARAGRAPHS[shift:] + LONG_CONTEXT_PARAGRAPHS[:shift]
         questions = (
@@ -268,6 +296,7 @@ def new_blank_result():
         "error_detail": None,
         "ttft_ms": None,
         "total_ms": None,
+        "timing": request_timing(),
         "completed": False,
         "reason": None,
         # 以下为 schema v3 新增的用量计量字段。
@@ -466,10 +495,11 @@ async def do_request(client, item, payload, headers, timeout_cfg, fb_patterns=No
     注入在这里完成，而不是交给每个调用方——忘记注入就会静默拿不到缓存命中率。
     """
     payload = _payload_with_usage(payload, include_usage)
-    start = time.perf_counter()
+    start = time.monotonic()
+    started_at = time.time()
     result = new_blank_result()
     result.update({
-        "ts": int(time.time() * 1000),
+        "ts": int(started_at * 1000),
         "item_id": item.get("id"),
         "mode": item.get("mode"),
         "profile": item.get("profile"),
@@ -478,6 +508,8 @@ async def do_request(client, item, payload, headers, timeout_cfg, fb_patterns=No
     })
     status_code = 0
     ttft = None
+    first_token_at = None
+    cancelled = None
     completed = False
     error_type = None
     reason = None
@@ -554,7 +586,8 @@ async def do_request(client, item, payload, headers, timeout_cfg, fb_patterns=No
                         if content:
                             response_text_parts.append(content)
                             if ttft is None:
-                                ttft = int((time.perf_counter() - start) * 1000)
+                                first_token_at = time.time()
+                                ttft = int((time.monotonic() - start) * 1000)
                         if upstream_error:
                             mid_stream_error = True
                             saw_finish = True
@@ -583,8 +616,9 @@ async def do_request(client, item, payload, headers, timeout_cfg, fb_patterns=No
                     if content:
                         response_text_parts.append(content)
                         if ttft is None:
-                            ttft = int((time.perf_counter() - start) * 1000)
-                completed = completed or saw_finish
+                            first_token_at = time.time()
+                            ttft = int((time.monotonic() - start) * 1000)
+                completed = (completed or saw_finish) and not mid_stream_error
 
                 # 非流式兼容响应：2xx JSON 且包含正文即视为完成。
                 if not completed and not mid_stream_error:
@@ -593,8 +627,7 @@ async def do_request(client, item, payload, headers, timeout_cfg, fb_patterns=No
                         content, finish = _content_and_finish(parsed)
                         if content:
                             response_text_parts.append(content)
-                            if ttft is None:
-                                ttft = int((time.perf_counter() - start) * 1000)
+                            # 完整 JSON 到达后才能解析正文，不能冒充流式首字时间。
                         completed = bool(content) or finish
                         if isinstance(parsed, dict) and parsed.get("usage") is not None:
                             found = _extract_usage(parsed["usage"])
@@ -609,6 +642,11 @@ async def do_request(client, item, payload, headers, timeout_cfg, fb_patterns=No
                 elif not completed:
                     error_type = "PROTOCOL"
                     reason = "响应为 2xx，但未发现完整响应标记或有效正文"
+    except asyncio.CancelledError as exc:
+        cancelled = exc
+        completed = False
+        error_type = "CANCELLED"
+        reason = "客户端取消请求；上游是否停止及最终计费未知"
     except httpx.TimeoutException as exc:
         error_type = "TIMEOUT"
         reason = f"{type(exc).__name__}: {exc}"[:300]
@@ -619,7 +657,15 @@ async def do_request(client, item, payload, headers, timeout_cfg, fb_patterns=No
         error_type = "NETWORK"
         reason = f"{type(exc).__name__}: {exc}"[:300]
 
+    ended_at = time.time()
+    total_ms = int((time.monotonic() - start) * 1000)
     cached = usage_seen.get("cached_tokens")
+    def since_item(name):
+        value = item.get(name)
+        if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value):
+            return max(0, (start - value) * 1000)
+        return None
+
     result.update({
         "status_code": status_code,
         "completed": completed,
@@ -628,7 +674,13 @@ async def do_request(client, item, payload, headers, timeout_cfg, fb_patterns=No
         "reason": reason,
         "response_text": "".join(response_text_parts),
         "ttft_ms": ttft,
-        "total_ms": int((time.perf_counter() - start) * 1000),
+        "total_ms": total_ms,
+        "timing": request_timing(
+            scheduled_at=item.get("scheduled_at"), enqueued_at=item.get("enqueued_at"),
+            started_at=started_at, first_token_at=first_token_at, ended_at=ended_at,
+            queue_ms=since_item("_enqueued_mono"),
+            schedule_lag_ms=since_item("_scheduled_mono"), ttft_ms=ttft, total_ms=total_ms,
+        ),
     })
     # 只有真的收到 usage 块才写入计量字段；否则保持 None，与「命中 0」区分开。
     if usage_seen:
@@ -651,6 +703,10 @@ async def do_request(client, item, payload, headers, timeout_cfg, fb_patterns=No
             raw_output += "\n[已截断：达到原始响应记录上限]"
         result["raw_input"] = payload
         result["raw_output"] = raw_output
+    if cancelled is not None:
+        # 保留取消语义，同时让持久化调用方拿到最后的时间及用量证据。
+        cancelled.request_result = result
+        raise cancelled
     return result
 
 
@@ -667,6 +723,8 @@ def _validate_cli(args):
         value = getattr(args, name, None)
         if value is not None and (not math.isfinite(value) or value <= 0):
             raise SystemExit(f"--{name.replace('_', '-')} 必须是大于 0 的有限数字")
+    if args.profile not in {"smoke", "short", "long", "cache"}:
+        raise SystemExit("--profile 必须是 smoke、short、long 或 cache")
     if args.mode == "ramp":
         if not args.ramps:
             raise SystemExit("ramp 模式需要 --ramps")
@@ -704,8 +762,25 @@ def _payload_with_usage(payload, include_usage):
     return enriched
 
 
+def attempt_timing(result, attempt_index):
+    """兼容性重发保留每次真实尝试的时间；不保存敏感正文。"""
+    return {"attempt_index": attempt_index, "status_code": result.get("status_code"),
+            "error_type": result.get("error_type"),
+            "timing": result.get("timing") or request_timing(source="partial")}
+
+
 async def run(args):
     _validate_cli(args)
+    lifecycle = {"created_at": time.time()}
+    created_mono = time.monotonic()
+    lifecycle_mono = time.monotonic()
+    lifecycle.update(started_at=time.time(), queue_ms=(lifecycle_mono - created_mono) * 1000)
+    task_status = "running"
+    dispatched = 0
+    done = 0
+    total = None
+    dispatch_ended_mono = None
+    output_created = False
     headers = dict(args.headers or {})
     if args.api_key:
         headers["Authorization"] = f"Bearer {args.api_key}"
@@ -713,6 +788,19 @@ async def run(args):
     client = httpx.AsyncClient(http2=args.http2, verify=not args.insecure)
     out = None
     chat_url = _chat_url(args.url, args.chat_url)
+
+    def persist_task_times():
+        if not output_created:
+            return
+        metadata_path = Path(str(args.out) + ".task.json")
+        pending_path = metadata_path.with_name(metadata_path.name + ".tmp")
+        pending_path.write_text(json.dumps({
+            "schema_version": 1, "status": task_status,
+            "timing": task_timing(**lifecycle), "planned_requests": total,
+            "started_requests": dispatched, "finished_requests": done,
+        }, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        os.replace(pending_path, metadata_path)
+
     try:
         if args.dry_run:
             models = await fetch_models(client, args.url, headers)
@@ -738,8 +826,9 @@ async def run(args):
         # 避免同一轮里一部分请求带 include_usage、一部分不带，造成口径不一致。
         usage_mode = [bool(args.include_usage)]
         out = open(args.out, "w", encoding="utf-8") if args.out else None
-        done = 0
+        output_created = out is not None
         start = asyncio.get_running_loop().time()
+        start_wall = time.time()
 
         steps = []
         if args.mode == "ramp":
@@ -750,6 +839,8 @@ async def run(args):
         else:
             steps = [(1, args.rps, args.iterations / args.rps, args.iterations)]
         total = sum(s[3] for s in steps)
+        # 请求前先落盘创建/开始时间，进程意外消失时仍有可核查的任务起点。
+        persist_task_times()
 
         async def producer():
             item_id = 0; offset = 0.0
@@ -760,36 +851,51 @@ async def run(args):
                     wait = due - asyncio.get_running_loop().time()
                     if wait > 0:
                         await asyncio.sleep(wait)
-                    await q.put({"id": item_id, "step_index": step_index, "rps": rps,
-                                 "scheduled_at": due, "mode": args.mode,
-                                 "profile": args.profile, "grade": args.grade})
+                    item = {"id": item_id, "step_index": step_index, "rps": rps,
+                            "scheduled_at": start_wall + offset + j / rps,
+                            "_scheduled_mono": due, "mode": args.mode,
+                            "profile": args.profile, "grade": args.grade}
+                    await q.put(item)
+                    # put 返回后才真正入队；队列满时的等待不伪装为队内等待。
+                    item.update(enqueued_at=time.time(), _enqueued_mono=time.monotonic())
                     item_id += 1
                 offset += duration
             for _ in range(args.concurrency):
                 await q.put(None)
 
         async def worker():
-            nonlocal done
+            nonlocal done, dispatched, dispatch_ended_mono
             while True:
                 item = await q.get()
+                attempts = []
                 try:
                     if item is None:
                         return
                     payload = build_payload(model, item["profile"], args.extra_messages,
                                             args.temperature, args.max_tokens, args.stream, request_index=item["id"])
+                    dispatched += 1
+                    lifecycle["dispatch_ended_at"] = time.time()
+                    dispatch_ended_mono = time.monotonic()
                     result = await do_request(client, item, payload, headers,
                                               {"connect": args.connect_timeout, "read": args.read_timeout,
                                                "write": args.write_timeout, "pool": args.connect_timeout},
                                               chat_url=chat_url, include_usage=usage_mode[0])
+                    attempts.append(attempt_timing(result, len(attempts) + 1))
                     # 仅在上游明确拒绝 usage 参数时降级；429 等失败保留且不追加请求。
                     if should_retry_without_usage(result, usage_mode[0], args.stream):
                         usage_mode[0] = False
-                        result = await do_request(client, item, payload, headers,
+                        lifecycle["dispatch_ended_at"] = time.time()
+                        dispatch_ended_mono = time.monotonic()
+                        retry_item = {key: value for key, value in item.items() if key not in
+                                      ("scheduled_at", "enqueued_at", "_scheduled_mono", "_enqueued_mono")}
+                        result = await do_request(client, retry_item, payload, headers,
                                                   {"connect": args.connect_timeout, "read": args.read_timeout,
                                                    "write": args.write_timeout, "pool": args.connect_timeout},
                                                   chat_url=chat_url, include_usage=False)
+                        attempts.append(attempt_timing(result, len(attempts) + 1))
                     result.pop("_usage_options_rejected", None)
                     result["usage_retry_policy"] = USAGE_RETRY_POLICY
+                    result["attempts"] = attempts
                     if out:
                         async with write_lock:
                             out.write(json.dumps(result, ensure_ascii=False) + "\n")
@@ -797,6 +903,19 @@ async def run(args):
                     done += 1
                     if done % 100 == 0:
                         print(f"已完成 {done}/{total}")
+                except asyncio.CancelledError as exc:
+                    result = getattr(exc, "request_result", None)
+                    if result is not None:
+                        attempts.append(attempt_timing(result, len(attempts) + 1))
+                        result["attempts"] = attempts
+                        result["usage_retry_policy"] = USAGE_RETRY_POLICY
+                        result.pop("_usage_options_rejected", None)
+                        if out:
+                            async with write_lock:
+                                out.write(json.dumps(result, ensure_ascii=False) + "\n")
+                                out.flush()
+                        done += 1
+                    raise
                 finally:
                     q.task_done()
 
@@ -806,7 +925,11 @@ async def run(args):
         try:
             # 同时观察生产者和工作协程；否则队列满时工作协程失败会永久等入队。
             await asyncio.gather(*pending)
-        except BaseException:
+        except BaseException as exc:
+            lifecycle["dispatch_ended_at"] = time.time()
+            dispatch_ended_mono = time.monotonic()
+            if isinstance(exc, asyncio.CancelledError):
+                lifecycle["stop_requested_at"] = time.time()
             for task in pending:
                 if not task.done():
                     task.cancel()
@@ -817,13 +940,32 @@ async def run(args):
         else:
             print("usage 计量：本网关不支持 include_usage，已降级（缓存命中率将标记为不可得）")
         print(f"完成：{done}/{total}" + (f"，结果：{args.out}" if args.out else ""))
+        task_status = "finished"
         return 0
+    except asyncio.CancelledError:
+        task_status = "cancelled"
+        lifecycle.setdefault("stop_requested_at", time.time())
+        raise
+    except BaseException:
+        task_status = "failed"
+        raise
     finally:
+        # 没有发完的任务以取消/异常确认时刻标记停止调度，不补造真实发送时间。
+        if lifecycle.get("dispatch_ended_at") is None:
+            lifecycle["dispatch_ended_at"] = time.time()
+            dispatch_ended_mono = time.monotonic()
+        lifecycle["ended_at"] = time.time()
+        end_mono = time.monotonic()
+        lifecycle["elapsed_ms"] = (end_mono - lifecycle_mono) * 1000
+        lifecycle["drain_ms"] = (end_mono - dispatch_ended_mono) * 1000
         try:
             if out:
                 out.close()
         finally:
-            await client.aclose()
+            try:
+                await client.aclose()
+            finally:
+                persist_task_times()
 
 
 def main():
@@ -834,15 +976,18 @@ def main():
     p.add_argument("--model")
     p.add_argument("--pick-index", type=int)
     p.add_argument("--mode", choices=["smoke", "ramp", "soak"], default="smoke")
-    p.add_argument("--rps", type=float, default=10.0)
+    p.add_argument("--rps", type=float, default=100 / 60,
+                   help="计划每秒请求数，默认 100/60（每分钟 100 请求）")
     p.add_argument("--ramps")
     p.add_argument("--iterations", type=int, default=50)
     p.add_argument("--duration", type=int, default=60)
     p.add_argument("--concurrency", type=int, default=20)
     p.add_argument("--queue-size", type=int, default=500)
-    p.add_argument("--profile", choices=["smoke", "short", "long"], default="smoke")
+    p.add_argument("--profile", choices=["smoke", "short", "long", "cache"], default="smoke")
     p.add_argument("--stream", action=argparse.BooleanOptionalAction, default=True)
-    p.add_argument("--include-usage", action=argparse.BooleanOptionalAction, default=False,
+    # 默认请求 usage：缓存命中率和 Token（词元）用量必须有真实上游证据。
+    # 仍保留 --no-include-usage，用于明确知道目标不支持该扩展的兼容场景。
+    p.add_argument("--include-usage", action=argparse.BooleanOptionalAction, default=True,
                    help="请求上游返回 usage 统计（缓存命中率数据来源）；网关不支持时自动降级")
     p.add_argument("--grade")
     p.add_argument("--out")

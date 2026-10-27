@@ -8,15 +8,28 @@ PROJECT_DIR="$(pwd -P)"
 PORT="${ROUTE_TEST_PORT:-8666}"
 URL="http://127.0.0.1:${PORT}/"
 PYTHON="${PROJECT_DIR}/.venv/bin/python"
+CHECK_ONLY=0
+if [ "$#" -gt 0 ]; then
+  if [ "$#" -eq 1 ] && [ "$1" = "--check" ]; then
+    CHECK_ONLY=1
+  else
+    echo "用法：双击启动，或使用 --check（仅检查运行环境，不启动服务）。"
+    exit 2
+  fi
+fi
 
 # 清掉可能从外部环境带进来的预览设置，确保读写的是正式数据与系统安全存储。
 unset ROUTE_TEST_DATA_DIR ROUTE_TEST_DISABLE_CREDENTIAL_STORE
+# 外部终端环境不应改变本项目解释器的标准库、模块路径或虚拟环境身份。
+unset PYTHONHOME PYTHONPATH __PYVENV_LAUNCHER__
 export ROUTE_TEST_PORT="$PORT"
 
 pause_exit() {
   echo
-  read -r -n 1 -s -p "按任意键关闭窗口…"
-  echo
+  if [ "$CHECK_ONLY" -eq 0 ] && [ -t 0 ]; then
+    read -r -n 1 -s -p "按任意键关闭窗口…"
+    echo
+  fi
   exit "${1:-1}"
 }
 
@@ -33,6 +46,24 @@ if [ ! -x "$PYTHON" ]; then
   echo "  python3.11 -m venv .venv"
   echo "  .venv/bin/python -m pip install -r requirements-dev.lock"
   pause_exit 1
+fi
+
+# 先验证真实解释器、配置版本及依赖，失败时不启动服务，也不停止已有服务。
+# 仅导入依赖检查工具，不加载账号、历史记录或系统凭据。
+RUNTIME_OUTPUT="$("$PYTHON" -E -s tools/check_runtime.py 2>&1)"
+RUNTIME_STATUS=$?
+printf '%s\n' "$RUNTIME_OUTPUT"
+if [ "$RUNTIME_STATUS" -ne 0 ]; then
+  if [[ "$RUNTIME_OUTPUT" == *"Operation not permitted"* ]] || [[ "$RUNTIME_OUTPUT" == *"PermissionError"* ]]; then
+    echo "系统拒绝运行环境读取项目文件。普通文件权限与系统隐私授权是不同问题。"
+    echo "若项目位于桌面，请检查 系统设置 → 隐私与安全性 → 文件与文件夹 → 终端 → 桌面文件夹。"
+    echo "若 .venv（运行环境）来自其他应用或版本混杂，请按 README.md（使用说明）备份后重建。"
+  fi
+  echo "启动已停止，请先修复上方运行环境问题；现有服务与正式数据未改动。"
+  pause_exit 1
+fi
+if [ "$CHECK_ONLY" -eq 1 ]; then
+  exit 0
 fi
 
 # 端口已被占用：区分“本项目已在运行”和“被别的程序占用”。
@@ -69,7 +100,7 @@ if [ -n "$EXISTING_PID" ]; then
   fi
 fi
 
-"$PYTHON" route_test_ui.py &
+"$PYTHON" -E -s route_test_ui.py &
 SERVER_PID=$!
 # 关闭窗口、Ctrl+C 或脚本退出时一并停止服务，不留后台进程。
 trap 'kill "$SERVER_PID" 2>/dev/null; wait "$SERVER_PID" 2>/dev/null' EXIT

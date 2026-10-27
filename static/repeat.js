@@ -26,7 +26,7 @@
   }
   function init() {
     if (s.initialized) return;
-    document.body.insertAdjacentHTML('beforeend', `<div class="modal" id="repeatModal" hidden><div class="modal-backdrop" data-click-action="closeRepeat"></div><section class="modal-panel" role="dialog" aria-modal="true" aria-labelledby="repeatTitle"><header class="modal-head"><div><div class="modal-kicker">沿用原参数 · 创建新记录</div><h2 id="repeatTitle">再来一次</h2></div><button class="modal-close" type="button" data-click-action="closeRepeat" aria-label="关闭再次测试">${UI.icon('close')}</button></header><div class="modal-body" id="repeatBody" tabindex="0"></div></section></div>`);
+    document.body.insertAdjacentHTML('beforeend', `<div class="modal" id="repeatModal" hidden><div class="modal-backdrop" data-click-action="closeRepeat"></div><section class="modal-panel" role="dialog" aria-modal="true" aria-labelledby="repeatTitle"><header class="modal-head"><div><div class="modal-kicker">沿用原参数 · 创建新记录</div><h2 id="repeatTitle">再来一次</h2></div><button class="modal-close" type="button" data-click-action="closeRepeat" aria-label="关闭再次测试">${UI.icon('close')}</button></header><div class="modal-body" id="repeatBody" tabindex="0"></div><footer class="modal-footer" id="repeatFooter"></footer></section></div>`);
     s.initialized = true;
   }
   function current(operation) { return signedIn() && operation.epoch === s.epoch && s.operations.get(operation.key) === operation; }
@@ -40,11 +40,11 @@
   }
   function formHtml(data) {
     const connections = Array.isArray(data.connections) ? data.connections : [];
-    const rows = connections.map(connection => [UI.esc(connection.label || '测试目标'),UI.esc(connection.model || '—'),UI.esc(connection.url || '—'),UI.tag(connection.saved ? '复用已保存密钥' : connection.optional ? '原记录无需密钥' : '需要填写密钥',connection.saved || connection.optional ? 'success' : 'warning')]);
+    const targets = connections.length ? UI.methodCards(connections.map(connection => ({title:connection.label || '测试目标',lines:[`模型：${connection.model || '未记录'}`,`请求地址：${connection.url || '未记录'}`,connection.saved ? '复用已保存密钥' : connection.optional ? '原记录无需密钥' : '需要填写密钥']}))) : UI.notice('原记录未保存目标信息。',{tone:'warning'});
     const missing = connections.map((connection,index) => ({connection,index})).filter(item => !item.connection.saved && !item.connection.optional);
     const fields = missing.map(({connection,index}) => UI.field({id:`repeatKey${index}`,label:`${connection.label || '测试目标'} · API Key（接口密钥）`,required:true,
       controlHtml:UI.passwordInput({id:`repeatKey${index}`,required:true,visibilityLabel:'API Key（接口密钥）',placeholder:'填写此次测试使用的密钥'}),
-      hint:[connection.issue,connection.model ? `模型：${connection.model}` : '',connection.url ? `地址：${connection.url}` : '',connection.issue ? '重新输入密钥后，本次新记录使用该地址和密钥。' : '密钥仅用于此次创建，关闭窗口后清空。'].filter(Boolean).join(' ')
+      hint:[connection.issue,'密钥仅用于此次创建，关闭窗口后清空。'].filter(Boolean).join(' ')
     })).join('');
     const preflight = data.preflight || {};
     const risk = preflight.requires_confirmation ? UI.switchRow({id:'repeatRiskAck',title:data.source_kind === 'fingerprint' ? '我已确认本次采集的请求数与费用' : '我已确认目标环境及本次请求负载',
@@ -52,13 +52,14 @@
     const preflightClass = {ok:'preflight-card level-ok',warn:'preflight-card level-warn',risk:'preflight-card level-risk'}[preflight.level] || 'preflight-card';
     const preflightBody = typeof preflightHtml === 'function' ? `<div class="${preflightClass}">${preflightHtml(preflight)}</div>` : '';
     return UI.notice(`将沿用「${data.name || '原测试'}」的参数创建新记录。原记录和结果保留。`)
-      + UI.table({columns:['测试目标','模型','请求地址','凭据'].map(label=>({label})),rowsHtml:rows,empty:'原记录未保存目标信息'})
-      + fields + preflightBody + risk + '<div class="form-status" id="repeatStatus" role="status" aria-live="polite"></div>'
-      + UI.actionBar(UI.button('取消',{action:'closeRepeat'})+UI.button('创建并开始',{variant:'primary',action:'submitRepeat'}));
+      + UI.formSectionTitle(1,'核对测试目标') + targets
+      + (missing.length ? UI.formSectionTitle(2,'补充接口密钥') + fields : '')
+      + UI.formSectionTitle(missing.length ? 3 : 2,'确认本次负载') + preflightBody + risk
+      + '<div class="form-status" id="repeatStatus" role="status" aria-live="polite"></div>';
   }
   function showForm(operation,data) {
     init(); const body = formHtml(data); operation.phase = 'confirm'; s.form = {operation,data};
-    $('repeatBody').innerHTML = body; openModal('repeatModal'); updateButtons();
+    $('repeatBody').innerHTML = body; $('repeatFooter').innerHTML = UI.button('取消',{action:'closeRepeat'}) + UI.button('创建并开始',{variant:'primary',action:'submitRepeat'}); openModal('repeatModal'); updateButtons();
     const first = data.connections?.findIndex(connection => !connection.saved && !connection.optional);
     if (first >= 0) $(`repeatKey${first}`)?.focus({preventScroll:true});
   }
@@ -84,8 +85,8 @@
     operation.phase = 'creating'; updateButtons();
     if (s.form?.operation === operation) {
       status('正在创建新测试；关闭窗口不会取消已提交的创建请求。');
-      for (const node of $('repeatBody').querySelectorAll('[data-click-action="submitRepeat"]')) node.disabled = true;
-      for (const node of $('repeatBody').querySelectorAll('[data-click-action="closeRepeat"]')) { const label = node.querySelector('span'); if (label) label.textContent = '关闭窗口'; }
+      for (const node of $('repeatFooter').querySelectorAll('[data-click-action="submitRepeat"]')) { node.disabled = true; const label = node.querySelector('span'); if (label) label.textContent = '正在创建…'; }
+      for (const node of $('repeatFooter').querySelectorAll('[data-click-action="closeRepeat"]')) { const label = node.querySelector('span'); if (label) label.textContent = '关闭窗口'; }
     }
     try {
       const body = {source_kind:operation.kind,source_id:operation.id};
@@ -104,7 +105,8 @@
       if (operation.dismissed) { finish(operation); return; }
       if (s.form?.operation === operation) {
         operation.phase = 'confirm'; status(error.message || '创建失败，请检查后重试。',true);
-        for (const node of $('repeatBody').querySelectorAll('[data-click-action="submitRepeat"]')) node.disabled = false;
+        for (const node of $('repeatFooter').querySelectorAll('[data-click-action="submitRepeat"]')) { node.disabled = false; const label = node.querySelector('span'); if (label) label.textContent = '创建并开始'; }
+        for (const node of $('repeatFooter').querySelectorAll('[data-click-action="closeRepeat"]')) { const label = node.querySelector('span'); if (label) label.textContent = '取消'; }
         updateButtons();
       } else { finish(operation); toast(error.message || '创建再次测试失败'); }
     } finally { for (const slot of Object.keys(keys)) keys[slot] = ''; }
@@ -126,6 +128,7 @@
   function onClosed() {
     const form = s.form; s.form = null;
     if ($('repeatBody')) { for (const input of $('repeatBody').querySelectorAll('input')) { input.value = ''; input.type === 'text' && (input.type = 'password'); } $('repeatBody').innerHTML = ''; }
+    if ($('repeatFooter')) $('repeatFooter').innerHTML = '';
     if (form) {
       if (form.operation.phase === 'creating' && !form.operation.completed) form.operation.dismissed = true;
       else finish(form.operation);

@@ -2,13 +2,35 @@
 import asyncio
 import contextlib
 import io
+import json
 import tempfile
 from pathlib import Path
 from types import SimpleNamespace
 import unittest
 from unittest import mock
 
+import httpx
 import smart_route_load as load
+
+
+class LoadCliDefaultTests(unittest.TestCase):
+    def test_cli_defaults_match_workbench_and_keep_explicit_pressure(self):
+        for options, concurrency, rpm in (([], 20, 100), (["--concurrency", "7", "--rps", "5.35"], 7, 321)):
+            with self.subTest(options=options), \
+                    mock.patch("sys.argv", ["smart_route_load.py", "--url", "http://synthetic.invalid", *options]), \
+                    mock.patch.object(load, "run", new=mock.AsyncMock(return_value=0)) as run:
+                self.assertEqual(load.main(), 0)
+                args = run.await_args.args[0]
+                self.assertEqual(args.concurrency, concurrency)
+                self.assertAlmostEqual(args.rps * 60, rpm)
+                self.assertTrue(args.include_usage, "默认必须请求 usage，才能统计缓存命中率")
+
+    def test_cli_allows_explicitly_disabling_usage_collection(self):
+        with mock.patch("sys.argv", ["smart_route_load.py", "--url", "http://synthetic.invalid",
+                                      "--no-include-usage"]), \
+                mock.patch.object(load, "run", new=mock.AsyncMock(return_value=0)) as run:
+            self.assertEqual(load.main(), 0)
+        self.assertFalse(run.await_args.args[0].include_usage)
 
 
 class LoadCliLifecycleTests(unittest.IsolatedAsyncioTestCase):
@@ -56,6 +78,41 @@ class LoadCliLifecycleTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(await asyncio.wait_for(load.run(self.args), timeout=1), 0)
         self.assertEqual(sorted(completed), list(range(self.args.iterations)))
         self.client.aclose.assert_awaited_once()
+
+    async def test_plan_queue_and_retry_attempts_are_retained_with_task_times(self):
+        self.args.concurrency = 1
+        self.args.iterations = 1
+        calls = []
+
+        async def request(client, item, *args, **kwargs):
+            calls.append(dict(item))
+            rejected = len(calls) == 1
+            return {"status_code": 400 if rejected else 200,
+                    "completed": not rejected, "error_type": "HTTP_4XX" if rejected else None,
+                    "_usage_options_rejected": rejected,
+                    "timing": load.request_timing(started_at=100 + len(calls), ended_at=102 + len(calls))}
+
+        with tempfile.TemporaryDirectory(prefix="load-cli-times-") as folder:
+            path = Path(folder) / "results.jsonl"
+            self.args.out = str(path)
+            with mock.patch.object(load, "do_request", side_effect=request):
+                self.assertEqual(await load.run(self.args), 0)
+            result = json.loads(path.read_text())
+            task = json.loads(Path(str(path) + ".task.json").read_text())
+        self.assertEqual(len(calls), 2)
+        self.assertGreater(calls[0]["scheduled_at"], 1_000_000_000)
+        self.assertGreaterEqual(calls[0]["enqueued_at"], calls[0]["scheduled_at"])
+        self.assertIn("_enqueued_mono", calls[0])
+        for field in ("scheduled_at", "enqueued_at", "_scheduled_mono", "_enqueued_mono"):
+            self.assertNotIn(field, calls[1])
+        self.assertEqual([row["status_code"] for row in result["attempts"]], [400, 200])
+        self.assertNotEqual(result["attempts"][0]["timing"], result["attempts"][1]["timing"])
+        self.assertEqual(result["timing"], result["attempts"][-1]["timing"])
+        self.assertEqual(task["status"], "finished")
+        self.assertEqual(task["started_requests"], 1)
+        self.assertEqual(task["finished_requests"], 1)
+        for field in ("created_at", "started_at", "dispatch_ended_at", "ended_at"):
+            self.assertIsNotNone(task["timing"][field])
 
     async def test_worker_failure_cancels_blocked_producer_and_sibling(self):
         started = 0
@@ -112,8 +169,50 @@ class LoadCliLifecycleTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(len(outputs), 1)
             self.assertTrue(outputs[0].closed)
             self.assertEqual(path.read_text(), "")
+            metadata = json.loads(Path(str(path) + ".task.json").read_text())
+            self.assertEqual(metadata["status"], "cancelled")
+            self.assertIsNotNone(metadata["timing"]["stop_requested_at"])
+            self.assertIsNotNone(metadata["timing"]["ended_at"])
         self.assertFalse(asyncio.all_tasks() - existing_tasks)
         self.client.aclose.assert_awaited_once()
+
+    async def test_cancelled_http_attempt_is_saved_before_cli_exits(self):
+        self.args.concurrency = 1
+        self.args.iterations = 2
+        blocked = asyncio.Event()
+
+        class PendingStream(httpx.AsyncByteStream):
+            async def __aiter__(self):
+                yield b'data: {"choices":[{"delta":{"content":"partial"}}]}\n\n'
+                blocked.set()
+                await asyncio.Event().wait()
+
+        @contextlib.asynccontextmanager
+        async def stream(*args, **kwargs):
+            yield httpx.Response(200, stream=PendingStream())
+
+        self.client.stream = stream
+        with tempfile.TemporaryDirectory(prefix="load-cli-cancel-times-") as folder:
+            path = Path(folder) / "results.jsonl"
+            self.args.out = str(path)
+            execution = asyncio.create_task(load.run(self.args))
+            await asyncio.wait_for(blocked.wait(), timeout=1)
+            running = json.loads(Path(str(path) + ".task.json").read_text())
+            self.assertEqual(running["status"], "running")
+            self.assertIsNotNone(running["timing"]["started_at"])
+            self.assertIsNone(running["timing"]["ended_at"])
+            execution.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await execution
+            rows = [json.loads(line) for line in path.read_text().splitlines()]
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]["error_type"], "CANCELLED")
+            self.assertIsNotNone(rows[0]["timing"]["ended_at"])
+            self.assertIsNotNone(rows[0]["timing"]["first_token_at"])
+            self.assertEqual(rows[0]["attempts"][0]["timing"], rows[0]["timing"])
+            ended = json.loads(Path(str(path) + ".task.json").read_text())
+            self.assertEqual(ended["started_requests"], 1)
+            self.assertEqual(ended["finished_requests"], 1)
 
 
 if __name__ == "__main__":

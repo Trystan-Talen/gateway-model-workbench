@@ -13,7 +13,7 @@
   --color-border-strong: #ccc8bc;
   --color-text: #16161a;
   --color-text-secondary: #4b4b53;
-  --color-muted: #7b7a82;
+  --color-muted: #6e6d75;
   --color-accent: #5b47f5;
   --color-accent-hover: #4632e0;
   --color-accent-soft: #efecff;
@@ -171,6 +171,9 @@
   --drawer-w: 600px;
   --card-inset: var(--space-6);
   --section-gap: var(--space-4);
+  --content-gap: var(--space-4);
+  --content-group-gap: var(--space-6);
+  --method-column-min: 320px;
 
   /* Compatibility aliases (fingerprint.css and older markup). Do not use in new code. */
   --card-shadow: var(--shadow-card);

@@ -57,7 +57,7 @@
   }
 
   /* ---- Actions ---- */
-  // variant: default | primary | danger · size: md (34px) | lg (42px, record panel create button)
+  // variant: default | primary | danger · controls expand to touch targets on narrow screens.
   function button(label, { variant = 'default', action = '', args = [], iconName = '', disabled = false, title = '', type = 'button' } = {}) {
     const variantClass = { default: '', primary: 'primary', danger: 'danger' }[variant] ?? '';
     return `<button class="${cls('btn', variantClass)}" type="${esc(type)}"${actionAttrs(action, args)}${title ? ` title="${esc(title)}"` : ''}${disabled ? ' disabled' : ''}>${iconName ? icon(iconName) : ''}<span>${esc(label)}</span></button>`;
@@ -89,7 +89,8 @@
   function recordItem({ id, title, state, stateLabel, typeLabel = '', compare = false, meta = [], progress = 0, trailing = '', selected = false, action }) {
     const value = pct(progress);
     const metaHtml = [typeLabel ? `<span class="${cls('record-type', compare && 'comparison-type')}">${esc(typeLabel)}</span>` : '', ...meta.map(esc)].filter(Boolean).join(' · ');
-    return `<button class="${cls('task', compare && 'comparison-record', selected && 'sel')}" type="button"${actionAttrs(action, [id])}><div class="task-top"><div class="task-name">${esc(title)}</div>${status(state, stateLabel)}</div><div class="task-meta">${metaHtml}</div><div class="task-foot"><div class="mini-track"><i style="width:${value}%"></i></div><span class="task-pct">${esc(trailing || `${value}%`)}</span></div></button>`;
+    const foot = progress == null ? '' : `<div class="task-foot"><div class="mini-track"><i style="width:${value}%"></i></div><span class="task-pct">${esc(trailing || `${value}%`)}</span></div>`;
+    return `<button class="${cls('task', compare && 'comparison-record', selected && 'sel')}" type="button"${actionAttrs(action, [id])}${selected ? ' aria-current="true"' : ''}><div class="task-top"><div class="task-name" title="${esc(title)}">${esc(title)}</div>${status(state, stateLabel)}</div><div class="task-meta">${metaHtml}</div>${foot}</button>`;
   }
   function recordEmpty(title, hint) { return `<div class="task-empty"><b>${esc(title)}</b><span>${esc(hint)}</span></div>`; }
 
@@ -98,6 +99,7 @@
   function pageShell(childrenHtml) { return `<div class="detail-layout report-shell">${childrenHtml}</div>`; }
   const STATUS_CLASS = { neutral: '', accent: '', success: 'good', warning: 'caution', danger: 'risk' };
   function pageHeader({ kicker, title, description = '', meta = [], statusLabel = '', statusNote = '', statusTone = 'neutral', actionsHtml = '' }) {
+    meta = meta.filter(item => item !== statusLabel);
     const statusHtml = statusLabel
       ? `<div class="${cls('report-status', STATUS_CLASS[tone(statusTone)])}">${esc(statusLabel)}${statusNote ? `<br><small>${esc(statusNote)}</small>` : ''}</div>`
       : '';
@@ -106,10 +108,14 @@
   }
   // items: [[id, label]]; the page's action receives (ownerId, tabId). Arrow/Home/End keys are handled globally.
   function tabs({ label, items, active, action, ownerId }) {
-    return `<nav class="report-tabs" role="tablist" aria-label="${esc(label)}">${items.map(([id, text]) => `<button class="${cls('report-tab', id === active && 'active')}" role="tab" aria-selected="${id === active}" type="button"${actionAttrs(action, [ownerId, id])}>${esc(text)}</button>`).join('')}</nav>`;
+    return `<nav class="report-tabs" role="tablist" aria-label="${esc(label)}">${items.map(([id, text]) => `<button class="${cls('report-tab', id === active && 'active')}" role="tab" aria-selected="${id === active}" tabindex="${id === active ? 0 : -1}" type="button"${actionAttrs(action, [ownerId, id])}>${esc(text)}</button>`).join('')}</nav>`;
   }
+  function stack(childrenHtml) { return `<div class="report-stack">${childrenHtml}</div>`; }
   function section({ title, description = '', badgeHtml = '', bodyHtml = '', className = '' }) {
-    return `<section class="${cls('report-section', className)}"><div class="report-section-title-row"><div><h2 class="report-section-title">${esc(title)}</h2>${description ? `<p class="report-section-sub">${esc(description)}</p>` : ''}</div>${badgeHtml}</div>${bodyHtml}</section>`;
+    return `<section class="${cls('report-section', className)}"><div class="report-section-title-row"><div><h2 class="report-section-title">${esc(title)}</h2>${description ? `<p class="report-section-sub">${esc(description)}</p>` : ''}</div>${badgeHtml}</div>${bodyHtml ? stack(bodyHtml) : ''}</section>`;
+  }
+  function disclosure({ title, bodyHtml = '', id = '', open = false, section: standalone = false }) {
+    return `<details class="${standalone ? 'report-section report-readout-section' : 'suite-details'}"${id ? ` id="${esc(id)}"` : ''}${open ? ' open' : ''}><summary>${esc(title)}</summary><div class="disclosure-body report-stack">${bodyHtml}</div></details>`;
   }
   function progressCard({ kicker, value, summary = '', note = '', label = kicker }) {
     const v = pct(value);
@@ -134,6 +140,67 @@
       ? rowsHtml.map(cells => `<tr>${cells.map(cell => `<td>${cell}</td>`).join('')}</tr>`).join('')
       : `<tr><td colspan="${columns.length}">${esc(empty)}</td></tr>`;
     return `<div class="table-wrap report-wrap"><table class="report-table"><thead><tr>${columns.map(c => `<th>${esc(c.label)}</th>`).join('')}</tr></thead><tbody>${body}</tbody></table></div>`;
+  }
+
+  // Display instants at fixed Singapore UTC+08:00, independent of browser or OS timezone.
+  // Naive legacy dates remain unknown; an offset cannot be inferred safely.
+  function formatTimestamp(value, missing = '未记录') {
+    if (value == null || value === '' || typeof value === 'boolean') return missing;
+    if (typeof value === 'string' && !/(?:Z|[+-]\d{2}:?\d{2})$/i.test(value)) return '时区未记录';
+    const date = new Date(typeof value === 'number' && Math.abs(value) < 1e12 ? value * 1000 : value);
+    if (!Number.isFinite(date.getTime())) return missing;
+    const singapore = new Date(date.getTime() + 8 * 60 * 60 * 1000);
+    if (!Number.isFinite(singapore.getTime())) return missing;
+    return singapore.toISOString().replace('T', ' ').replace('Z', ' 新加坡时间（UTC+08:00）');
+  }
+  function formatDurationMs(value) {
+    return value == null || value === '' || typeof value === 'boolean' || !Number.isFinite(Number(value)) || Number(value) < 0
+      ? '未记录' : Number(value).toLocaleString('zh-CN', {maximumFractionDigits:3}) + ' 毫秒';
+  }
+  const timeExpanded = new Set();
+  if (root.document?.addEventListener) root.document.addEventListener('toggle', event => {
+    const node = event.target, key = node?.dataset?.timeKey;
+    if (key && node.isConnected) node.open ? timeExpanded.add(key) : timeExpanded.delete(key);
+  }, true);
+  if (root.document?.addEventListener) root.document.addEventListener('click', event => {
+    const summary=event.target.closest?.('.request-time-records > summary');
+    if(!summary)return;
+    root.requestAnimationFrame(()=>{
+      const details=summary.parentElement,table=details.closest('.table-wrap');
+      if(!details.isConnected||!details.open||!table)return;
+      const cell=details.getBoundingClientRect(),viewport=table.getBoundingClientRect();
+      // Reveal the evidence inside its table only; preserve the page's reading position.
+      if(cell.right>viewport.right)table.scrollLeft+=cell.right-viewport.right+12;
+      else if(cell.left<viewport.left)table.scrollLeft-=viewport.left-cell.left+12;
+    });
+  });
+  // Only recorded instants are used. Never reconstruct an end from a start plus latency.
+  function timeRecords(record = {}, {request = false, live, key = '', title = '时间记录'} = {}) {
+    const timing = record.timing || {}, hasTiming = !!record.timing;
+    const active = live ?? ['waiting','running','stopping','queued','collecting','calibrating','warming','awaiting_calibration','awaiting_run','draining'].includes(record.phase || record.status);
+    const read = name => hasTiming ? timing[name] : record[name] ?? (name === 'created_at' ? record.created : name === 'ended_at' ? record.finished_at : null);
+    const started = formatTimestamp(read('started_at'), active ? '尚未开始' : '未记录');
+    const ended = formatTimestamp(read('ended_at'), active ? '尚未结束' : '未记录');
+    const names = request ? [['scheduled_at','计划发送'],['enqueued_at','进入队列'],['started_at','实际开始'],['first_token_at','收到首字'],['ended_at','请求结束']]
+      : [['created_at','任务创建'],['started_at','执行开始'],['stop_requested_at','请求停止'],['dispatch_ended_at','停止发新请求'],['ended_at','任务结束'],['interruption_detected_at','发现意外中断']];
+    const moments = names.map(([name,label]) => label + '：' + (name === 'started_at' ? started : name === 'ended_at' ? ended : formatTimestamp(read(name))));
+    const durations = (request ? [['queue_ms','排队等待'],['schedule_lag_ms','调度延迟'],['ttft_ms','首字耗时'],['total_ms','请求总耗时']] : [['queue_ms','任务等待'],['elapsed_ms','执行耗时'],['drain_ms','收尾耗时']])
+      .map(([name,label]) => label + '：' + formatDurationMs(hasTiming ? timing[name] : record[name]));
+    const source = timing.source === 'recorded' ? '已记录' : timing.source === 'partial' ? '部分已记录' : '历史记录；缺失时间不推算';
+    const attempts = request && Array.isArray(record.attempts) && record.attempts.length > 1 ? record.attempts : [];
+    const summary = request ? '查看时间记录' + (attempts.length ? ` · ${attempts.length} 次实际发送` : '') : title + ' · 新加坡时间（UTC+08:00）';
+    const content = methodCards([{title:(attempts.length ? '最终尝试时间' : '客户端时间') + ' · 新加坡时间（UTC+08:00）',lines:moments},{title:'耗时与来源',lines:[...durations,source,'时间点来自运行服务的系统时钟；耗时来自单调时钟。历史字段以原始记录为限。']}]) + (attempts.length ?
+      hint(`该逻辑请求包含 ${attempts.length} 次实际 HTTP（网络请求）尝试；下方逐次列出，不能视为只发送一次。网关内部重试仍不可见。`) +
+      methodCards(attempts.map((attempt,index) => {
+        const item = attempt || {}, at = item.timing || {};
+        return {title:`第 ${item.attempt_index ?? index + 1} 次实际发送`,lines:[
+          '状态码：' + (item.status_code ?? '未记录'), '错误分类：' + (item.error_type || '未记录'),
+          '实际开始：' + formatTimestamp(at.started_at), '收到首字：' + formatTimestamp(at.first_token_at),
+          '请求结束：' + formatTimestamp(at.ended_at), '首字耗时：' + formatDurationMs(at.ttft_ms),
+          '请求总耗时：' + formatDurationMs(at.total_ms)
+        ]};
+      })) : '');
+    return `<details class="gateway-single-advanced time-records${request ? ' request-time-records' : ''}"${key ? ` id="time-${esc(key)}" data-time-key="${esc(key)}"` : ''}${key && timeExpanded.has(key) ? ' open' : ''}><summary>${esc(summary)}</summary>${content}</details>`;
   }
 
   /* ---- Forms (creation drawer / dialogs) ---- */
@@ -163,8 +230,8 @@
     button, textButton, actionBar,
     status, tag, notice, signal, signalList, badge,
     recordItem, recordEmpty,
-    pageShell, pageHeader, tabs, section, progressCard,
-    metric, metrics, methodCards, steps, limitations, table,
+    pageShell, pageHeader, tabs, stack, section, disclosure, progressCard,
+    metric, metrics, methodCards, steps, limitations, table, formatTimestamp, formatDurationMs, timeRecords,
     formSectionTitle, field, input, passwordInput, select, inlineFields, switchRow, hint
   });
 })(typeof window !== 'undefined' ? window : globalThis);

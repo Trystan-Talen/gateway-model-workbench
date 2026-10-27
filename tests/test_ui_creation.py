@@ -19,12 +19,17 @@ class Markup(HTMLParser):
         self.nodes = []
         self.scripts = []
         self.script = None
+        self.stack = []
         self.feed(html)
 
     def handle_starttag(self, tag, attrs):
         if tag == 'script' and dict(attrs).get('src') == '/static/app.js':
             self.scripts.append((ui.CODE_DIR / 'static' / 'app.js').read_text(encoding='utf-8'))
-        self.nodes.append({'tag': tag, **dict(attrs)})
+        self.nodes.append({'tag': tag, '_parent': self.stack[-1] if self.stack else None,
+                           **dict(attrs)})
+        if tag not in {'area', 'base', 'br', 'col', 'embed', 'hr', 'img', 'input',
+                       'link', 'meta', 'param', 'source', 'track', 'wbr'}:
+            self.stack.append(len(self.nodes) - 1)
         if tag == 'script' and not dict(attrs).get('src'):
             self.script = []
 
@@ -33,6 +38,10 @@ class Markup(HTMLParser):
             self.script.append(data)
 
     def handle_endtag(self, tag):
+        for index in range(len(self.stack) - 1, -1, -1):
+            if self.nodes[self.stack[index]]['tag'] == tag:
+                del self.stack[index:]
+                break
         if tag == 'script' and self.script is not None:
             self.scripts.append(''.join(self.script))
             self.script = None
@@ -82,7 +91,7 @@ class CreationStateTests(unittest.TestCase):
                  'connectionBindingNode', 'connectionFieldNodes', 'boundConnectionId', 'boundConnectionProfile',
                  'savedConnectionPickerHtml',
                  'currentRoutingModel', 'resetRoutingModels', 'setRoutingModelMode',
-                 'resetCreateForm', 'startNewTest', 'openCreateForContext',
+                 'resetPressureDrafts', 'resetCreateForm', 'startNewTest', 'openCreateForContext',
                  'openGatewayCreate', 'openQualityCreate', 'openRoutingCreate']
         implementation = '\n'.join(self.function(script, name) for name in names)
         harness = r'''
@@ -93,12 +102,20 @@ const classes=node=>new Set(String(node.class||'').split(/\s+/).filter(Boolean))
 function node(attrs={}){
  const result={...attrs,hidden:Object.hasOwn(attrs,'hidden'),value:attrs.value||'',checked:false,
   type:attrs.type||'text',children:[],options:[],dataset:{},textContent:'',disabled:false,
-  setAttribute(key,value){this[key]=value},focus(){},querySelector(){return null},querySelectorAll(){return []}};
+  setAttribute(key,value){this[key]=value},focus(){},querySelector(){return null},querySelectorAll(){return []},
+  closest(selector){for(let item=this;item;item=item.parentElement){if(selector.startsWith('.')&&classes(item).has(selector.slice(1)))return item}return null},
+  after(item){
+   if(!this.parentElement)return;
+   if(item.parentElement){const siblings=item.parentElement.children;siblings.splice(siblings.indexOf(item),1)}
+   item.parentElement=this.parentElement;
+   const siblings=this.parentElement.children;siblings.splice(siblings.indexOf(this)+1,0,item);
+  }};
  for(const [key,value] of Object.entries(attrs))if(key.startsWith('data-'))result.dataset[key.slice(5).replace(/-([a-z])/g,(_,c)=>c.toUpperCase())]=value;
  const current=classes(attrs);result.classList={toggle(key,on){if(on)current.add(key);else current.delete(key)},contains:key=>current.has(key)};
  return result;
 }
 const nodes=raw.map(node),byId=Object.fromEntries(nodes.filter(x=>x.id).map(x=>[x.id,x]));
+nodes.forEach(item=>{if(item._parent!==null&&item._parent!==undefined){item.parentElement=nodes[item._parent];item.parentElement.children.push(item)}});
 function $(id){return byId[id]||null}
 let panels=[];
 const tabs=['routingBaselineTab','routingCandidateTab'].map(id=>$(id));
@@ -118,19 +135,23 @@ const document={
   if(selector==='#routingSidePanels [data-routing-side]')return panels;
   return nodes.filter(item=>selector.split(',').some(part=>classes(item).has(part.trim().slice(1))));
  },
- querySelector(selector){const match=selector.match(/^\[data-routing-side="([^"]+)"\]$/);return match?panels.find(panel=>panel.dataset.routingSide===match[1])||null:null}
+ querySelector(selector){
+  const match=selector.match(/^\[data-routing-side="([^"]+)"\]$/);if(match)return panels.find(panel=>panel.dataset.routingSide===match[1])||null;
+  const label=selector.match(/^label\[for="([^"]+)"\]$/);return label?nodes.find(item=>item.tag==='label'&&item.for===label[1])||null:null;
+ }
 };
 let routingModelRequestSeq=0;
 let routingSavedConnections={};const loadRoutingConnections=()=>{};
 let savedConnectionProfiles=[],savedConnectionsLoaded=false;const renderSavedConnectionPickers=()=>{};
 let createKind='gateway-single',activeModule='gateway',activeView='single',activeTemplateId=null;
+let pressureModeDrafts=Object.create(null),templateApplySeq=0;
 let preflightData=null,preflightAckRequested=false,preflightTimer=null,preflightSeq=0,templateCache=null;
 let routingCorpus=[{tier:1000,note:'合成测试集'}],lastRendered=null,drawerOpen=false;
 const esc=value=>String(value??''),num=value=>String(value??'');
 const renderComparisonFields=()=>{lastRendered='gateway-compare'};
 const renderQualityFields=compare=>{lastRendered=compare?'quality-compare':'quality-single'};
 const renderTemplatePicker=()=>{},resetKeyButton=()=>{},updateKeyInputHint=()=>{},setSavedModelOption=()=>{};
-const setMode=()=>{},applyDynamic=()=>{},currentModel=()=> 'gateway-only-model';
+const setMode=()=>{},paintMode=()=>{},applyDynamic=()=>{},syncProfileHint=()=>{},currentModel=()=> 'gateway-only-model';
 const updateWorkspaceChrome=()=>{},toggleConfig=open=>{drawerOpen=open},schedulePreflight=()=>{};
 __IMPLEMENTATION__
 
@@ -142,6 +163,15 @@ for(const kind of ['gateway-single','gateway-compare','quality-single','quality-
 }
 activeModule='routing';activeView='compare';openCreateForContext();assert.equal(drawerOpen,true);
 assert.equal(panels.length,2,'both route forms must be mounted at once');
+const fallback=$('routingManualModelToggle').closest('.model-fallback');
+assert.ok(fallback,'manual model toggle must have its actual fallback container');
+for(const manual of [true,false,true,false]){
+ setRoutingModelMode(manual);
+ const anchor=$(manual?'routingModelManualWrap':'routingModelHint');
+ assert.equal(anchor.parentElement.children[anchor.parentElement.children.indexOf(anchor)+1],fallback,'model mode switch must move the toggle after the active input section');
+ assert.equal(document.querySelector('label[for="routingModel"]').hidden,manual,'list label follows the active input mode');
+ assert.equal($('routingModelRow').hidden,manual);
+}
 for(const [index,panel] of panels.entries()){
  panel.querySelector('.routing-side-url').value='http://127.0.0.1:'+(9001+index)+'/v1';
  panel.querySelector('.routing-side-key').value='synthetic-'+panel.dataset.routingSide;

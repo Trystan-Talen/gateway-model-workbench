@@ -38,6 +38,7 @@
   .gallery-shape{display:grid;place-items:center;height:72px;border:1px solid var(--color-border);background:var(--color-surface)}
   .gallery-narrow{max-width:360px}
   .gallery-drawer{position:static;visibility:visible;transform:none;width:100%;max-width:560px;height:auto;border:1px solid var(--color-border);border-radius:var(--radius-panel)}
+  @media (max-width:640px){.gallery-type{grid-template-columns:minmax(0,1fr)}.gallery-type span{overflow-wrap:anywhere}.gallery-demo{padding:var(--space-4)}.gallery-label{overflow-wrap:anywhere}}
   @media (max-width:980px){.gallery-page{grid-template-columns:minmax(0,1fr)}.gallery-nav{position:static;height:auto}.gallery-main{padding:var(--space-5) var(--space-4)}}
 </style>
 </head>
@@ -76,7 +77,7 @@
     </section>
 
     <section class="gallery-block" id="page"><h2>详情页结构</h2><p>UI.pageShell(页头 + 标签 + 进度 + 区块 + 操作区)。</p>
-      <div class="gallery-demo"><div class="gallery-label">UI.pageShell · UI.pageHeader · UI.tabs · UI.progressCard · UI.section</div><div id="demoPage"></div></div>
+      <div class="gallery-demo"><div class="gallery-label">UI.pageShell · UI.pageHeader · UI.tabs · UI.progressCard · UI.section · UI.disclosure · UI.stack（纵向内容组）</div><div id="demoPage"></div></div>
     </section>
 
     <section class="gallery-block" id="data"><h2>数据展示</h2><p>空值统一“—”，单位缩小跟在数字后。</p>
@@ -87,10 +88,11 @@
 
     <section class="gallery-block" id="forms"><h2>表单</h2><p>创建流程统一放在右侧抽屉，按编号分步。</p>
       <div class="gallery-demo"><div class="gallery-label">.config 抽屉 · UI.formSectionTitle · UI.field · UI.input · UI.passwordInput · UI.select · UI.inlineFields · UI.switchRow · UI.hint</div>
-        <aside class="config gallery-drawer" aria-label="抽屉示例"><header class="drawer-head"><div><div class="form-title">新建缓存评测</div><div class="form-sub">配置连接与请求清单，开始后查看实时结果。</div></div><button class="drawer-close" type="button" aria-label="关闭示例" id="demoClose"></button></header><div class="drawer-body" id="demoForm"></div><footer class="drawer-footer"><button class="submit" type="button">开始缓存评测</button><div class="form-note">开始后会向所填目标发送真实请求，请核对配置。</div></footer></aside>
+        <aside class="config gallery-drawer" aria-label="抽屉示例"><header class="drawer-head"><div><div class="form-title">新建缓存评测</div><div class="form-sub">配置连接与请求清单，开始后查看实时结果。</div></div><button class="drawer-close" type="button" aria-label="关闭示例" id="demoClose"></button></header><div class="drawer-body" id="demoForm"></div><footer class="drawer-footer"><div id="demoDrawerFeedback" role="status"></div><button class="submit" type="button">开始缓存评测</button><div class="form-note">开始后会向所填目标发送真实请求，请核对配置。</div></footer></aside>
       </div>
     </section>
 
+    <section class="gallery-block" id="modal-example"><h2>确认弹窗底栏</h2><div class="modal-panel"><header class="modal-head"><h2>确认复测</h2></header><div class="modal-body"><p>核对目标与负载。正文独立滚动，取消和确认始终在底栏。</p></div><footer class="modal-footer" id="demoModalFooter"></footer></div></section>
     <section class="gallery-block" id="recipe"><h2>完整页面配方</h2><p>与 docs/design-system.md 第 7 节的示例代码一致。</p><div class="gallery-demo" id="demoRecipe"></div></section>
   </main>
 </div>
@@ -112,27 +114,36 @@
   document.querySelectorAll('[data-radius]').forEach(el => { el.style.borderRadius = `var(--radius-${el.dataset.radius})`; });
   document.querySelectorAll('[data-shadow]').forEach(el => { el.style.borderRadius = 'var(--radius-card)'; el.style.boxShadow = `var(--shadow-${el.dataset.shadow})`; });
 
+  $('demoModalFooter').innerHTML = UI.button('取消') + UI.button('确认复测', {variant:'primary'});
   $('demoButtons').innerHTML = UI.button('开始评测', { variant: 'primary', iconName: 'plus' }) + UI.button('下载结论报告', { iconName: 'download' }) + UI.button('管理常用连接', { iconName: 'connections' }) + UI.button('删除本地记录', { variant: 'danger', iconName: 'trash' }) + UI.button('运行中不可删除', { disabled: true }) + UI.textButton('无法获取列表？手动指定模型') + UI.icon('activity');
   $('demoActionBar').innerHTML = UI.actionBar(UI.button('停止后续请求', { variant: 'danger', iconName: 'stop' }) + UI.button('下载报告', { iconName: 'download' }) + UI.button('删除本地记录', { variant: 'danger', iconName: 'trash' }));
   $('demoStatus').innerHTML = [['running','运行中'],['waiting','排队中'],['finished','已完成'],['finished_with_errors','完成但有错误'],['error','失败'],['stopped','已停止']].map(([s, l]) => UI.status(s, l)).join('') +
     UI.TONES.map(t => UI.tag(t, t)).join('') + UI.badge('有限证据') + UI.badge('12 道题', { hint: true });
-  $('demoNotice').innerHTML = UI.notice('结果文件已删除；页面仍保留历史摘要。') + UI.notice('两侧成功率差异可归因于路由。', { tone: 'success', title: '成功率' }) + UI.notice('样本不足，不做显著性判断。', { tone: 'warning' }) + UI.notice('结果文件已失效，证据无法逐条核对。', { tone: 'danger' });
+  $('demoNotice').innerHTML = UI.notice('结果文件已删除；页面仍保留历史摘要。') + UI.notice('本窗口已返回的请求均完整成功。', { tone: 'success', title: '成功率' }) + UI.notice('样本不足，不做显著性判断。', { tone: 'warning' }) + UI.notice('结果文件已失效，证据无法逐条核对。', { tone: 'danger' });
   $('demoSignal').innerHTML = UI.signalList([{ title: '对比组 1 完成吞吐未随压力增长', detail: '计划调度速率提高不等于实际完成能力提高。', tone: 'danger' }, { title: '长尾延迟上升', detail: 'p95 增加 2,738 ms。', tone: 'warning' }]) + UI.signal({ title: '当前窗口没有额外异常信号', tone: 'success' });
   $('demoRecords').innerHTML = UI.recordItem({ id: 'a', title: '生产网关晚高峰 · 40 并发', state: 'running', stateLabel: '运行中', typeLabel: '单次压测', meta: ['冒烟', '600 RPM'], progress: 42, selected: true, action: 'selectTask' }) +
     UI.recordItem({ id: 'b', title: '并发 40 与 100 对照', state: 'finished', stateLabel: '已完成', typeLabel: '对照实验', compare: true, meta: ['2/2 组完成'], progress: 100, trailing: '风险', action: 'selectComparison' }) +
+    UI.recordItem({id:'connection',title:'已保存的常用连接',state:'finished',stateLabel:'已保存',meta:['https://example.test/v1'],progress:null,action:'selectConnection'}) +
     UI.recordEmpty('暂无缓存评测记录', '创建一次缓存评测后，结果会出现在这里。');
   $('demoPage').innerHTML = UI.pageShell([
-    UI.pageHeader({ kicker: '网关压测 · 对照实验记录', title: '并发 40 与 100 对照', description: '一条实验记录承载公共配置和全部压力组。', meta: ['已完成', '2 个实验组', '串行执行'], statusLabel: '风险', statusNote: '对比组出现明显退化', statusTone: 'danger', actionsHtml: UI.button('再来一次', { action: 'openCreateForContext', iconName: 'refresh' }) }),
+    UI.pageHeader({ kicker: '网关压测 · 对照实验记录', title: '并发 40 与 100 对照', description: '一条实验记录承载公共配置和全部压力组。', meta: ['运行中', '2 个实验组', '串行执行'], statusLabel: '运行中', statusNote: '等待全部实验组完成', statusTone: 'accent', actionsHtml: UI.button('停止后续请求', { action: 'stopTask', iconName: 'stop' }) }),
     UI.tabs({ label: '示例标签', items: [['report', '对照结论'], ['base', '基准组'], ['cmp', '对比组 1']], active: 'report', action: 'setComparisonTab', ownerId: 'demo' }),
     UI.progressCard({ kicker: '实验整体进度', value: 64, summary: '26 / 40 条请求 · 1/2 组完成', note: '实验尚未完成；当前只展示过程数据。' }),
-    UI.section({ title: '关键发现', description: '异常信号是复测线索，不是根因结论。', badgeHtml: UI.badge('有限证据'), bodyHtml: UI.signalList([{ title: '成功率下降 6.5%', detail: '相对基准组。', tone: 'warning' }]) })
+    UI.section({ title: '关键发现', description: '异常信号是复测线索，不是根因结论。', badgeHtml: UI.badge('有限证据'), bodyHtml: UI.signalList([{ title: '成功率下降 6.5%', detail: '相对基准组。', tone: 'warning' }]) }),
+    UI.disclosure({ title:'查看执行记录与统计口径', section:true, open:true, bodyHtml:
+      UI.metrics([{ label:'已返回', value:'26', unit:'条' }, { label:'成功', value:'24', unit:'条' }]) +
+      UI.table({ columns:[{label:'指标'}, {label:'观测值'}], rowsHtml:[['首字耗时 · 第95百分位','640 毫秒'], ['计划调度速率','100 次/分钟']] }) +
+      UI.methodCards([{ title:'请求成功', lines:['仅完整的成功状态码响应计为成功。'] }, { title:'观测范围', lines:['只描述当前客户端窗口，不能推出网关容量。'] }]) +
+      UI.notice('样本尚未收齐，当前结果仍可能变化。', {tone:'warning'})
+    })
   ].join(''));
-  $('demoMetrics').innerHTML = UI.metrics([{ label: '稳定完成吞吐', value: '50.5', unit: 'RPM', note: '不是网关容量承诺', primary: true }, { label: '成功率', value: '100', unit: '%', note: '仅完整 2xx 计为成功' }, { label: '总耗时 p95', value: '22,293', unit: 'ms' }, { label: '缓存命中率', value: null }]) +
-    `<div class="gallery-narrow">${UI.metric({ label: '单个指标', value: '43.8', unit: 'RPM' })}</div>`;
-  $('demoMethod').innerHTML = UI.methodCards([{ title: '配对方式', lines: ['按请求编号一一配对。', '只有一侧有结果的请求整条剔除。'] }, { title: '唯一变量', lines: ['只有 URL 与密钥背后的路由不同。'] }]) + '<br>' +
-    UI.steps(['暂停扩大流量，定位失败类型', '用相同题集重复运行', '风险解除前不作为放量依据']) + UI.limitations(['证据量级不等于统计置信区间。', '黑盒结果不能证明上游来源。']);
+  $('demoMetrics').innerHTML = UI.stack(UI.metrics([{ label: '稳定完成吞吐', value: '50.5', unit: 'RPM', note: '不是网关容量承诺', primary: true }, { label: '成功率', value: '100', unit: '%', note: '仅完整 2xx 计为成功' }, { label: '总耗时 p95', value: '22,293', unit: 'ms' }, { label: '缓存命中率', value: null }]) +
+    `<div class="gallery-narrow">${UI.metric({ label: '单个指标', value: '43.8', unit: 'RPM' })}</div>`);
+  $('demoMethod').innerHTML = UI.stack(UI.methodCards([{ title: '配对方式', lines: ['按请求编号一一配对。', '只有一侧有结果的请求整条剔除。'] }, { title: '唯一变量', lines: ['只有 URL 与密钥背后的路由不同。'] }]) +
+    UI.steps(['暂停扩大流量，定位失败类型', '用相同题集重复运行', '风险解除前不作为放量依据']) + UI.limitations(['证据量级不等于统计置信区间。', '黑盒结果不能证明上游来源。']));
   $('demoTable').innerHTML = UI.table({ columns: [{ label: '请求编号' }, { label: '结果' }, { label: '总耗时' }], rowsHtml: [['159', UI.tag('超时', 'warning'), '60,005 ms'], ['158', UI.tag('成功', 'success'), '4,322 ms']] });
   $('demoClose').innerHTML = UI.icon('close');
+  $('demoDrawerFeedback').innerHTML = UI.hint('已保留手动输入，主操作始终可见。');
   $('demoForm').innerHTML = UI.formSectionTitle(1, '连接网关') +
     UI.field({ id: 'demoUrl', label: '网关地址', required: true, controlHtml: UI.input({ id: 'demoUrl', type: 'url', placeholder: 'https://gateway.example.com/v1' }), hint: '密钥不会写入任务记录。' }) +
     UI.field({ id: 'demoKey', label: 'API Key（接口密钥）', controlHtml: UI.passwordInput({ id: 'demoKey', visibilityLabel: 'API Key（接口密钥）', value: 'synthetic-demo-key' }), hint: '点击眼睛核对合成示例密钥，再次点击恢复遮盖。' }) +
@@ -141,9 +152,11 @@
     UI.hint('两侧按相同清单、节奏和并发交错发出请求。', { title: '对照方式' }) +
     UI.switchRow({ id: 'demoCapture', title: '保存原始输入与输出', description: '便于逐条核对结果，会增加本地存储占用。' });
   $('demoRecipe').innerHTML = UI.pageShell([
-    UI.pageHeader({ kicker: '缓存评测 · 单次运行', title: '长前缀缓存命中', description: '同一清单重复请求，观察缓存命中与首字耗时。', meta: ['运行中', '1,000 条请求'], statusLabel: '可复测', statusNote: '证据有限', statusTone: 'warning' }),
+    UI.pageHeader({ kicker: '缓存评测 · 单次运行', title: '长前缀缓存命中', description: '同一清单重复请求，观察缓存命中与首字耗时。', meta: ['运行中', '1,000 条请求'], statusLabel: '运行中', statusNote: '停止后等待已发送请求结束', statusTone: 'accent', actionsHtml: UI.button('停发并收尾', { iconName: 'stop' }) }),
     UI.tabs({ label: '缓存评测详情', items: [['report', '结论'], ['raw', '逐条结果']], active: 'report', action: 'setQualityTab', ownerId: 'recipe' }),
     UI.progressCard({ kicker: '执行进度', value: 82, summary: '820 / 1,000 条' }),
+    UI.timeRecords({status:'running',timing:{source:'recorded',timezone:'Asia/Singapore',created_at:'2026-10-15T23:59:59.012+08:00',started_at:'2026-10-16T00:00:00.000+08:00',queue_ms:988}}, {key:'gallery-timing'}),
+    UI.hint('旧时区记录转换：' + UI.formatTimestamp('2026-10-15T16:00:00.000Z') + ' · ' + UI.formatDurationMs(0)),
     UI.section({ title: '关键指标', description: '只描述客户端观测窗口。', badgeHtml: UI.badge('有限证据'), bodyHtml: UI.metrics([{ label: '命中率', value: '82.4', unit: '%', primary: true }, { label: '首字 p95', value: '640', unit: 'ms' }]) }),
     UI.section({ title: '下一步动作', bodyHtml: UI.steps(['扩大样本后复测', '检查未命中的请求']) }),
     UI.actionBar(UI.button('下载结论报告', { iconName: 'download' }) + UI.button('删除本地记录', { variant: 'danger' }))

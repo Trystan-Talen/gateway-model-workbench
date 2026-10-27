@@ -7,10 +7,7 @@
   const active = () => typeof activeModule !== 'undefined' && activeModule === 'connections';
   const signedIn = () => typeof authenticated === 'undefined' || authenticated;
   const notify = text => { if (typeof toast === 'function') toast(text); };
-  const date = value => {
-    const d = new Date(typeof value === 'number' ? value * (value < 1e12 ? 1000 : 1) : value);
-    return value && Number.isFinite(d.getTime()) ? d.toLocaleString('zh-CN',{dateStyle:'medium',timeStyle:'short',hour12:false}) : '日期未知';
-  };
+  const date = value => UI.formatTimestamp(value);
   function publicConnection(item) {
     return {id:String(item?.id || ''),name:String(item?.name || ''),url:String(item?.url || ''),api_key_saved:item?.api_key_saved === true,updated_at:item?.updated_at || null};
   }
@@ -76,10 +73,10 @@
   }
   function detailHtml(item) {
     return UI.pageShell([
-      UI.pageHeader({kicker:'常用连接 · 本地保存',title:item.name,description:'在测试表单中选择这个名称，即可复用地址与密钥。',meta:[`更新于 ${date(item.updated_at)}`],statusLabel:item.api_key_saved?'密钥已保存':'密钥不可用',statusTone:item.api_key_saved?'success':'warning',statusNote:item.api_key_saved?'可在测试时直接选择':'编辑后重新保存密钥'}),
-      UI.section({title:'连接信息',bodyHtml:UI.methodCards([{title:'连接名称',lines:[item.name]},{title:'URL（请求地址）',lines:[item.url]},{title:'API Key（接口密钥）',lines:[item.api_key_saved?'已保存在本机凭据库；编辑时可主动点击眼睛核对。':'未找到已保存密钥；请编辑连接重新输入。']}])}),
+      UI.pageHeader({kicker:'常用连接 · 本地保存',title:item.name,description:'在测试表单中选择这个名称，即可复用地址与密钥。',meta:[`更新于 ${date(item.updated_at)}`],statusLabel:item.api_key_saved?'密钥已保存':'密钥不可用',statusTone:item.api_key_saved?'success':'warning',statusNote:item.api_key_saved?'可在测试时直接选择':'编辑后重新保存密钥',actionsHtml:UI.button('编辑常用连接',{variant:'primary',action:'openConnectionEdit',args:[item.id]})}),
+      UI.section({title:'连接信息',bodyHtml:UI.methodCards([{title:'URL（请求地址）',lines:[item.url]},{title:'API Key（接口密钥）',lines:[item.api_key_saved?'已保存在本机凭据库；编辑时可主动点击眼睛核对。':'未找到已保存密钥；请编辑连接重新输入。']}])}),
       !s.storageAvailable ? UI.notice('本机凭据库当前不可用，保存密钥可能失败。',{tone:'warning'}) : '',
-      UI.actionBar(UI.button('编辑常用连接',{action:'openConnectionEdit',args:[item.id]}) + UI.button('删除常用连接',{variant:'danger',action:'deleteConnection',args:[item.id]}))
+      UI.actionBar(UI.button('删除常用连接',{variant:'danger',action:'deleteConnection',args:[item.id]}))
     ].join(''));
   }
   function emptyHtml() {
@@ -95,11 +92,12 @@
     host.hidden = false;
     const item = s.items.find(connection=>connection.id === s.selected) || s.items[0];
     if (item) s.selected = item.id;
-    $('connectionsList').innerHTML = s.items.length ? s.items.map(connection=>UI.recordItem({id:connection.id,title:connection.name,state:connection.api_key_saved?'finished':'error',stateLabel:connection.api_key_saved?'密钥已保存':'密钥不可用',typeLabel:'常用连接',meta:[connection.url],progress:100,trailing:date(connection.updated_at),selected:connection.id === s.selected,action:'selectConnection'})).join('') : UI.recordEmpty(s.pending?'正在读取常用连接':'暂无常用连接','保存后可在测试表单中按名称选择。');
+    $('connectionsList').innerHTML = s.items.length ? s.items.map(connection=>UI.recordItem({id:connection.id,title:connection.name,state:connection.api_key_saved?'finished':'error',stateLabel:connection.api_key_saved?'密钥已保存':'密钥不可用',typeLabel:'常用连接',meta:[connection.url],progress:null,trailing:date(connection.updated_at).split(' ')[0],selected:connection.id === s.selected,action:'selectConnection'})).join('') : UI.recordEmpty(s.pending?'正在读取常用连接':'暂无常用连接','保存后可在测试表单中按名称选择。');
     const loading = s.pending && !s.loaded && !s.items.length ? UI.section({title:'正在读取常用连接',bodyHtml:UI.notice('正在读取本地保存的名称与地址，请稍候。')}) : '';
     const error = s.error ? UI.section({title:'常用连接读取失败',bodyHtml:UI.notice(s.error,{tone:'danger'}) + UI.button('重新读取',{action:'refreshConnections'})}) : '';
     host.dataset.connectionId = item?.id || '';
-    host.innerHTML = error + (loading || (item ? detailHtml(item) : !s.error ? emptyHtml() : ''));
+    const content = loading || (item ? detailHtml(item) : !s.error ? emptyHtml() : '');
+    host.innerHTML = error ? UI.stack(error + content) : content;
     if (main) main.scrollTop = previous === host.dataset.connectionId ? scroll : 0;
     if (!s.loaded && !s.pending && !s.error) refresh().catch(()=>{});
   }
@@ -136,16 +134,27 @@
   function beginDrawer(mode) {
     if (!s.initialized) init();
     if (s.drawerOpen) closeCreate();
+    window.clearTransientFeedback?.();
     s.overlayState = {appInert:document.querySelector('.app')?.inert,baseInert:$('config')?.inert,fingerprintInert:$('fingerprintDrawer')?.inert};
     s.drawerOpen = true; s.drawerMode = mode; s.drawerOwner = typeof activeModule !== 'undefined' ? activeModule : null; s.drawerSession++; s.opener = document.activeElement;
     $('connectionDrawer').classList.add('mobile-open'); $('connectionDrawer').inert = false; $('connectionDrawer').setAttribute('aria-hidden','false'); $('connectionBackdrop').hidden = false;
     syncOverlay();
   }
+  function focusDrawerStart(node) {
+    const session=s.drawerSession;
+    // Descendants can remain hidden for the first frame of the visibility transition.
+    const attempt=(remaining=20)=>{
+      if(!s.drawerOpen||session!==s.drawerSession||!node?.isConnected||$('connectionDrawer').contains(document.activeElement))return;
+      if(typeof getComputedStyle!=='function'||getComputedStyle(node).visibility==='visible')node.focus({preventScroll:true});
+      if(document.activeElement!==node&&remaining&&typeof requestAnimationFrame==='function')requestAnimationFrame(()=>attempt(remaining-1));
+    };
+    attempt();
+  }
   function paintManager() {
     if (!s.drawerOpen || s.drawerMode !== 'manage') return;
     const body = $('connectionCreateBody'), scroll = body.scrollTop;
-    body.innerHTML = (s.error?UI.notice(s.error,{tone:'danger'}) + UI.button('重新读取',{action:'refreshConnections'}):'') +
-      UI.section({title:'常用连接',description:'编辑和删除仅影响常用连接；当前测试输入会保留。',bodyHtml:s.pending && !s.loaded ? UI.notice('正在读取本地连接，请稍候。') : UI.table({columns:[{label:'连接名称'},{label:'URL（请求地址）'},{label:'密钥状态'},{label:'操作'}],rowsHtml:s.items.map(item=>[UI.esc(item.name),UI.esc(item.url),UI.tag(item.api_key_saved?'已保存':'不可用',item.api_key_saved?'success':'warning'),UI.button('编辑',{action:'openConnectionEdit',args:[item.id]}) + UI.button('删除',{variant:'danger',action:'deleteConnection',args:[item.id]})]),empty:'暂无常用连接'})});
+    body.innerHTML = UI.pageShell((s.error?UI.notice(s.error,{tone:'danger'}) + UI.button('重新读取',{action:'refreshConnections'}):'') +
+      UI.hint('编辑和删除仅影响常用连接；当前测试输入会保留。') + (s.pending && !s.loaded ? UI.notice('正在读取本地连接，请稍候。') : s.items.length ? s.items.map(item=>UI.section({title:item.name,description:item.url,badgeHtml:UI.tag(item.api_key_saved?'密钥已保存':'密钥不可用',item.api_key_saved?'success':'warning'),bodyHtml:UI.actionBar(UI.button('编辑连接',{action:'openConnectionEdit',args:[item.id]}) + UI.button('删除连接',{variant:'danger',action:'deleteConnection',args:[item.id]}))})).join('') : UI.recordEmpty('暂无常用连接','点击下方“保存新连接”添加。')));
     body.scrollTop = scroll;
   }
   function openManage() {
@@ -153,7 +162,7 @@
     beginDrawer('manage'); s.editing = null; s.sourceSide = null;
     $('connectionCreateTitle').textContent = '管理常用连接';
     $('connectionSubmit').textContent = '保存新连接'; $('connectionSubmit').disabled = false; $('connectionSubmit').dataset.clickAction = 'openConnectionCreate';
-    formStatus(''); paintManager(); $('connectionDrawer').querySelector('.drawer-close').focus({preventScroll:true});
+    formStatus(''); paintManager(); focusDrawerStart($('connectionDrawer').querySelector('.drawer-close'));
     refresh().catch(()=>{});
   }
   function openCreate(seed = {}) { openForm(null,seed); }
@@ -168,13 +177,13 @@
     s.sourceSide = Object.hasOwn(seed,'source_side') ? seed.source_side : null;
     s.submitting = false; s.retrieved = false;
     $('connectionCreateTitle').textContent = item?'编辑常用连接':'保存常用连接';
-    const keyRequired = !item && s.sourceSide === null;
+    const keyRequired = item ? !item.api_key_saved : s.sourceSide === null;
     $('connectionCreateBody').innerHTML = UI.formSectionTitle(1,'连接名称与地址') +
       UI.field({id:'connectionName',label:'连接名称',required:true,controlHtml:UI.input({id:'connectionName',value:item?.name || seed.name || '',placeholder:'例如：日常智能路由',required:true})}) +
       UI.field({id:'connectionUrl',label:'URL（请求地址）',required:true,controlHtml:UI.input({id:'connectionUrl',type:'url',value:item?.url || seed.url || '',placeholder:'https://example.com/v1',required:true}),hint:'填写测试时使用的完整请求地址；编辑后更换地址需要重新输入密钥。'}) +
-      UI.formSectionTitle(2,'接口密钥') + UI.field({id:'connectionKey',label:'API Key（接口密钥）',required:keyRequired,controlHtml:UI.passwordInput({id:'connectionKey',value:seed.api_key || '',required:keyRequired,action:'revealConnectionKey',args:[],visibilityLabel:'API Key（接口密钥）',placeholder:item?'留空保留已保存密钥':'填写接口密钥',describedBy:'connectionKeyHint'}),hint:item?'留空保留原密钥。点击眼睛可主动取回核对，隐藏或关闭即清空取回值。':s.sourceSide !== null?'留空时复用当前地址已保存的密钥。':'密钥存入本机凭据库，列表只展示名称与地址。',hintId:'connectionKeyHint'});
+      UI.formSectionTitle(2,'接口密钥') + UI.field({id:'connectionKey',label:'API Key（接口密钥）',required:keyRequired,controlHtml:UI.passwordInput({id:'connectionKey',value:seed.api_key || '',required:keyRequired,action:'revealConnectionKey',args:[],visibilityLabel:'API Key（接口密钥）',placeholder:item?.api_key_saved?'留空保留已保存密钥':'填写接口密钥',describedBy:'connectionKeyHint'}),hint:item?(item.api_key_saved?'留空保留原密钥。点击眼睛可主动取回核对，隐藏或关闭即清空取回值。':'该连接的密钥已不可用，请重新填写后保存。'):s.sourceSide !== null?'留空时复用当前地址已保存的密钥。':'密钥存入本机凭据库，列表只展示名称与地址。',hintId:'connectionKeyHint'});
     formStatus(''); $('connectionSubmit').disabled = false; $('connectionSubmit').textContent = '保存常用连接'; $('connectionSubmit').dataset.clickAction = 'saveConnection';
-    $('connectionCreateBody').scrollTop = 0; $('connectionName').focus({preventScroll:true});
+    $('connectionCreateBody').scrollTop = 0; focusDrawerStart($('connectionName'));
   }
   function closeCreate() {
     if (!s.initialized) return;

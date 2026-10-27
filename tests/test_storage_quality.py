@@ -104,6 +104,15 @@ class FingerprintSamplePageTests(unittest.TestCase):
         self.manager._runs[self.identifier] = self.run
         self.path = self.manager._samples_path(self.identifier)
 
+    @staticmethod
+    def with_empty_legacy_timing(row):
+        return {**row, "timing": {
+            "version": 1, "clock": "client", "timezone": "Asia/Singapore", "source": "legacy",
+            "scheduled_at": None, "enqueued_at": None, "started_at": None,
+            "first_token_at": None, "ended_at": None, "queue_ms": None,
+            "schedule_lag_ms": None, "ttft_ms": None, "total_ms": None,
+        }}
+
     def write(self, rows):
         self.path.write_text("\n".join(json.dumps(row) for row in rows) + "\n", encoding="utf-8")
 
@@ -113,7 +122,7 @@ class FingerprintSamplePageTests(unittest.TestCase):
                      {"index": 10 ** 80, "cell_id": "synthetic", "sequence": 171}])
         random.Random(731).shuffle(rows)
         self.write(rows)
-        expected = sorted(rows, key=lambda row: row["index"])
+        expected = [self.with_empty_legacy_timing(row) for row in sorted(rows, key=lambda row: row["index"])]
         for offset, limit in ((0, 1), (0, 100), (3, 7), (19, 25), (169, 3), (172, 100), (200, 1), (0, 500)):
             with self.subTest(offset=offset, limit=limit):
                 self.assertEqual(self.manager.samples(self.identifier, offset, limit),
@@ -124,11 +133,11 @@ class FingerprintSamplePageTests(unittest.TestCase):
         valid = [{"index": 2, "cell_id": "synthetic"}, {"index": 1, "cell_id": "synthetic"}]
         self.path.write_text(json.dumps(valid[0]) + '\n{broken\nnull\n{"index":"bad","cell_id":"synthetic"}\n' + json.dumps(valid[1]) + '\n', encoding="utf-8")
         page = self.manager.samples(self.identifier, limit=1)
-        self.assertEqual(page["samples"], [valid[1]])
+        self.assertEqual(page["samples"], [self.with_empty_legacy_timing(valid[1])])
         self.assertEqual(page["total"], 2)
         self.assertIn("损坏或缺失", self.run["storage_warning"])
         samples, damaged = self.manager._read_samples(self.run)
-        self.assertEqual(samples, valid)
+        self.assertEqual(samples, [self.with_empty_legacy_timing(row) for row in valid])
         self.assertTrue(damaged)
 
     def test_missing_and_changed_sample_files_are_reread(self):
@@ -137,9 +146,26 @@ class FingerprintSamplePageTests(unittest.TestCase):
         first = {"index": 3, "cell_id": "synthetic"}
         second = {"index": 1, "cell_id": "synthetic"}
         self.write([first])
-        self.assertEqual(self.manager.samples(self.identifier)["samples"], [first])
+        self.assertEqual(self.manager.samples(self.identifier)["samples"], [self.with_empty_legacy_timing(first)])
         self.write([first, second])
-        self.assertEqual(self.manager.samples(self.identifier)["samples"], [second, first])
+        self.assertEqual(self.manager.samples(self.identifier)["samples"],
+                         [self.with_empty_legacy_timing(row) for row in [second, first]])
+
+    def test_recorded_timing_uses_whitelist_and_keeps_same_page_order(self):
+        timing = {"version": 999, "clock": "server", "timezone": "arbitrary", "source": "recorded",
+                  "started_at": "2026-10-15T12:00:00+08:00", "ended_at": "2026-10-15T12:00:01+08:00",
+                  "total_ms": 900.5, "unrecognized_secret": "never-forward-this"}
+        rows = [{"index": 2, "cell_id": "synthetic", "sequence": 0, "timing": timing},
+                {"index": 1, "cell_id": "synthetic", "sequence": 1}]
+        self.write(rows)
+        expected = self.with_empty_legacy_timing(rows[0])
+        expected["timing"].update(source="recorded", started_at="2026-10-15T12:00:00.000+08:00",
+                                  ended_at="2026-10-15T12:00:01.000+08:00", total_ms=900.5)
+        self.assertEqual(self.manager.samples(self.identifier, 1, 1),
+                         {"samples": [expected], "total": 2, "offset": 1, "limit": 1})
+        self.assertEqual(self.manager._read_samples(self.run),
+                         ([expected, self.with_empty_legacy_timing(rows[1])], False))
+        self.assertNotIn("storage_warning", self.run)
 
     def test_invalid_paging_arguments_keep_validation(self):
         self.write([])

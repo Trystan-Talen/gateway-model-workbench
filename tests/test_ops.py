@@ -232,11 +232,11 @@ class TemplateTests(unittest.TestCase):
             self.assertGreater(total, 0, f"{item['id']} 的请求量为 0")
             self.assertTrue(steps, f"{item['id']} 没有生成计划步骤")
 
-    def test_all_builtin_pressure_defaults_are_100(self):
+    def test_all_builtin_pressure_defaults_are_20_concurrency_and_100_rpm(self):
         for item in self.store.list():
             with self.subTest(template=item["id"]):
                 cfg = item["config"]
-                self.assertEqual(cfg["concurrency"], 100)
+                self.assertEqual(cfg["concurrency"], 20)
                 self.assertEqual(cfg["rpm"], 100)
 
     def test_ramp_builtins_start_at_100_and_preserve_step_shape(self):
@@ -258,7 +258,7 @@ class TemplateTests(unittest.TestCase):
         reopened = test_plan.TemplateStore(os.path.join(self.tmp, "templates.json"))
         for item in reopened.list():
             if item["builtin"]:
-                self.assertEqual(item["config"]["concurrency"], 100)
+                self.assertEqual(item["config"]["concurrency"], 20)
                 self.assertEqual(item["config"]["rpm"], 100)
         self.assertEqual(reopened.get(custom["id"])["config"], custom_cfg)
 

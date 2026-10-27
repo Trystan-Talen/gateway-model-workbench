@@ -130,6 +130,9 @@ async function side(page,key){
    await openFromButton(page,'gateway');
    await drawerGeometry(page,width,height,'gateway-single '+width);
    assert.equal(await page.locator('#url').isVisible(),true);
+   assert.equal(await page.locator('#concurrency').inputValue(),'20');
+   assert.equal(await page.locator('#rpm').inputValue(),'100');
+   assert.equal(await page.locator('#templatePickerBody').isVisible(),false,'new forms keep optional templates collapsed');
    await closeDrawer(page);
    await page.locator('#gatewaySubnav [data-view="compare"]').click();
    await page.locator('#recordCreateButton').click();
@@ -140,6 +143,8 @@ async function side(page,key){
    await openFromButton(page,'routing');
    await drawerGeometry(page,width,height,'routing '+width);
    assert.equal(await page.locator('#routingModel').isVisible(),true,'routing owns a visible shared model');
+   assert.equal(await page.locator('#routingConcurrency').inputValue(),'20');
+   assert.equal(await page.locator('#routingRpm').inputValue(),'100');
    const beforeInvalid=submissions.length;
    await page.locator('#submit').click();
    await page.waitForFunction(()=>document.getElementById('formStatus').classList.contains('error'));
@@ -152,7 +157,7 @@ async function side(page,key){
    await page.locator('#routingConcurrency').fill('4');
    await page.locator('#routingRpm').fill('120');
    await page.locator('#routingTier').selectOption('1000');
-   await page.locator('.routing-advanced summary').click();
+   await page.locator('#routingFields summary').filter({hasText:'超时与原始记录'}).click();
    await page.locator('#routingConnectTimeout').fill('9');
    await page.locator('#routingReadTimeout').fill('45');
    await page.locator('#routingCapture').check();
@@ -202,6 +207,36 @@ async function side(page,key){
    assert.equal(submissions.length,beforeInvalid,'discovered models still require a selection');
    await page.locator('#routingModel').selectOption('shared-routing-model');
    assert.equal(await page.locator('#formStatus').textContent(),'','correcting a model clears the outdated validation error');
+   // The list and manual entry are independent drafts. Refreshing one must not erase the other.
+   await page.locator('#routingManualModelToggle').click();
+   await page.locator('#routingModelManual').fill('Custom/Shared-Draft');
+   assert.equal(await page.locator('#routingModelRow').isHidden(),true,'manual entry shows only its active control');
+   assert.equal(await page.locator('#routingModelHint').isHidden(),true,'list verification is not presented as manual verification');
+   if([1440,980,390].includes(width)){
+    for(const theme of ['light','dark']){
+     await page.evaluate(theme=>setTheme(theme),theme);
+     await page.evaluate(()=>new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve))));
+     await page.locator('#routingModelManual').scrollIntoViewIfNeeded();
+     await drawerGeometry(page,width,height,'routing-manual '+width+' '+theme);
+     await page.screenshot({path:path.join(output,`routing-manual-${width}-${theme}.png`)});
+    }
+    await page.evaluate(()=>setTheme('light'));
+   }
+   await page.locator('#routingManualModelToggle').click();
+   assert.equal(await page.locator('#routingModel').inputValue(),'shared-routing-model');
+   await page.locator('#loadRoutingModels').click();
+   await page.waitForFunction(()=>!document.getElementById('loadRoutingModels').disabled);
+   assert.equal(await page.locator('#routingModel').inputValue(),'shared-routing-model','valid list selection survives refresh');
+   await page.locator('#routingManualModelToggle').click();
+   assert.equal(await page.locator('#routingModelManual').inputValue(),'Custom/Shared-Draft','list refresh preserves the separate manual draft');
+   await page.locator('#routingManualModelToggle').click();
+   discoveryMode='failure';
+   await page.locator('#loadRoutingModels').click();
+   await page.waitForFunction(()=>!document.getElementById('loadRoutingModels').disabled);
+   assert.equal(await page.locator('#routingModel').inputValue(),'shared-routing-model','transient refresh failure preserves the previous choice for the same connections');
+   assert.equal(await page.locator('#routingModel').isEnabled(),true);
+   assert.match(await page.locator('#routingModelHint').textContent(),/本次刷新未验证/);
+   discoveryMode='normal';
    // Route labels do not affect discovery, but credentials and addresses do.
    await (await side(page,'baseline')).locator('.routing-side-name').fill('固定入口');
    assert.equal(await page.locator('#routingModel').inputValue(),'shared-routing-model');
@@ -404,7 +439,12 @@ async function side(page,key){
     await resources.nth(i).locator('.quality-url').fill(`http://127.0.0.1:${9010+i}/v1`);
     await resources.nth(i).locator('.quality-key').fill('synthetic-quality-key-'+i);
     await resources.nth(i).locator('.quality-model-refresh').click();
-    await page.waitForFunction(index=>document.querySelectorAll('#qualityResourceFields .quality-model')[index].value==='synthetic-quality-model',i);
+    await page.waitForFunction(index=>{
+     const model=document.querySelectorAll('#qualityResourceFields .quality-model')[index];
+     return !model.disabled&&[...model.options].some(option=>option.value==='synthetic-quality-model');
+    },i);
+    assert.equal(await resources.nth(i).locator('.quality-model').inputValue(),'','quality requires an explicit model choice after discovery');
+    await resources.nth(i).locator('.quality-model').selectOption('synthetic-quality-model');
    }
    await page.locator('#submit').click();
    await page.waitForFunction(()=>!document.getElementById('config').classList.contains('mobile-open'));

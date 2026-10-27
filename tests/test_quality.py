@@ -196,6 +196,17 @@ class BackendQualityIntegrationTests(unittest.TestCase):
         config = {"shared_config": self.base, "groups": [{}, {}], "seed": 123}
         self.assertRaisesMessage("暂不支持随机种子", ui.validate_comparison_config, config)
 
+    def test_comparison_pressure_defaults_and_explicit_group_values(self):
+        config = ui.validate_comparison_config({
+            "shared_config": self.base,
+            "groups": [{}, {"concurrency": 7, "rpm": 321, "iterations": 13}],
+        })
+        self.assertEqual(config["shared_config"]["concurrency"], 20)
+        self.assertEqual(config["shared_config"]["rpm"], 100)
+        self.assertEqual((config["groups"][0]["concurrency"], config["groups"][0]["rpm"]), (20, 100))
+        self.assertEqual((config["groups"][1]["concurrency"], config["groups"][1]["rpm"],
+                          config["groups"][1]["iterations"]), (7, 321, 13))
+
     def test_public_config_recursively_removes_credentials(self):
         cfg = {"name": "x", "api_key": self.secret_a, "nested": {"Authorization": self.secret_b, "safe": 1}}
         public = ui.public_config(cfg)
@@ -217,6 +228,30 @@ class BackendQualityIntegrationTests(unittest.TestCase):
         self.assertNotIn(self.secret_a, payload)
         self.assertNotIn(self.secret_b, payload)
         self.assertEqual(payload.count("[已隐藏]"), 2)
+
+    def test_field_name_cache_is_bounded_and_does_not_cache_policy_or_values(self):
+        ui._cached_field_name.cache_clear()
+        self.addCleanup(ui._cached_field_name.cache_clear)
+        for number in range(1100):
+            self.assertFalse(ui._is_secret_field(f"metric_{number}"))
+        self.assertLessEqual(ui._cached_field_name.cache_info().currsize, 1024)
+        before = ui._cached_field_name.cache_info()
+        self.assertTrue(ui._is_secret_field("x" * 10000 + "-Token"))
+        self.assertEqual(ui._cached_field_name.cache_info(), before)
+        self.assertTrue(ui._is_secret_field(" Future-Secret-Token "))
+        self.assertTrue(ui._is_secret_field(" API-KEY "))
+        self.assertFalse(ui._is_secret_field(200))
+        self.assertFalse(ui._is_secret_field("new_policy_field"))
+        with mock.patch.object(ui, "_SECRET_FIELD_NAMES", ui._SECRET_FIELD_NAMES | {"new_policy_field"}):
+            self.assertTrue(ui._is_secret_field("new_policy_field"))
+        original = {"nested": [{" Future-Secret-Token ": self.secret_a, " Raw-Output ": self.secret_b,
+                                "safe": [1]}]}
+        clean = ui._history_safe_snapshot(original)
+        self.assertEqual(clean, {"nested": [{"safe": [1]}]})
+        clean["nested"][0]["safe"].append(2)
+        self.assertEqual(original["nested"][0]["safe"], [1])
+        self.assertNotIn(self.secret_a, json.dumps(clean))
+        self.assertNotIn(self.secret_b, json.dumps(clean))
 
     def test_quality_task_snap_and_raw_result_never_expose_key(self):
         cfg = ui.validate_quality_config({"suite_path": str(SMOKE_SUITE), "resources": [self.quality_resource], "capture_raw": True})

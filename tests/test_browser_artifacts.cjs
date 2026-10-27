@@ -63,7 +63,7 @@ class Child extends EventEmitter {
     for (const item of outputs) assert.equal(fs.readFileSync(path.join(item.output,'marker'),'utf8'),String(item.pid));
   });
   await check('every browser suite delegates output creation to the shared helper',()=>{
-    const scripts = fs.readdirSync(path.join(__dirname,'browser')).filter(name=>name.endsWith('.cjs')&&!['artifacts.cjs','assets.cjs','server.cjs','run-all.cjs'].includes(name));
+    const scripts = fs.readdirSync(path.join(__dirname,'browser')).filter(name=>name.endsWith('.cjs')&&!['artifacts.cjs','assets.cjs','server.cjs','tpm_launcher.cjs','run-all.cjs'].includes(name));
     assert.ok(scripts.length > 0);
     for (const name of scripts) {
       const source = fs.readFileSync(path.join(__dirname,'browser',name),'utf8');

@@ -34,7 +34,7 @@
    **默认选中**：进入模块时恢复该模块上次查看的记录；首次进入则选中“第一个有记录的筛选”里最新的一条；切换筛选、删除记录后自动打开该筛选的第一条。详情区只有在当前筛选没有任何记录时才显示空状态，不要出现“请选择一条记录”的中间态，也不要在详情里放“返回记录”按钮。
 4. **详情页**：固定配方 `UI.pageShell(UI.pageHeader + [UI.tabs] + [UI.progressCard] + UI.section… + UI.actionBar)`，详见第 7 节。
 5. **创建流程**：统一使用右侧全高抽屉 `.config`（结构：`.drawer-head` / `.drawer-body` / `.drawer-footer`）。分步标题用 `UI.formSectionTitle`，字段用 `UI.field` + `UI.input` / `UI.select`，开关用 `UI.switchRow`，提交按钮用 `.submit`。
-6. **弹窗**：复制 `static/index.html` 中 `.modal` 结构（`.modal-backdrop`、`.modal-panel`、`.modal-head`、`.modal-body`），通过 `openModal` / `closeModal` 打开关闭，获得焦点循环与 Esc 关闭。
+6. **弹窗**：复制 `static/index.html` 中 `.modal` 结构（`.modal-backdrop`、`.modal-panel`、`.modal-head`、`.modal-body`），通过 `openModal` / `closeModal` 打开关闭，获得焦点循环与 Esc（退出键）关闭。需要确认操作的弹窗在滚动正文之后放 `.modal-footer`（固定底栏），主操作靠右，取消在前；内容变长不应把提交按钮推走。
 7. **交互**：所有点击用 `data-click-action`（组件函数的 `action` 参数），并在 `static/actions.js` 的 `UI_ACTIONS` 注册处理函数。禁止行内事件。
 8. **样式**：确实需要新组件时，在 `static/app.css` 对应分区添加，只引用变量；把生成函数加入 `static/ui-kit.js`，在本文档第 6 节登记，并在组件画廊加示例。
 9. **验证**：运行第 11 节的命令，检查浅色、深色和 1440 / 980 / 390 像素宽度截图。
@@ -64,7 +64,7 @@
 |---|---|---|
 | 视口 `@media (max-width: 1100px)` | 1100 | 记录栏变窄，顶栏操作只保留图标（文字保留给读屏） |
 | 视口 `@media (max-width: 980px)` | 980 | 导航栏移到顶部横排；登录页隐藏品牌侧栏 |
-| 视口 `@media (max-width: 640px)` | 640 | 单列：记录栏限高在上，详情在下；抽屉满屏；表单单列 |
+| 视口 `@media (max-width: 640px)` | 640 | 单列：六模块入口完整一行，诊断/存储/主题进入顶栏；记录栏限高 30dvh（动态视口高度的 30%）并可收起；抽屉满屏；表单单列 |
 | 容器 `@container detail (max-width: 820px)` | 820 | 详情内双栏变单栏，页头状态块换到下方 |
 | 容器 `@container detail (max-width: 560px)` | 560 | 卡片内边距降为 `--space-4`，标题缩小，报告标签自动换行 |
 
@@ -84,7 +84,7 @@
 | `--color-border-strong` | #ccc8bc | #3c3c45 | 悬停描边、虚线提示框 |
 | `--color-text` | #16161a | #ededf0 | 标题与主要文字 |
 | `--color-text-secondary` | #4b4b53 | #b8b8c0 | 正文、表格内容 |
-| `--color-muted` | #7b7a82 | #8c8c96 | 说明、元信息、占位 |
+| `--color-muted` | #6e6d75 | #8c8c96 | 说明、元信息、占位 |
 | `--color-accent` | #5b47f5 | #9d8cff | 唯一强调色：选中、进度、焦点、主数据线 |
 | `--color-accent-hover` | #4632e0 | #b8abff | 强调色悬停 |
 | `--color-accent-soft` | #efecff | #221e3b | 选中底色、强调徽章底色 |
@@ -155,6 +155,7 @@
 `--space-1` 4px · `--space-2` 8px · `--space-3` 12px · `--space-4` 16px · `--space-5` 20px · `--space-6` 24px · `--space-7` 28px · `--space-8` 32px · `--space-10` 40px · `--space-12` 48px。
 
 - 同级卡片之间 `--section-gap`（16，窄容器 12）；卡片内边距 `--card-inset`（24，窄容器 16）。
+- 卡片正文中相邻内容块之间 `--content-gap`（16）；包含子区块的正文使用 `--content-group-gap`（24）。由内容容器统一管理，指标、表格、提示等子组件不另加外边距。
 - 标签与控件 8；字段之间 18；小节标题上方 28、下方 14。
 - 紧凑控件内允许 2px 半步（例如 10px、14px），不得出现 5px、7px 这类零散值。
 
@@ -197,7 +198,7 @@
 
 ### 4.6 布局尺寸与兼容别名
 
-`--rail-w`、`--records-w`、`--top-h`、`--content-max`、`--drawer-w`、`--card-inset`、`--section-gap`。在断点内只允许覆盖 `--records-w`、`--top-h`、`--rail-w`。
+`--rail-w`、`--records-w`、`--top-h`、`--content-max`、`--drawer-w`、`--card-inset`、`--section-gap`。方法说明列最小宽度 `--method-column-min`（320px），不足时按可用宽度显示单列。在断点内只允许覆盖 `--records-w`、`--top-h`、`--rail-w`。
 
 `--card-shadow`、`--float-shadow`、`--control-shadow`、`--ring`、`--line`、`--text`、`--sub`、`--muted`、`--blue` 等是旧代码的兼容别名，新代码不要使用。
 
@@ -225,7 +226,7 @@
 
 - **`UI.button(label, {variant, action, args, iconName, disabled, title})`** → `.btn` / `.btn.primary` / `.btn.danger`。`primary` 每个区域最多一个；危险操作用 `danger` 并在处理函数里 `confirm()` 说明后果。
 - **`UI.textButton(label, {action, args})`** → `.text-btn`：次要的内联操作（“手动指定模型”“查看详情”）。
-- **`UI.actionBar(buttonsHtml)`** → `.report-section.report-footer-actions`：详情页底部操作区，停止、下载、离线对照、删除放在这里，顺序：进行中操作（停止）→ 下载/导出 → 离线对照 → 删除。已结束测试的“再来一次”统一放在页头，不在底部重复。
+- **`UI.actionBar(buttonsHtml)`** → `.report-section.report-footer-actions`：详情页底部操作区，顺序：进行中操作（停止）→ 下载/导出 → 离线对照 → 删除。持续发请求的长流程可把唯一的停止操作提前到页头 `actionsHtml`（操作结构），避免被指标和曲线推到长页末尾；页头与底部不重复。已结束测试的“再来一次”统一放在页头，不在底部重复。
 
 已结束测试的复测入口统一命名为“再来一次”，放在详情页头右侧，沿用原记录配置创建独立任务。每条详情只显示一个复测按钮；窄屏按既有容器断点将操作与状态折到标题下方。直接复用可读取的已保存密钥；缺失凭据时复用 `.modal` 弹窗与 `UI.passwordInput` 补填，关闭后清空。提交期间显示忙碌状态并阻止重复点击；需要风险确认时仅使用本次用户确认。
 - 记录栏新建按钮 `.new-btn`、抽屉提交按钮 `.submit`、表单右侧小按钮 `.icon-btn`、密钥框按钮 `.secret-action` / `.secret-toggle` 由页面骨架提供。
@@ -237,29 +238,37 @@
 - **`UI.badge(label, {hint})`** → `.evidence-badge`（强调）/ `.table-hint`（中性）：区块标题右侧的证据等级或计数。
 - **`UI.notice(text, {tone, title})`** → `.notice` / `.notice.good|caution|risk`：整条提示；`danger` 自动 `role="alert"`。
 - **`UI.signal({title, detail, tone})`**、**`UI.signalList(items)`** → `.signal-list` / `.signal`：发现、异常线索列表。
-- 页面级：加载 `.loading-state`，空状态 `.empty`（插画 + 标题 + 三步引导），全局提示 `toast(text)`。
+- 页面级：加载 `.loading-state`，空状态 `.empty`（插画 + 标题 + 三步引导），全局提示 `toast(text)`。创建抽屉打开时，操作反馈复用 `UI.hint` 放入 `.drawer-footer` 文档流，已展示的同文错误不重复；禁止浮层提示遮住主操作。旧全局提示在抽屉打开期间隐藏。
+
+按钮在桌面最小高度 38 像素，640 像素以下主要按钮与关闭按钮最小 44 像素；窄屏输入字号使用 16 像素，避免移动浏览器聚焦后自动放大。浅色次要文字在画布和卡片表面保持至少 4.5:1 对比度。
 
 ### 6.4 记录栏
 
-- **`UI.recordItem({id, title, state, stateLabel, typeLabel, compare, meta, progress, trailing, selected, action})`** → `.task`：名称单行省略；元信息用“·”分隔；进度 0–100；`selected` 显示左侧强调条。
+- **`UI.recordItem({id, title, state, stateLabel, typeLabel, compare, meta, progress, trailing, selected, action})`** → `.task`：名称单行省略；元信息用“·”分隔；进度 0–100；静态连接记录传 `progress: null`（无进度），不显示进度轨道；`selected`（选中）显示左侧强调条并设置无障碍当前项，悬停名称可读完整标题。
 - **`UI.recordEmpty(title, hint)`** → `.task-empty`。
 - 分段筛选 `.workspace-subnav` > `.subnav-item`（计数放在 `<em>` 中），汇总行 `.record-summary`。
 
 ### 6.5 详情页结构
 
 - **`UI.pageShell(childrenHtml)`** → `.detail-layout.report-shell`：详情页根容器。
-- **`UI.pageHeader({kicker, title, description, meta, statusLabel, statusNote, statusTone, actionsHtml})`** → `.report-head`：眉标（模块 · 类型）、标题、一句话说明、元信息胶囊；右侧放结论状态块。`actionsHtml`（操作结构）非空时，以 `.hero-actions` 同时显示操作按钮和状态块，操作排在前面。已结束测试在这里放唯一的“再来一次”按钮。
+- **`UI.pageHeader({kicker, title, description, meta, statusLabel, statusNote, statusTone, actionsHtml})`** → `.report-head`：眉标（模块 · 类型）、标题、一句话说明、元信息胶囊；右侧放结论状态块。`actionsHtml`（操作结构）非空时，以 `.hero-actions` 同时显示操作按钮和状态块，操作排在前面，按钮顶部对齐、不被状态卡拉高。长流程进行中可放唯一的“停发并收尾”；收尾时移除停止操作并明确当前状态。已结束测试在这里放唯一的“再来一次”按钮。
 - **`UI.tabs({label, items, active, action, ownerId})`** → `.report-tabs` / `.report-tab`：分段标签，激活项为墨色；方向键、Home、End 已全局支持。第一个标签永远是结论，并且是打开详情时的默认标签：对照类记录（压测对照、资源对照、路由对照、指纹参考对照）命名为“对照结论”，单对象记录命名为“结论”；其后才是各侧/各组/证据标签。
-- **`UI.section({title, description, badgeHtml, bodyHtml, className})`** → `.report-section`：内容卡片，标题 + 一句话说明 + 内容。
+- **`UI.stack(childrenHtml)`（纵向内容组）** → `.report-stack`：统一安排相邻指标、表格、说明、提示与折叠区的间距；自由组合多个内容块时使用。不要靠空行、换行标签或特定组件组合的外边距补间距。
+- **`UI.section({title, description, badgeHtml, bodyHtml, className})`** → `.report-section`：内容卡片，标题 + 一句话说明 + 内容。正文自动包含纵向内容组，传入多个组件即可，不必重复包裹。
+- **`UI.disclosure({title, bodyHtml, id, open, section})`（折叠区）**：低频口径与执行记录默认收起；独立区块传 `section: true`（独立卡片），区块内使用默认样式。正文自动包含纵向内容组；正文内的子区块用标题与分隔线分组，避免多重卡片边框。稳定的 `id`（标识）用于刷新后恢复展开状态。已结束任务先展示结果与异常，再折叠执行进度；指标卡只留数值、单位和一句口径，完整方法放折叠区。影响当前判断的异常与结论边界必须保持可见。
 - **`UI.progressCard({kicker, value, summary, note})`** → `.report-progress-card`：带 `role="progressbar"` 的进度卡；放在区块内时自动去掉卡片外观。
 
 ### 6.6 数据展示
 
-- **`UI.metric({label, value, unit, note, primary})`**、**`UI.metrics(items)`** → `.report-metrics` / `.report-metric`：自动换列的指标网格；`primary` 使用深色核心指标样式，每个网格最多一个。空值显示“—”。
-- **`UI.methodCards(items)`** → `.method-grid` / `.method-card`：口径、方法、配置说明。
+- **`UI.metric({label, value, unit, note, primary})`**、**`UI.metrics(items)`** → `.report-metrics` / `.report-metric`：自动换列的指标网格；四项或八项指标在详情中排为四列，容器 820 像素以下两列，560 像素以下单列，避免末行悬空。`primary` 使用深色核心指标样式，每个网格最多一个。空值显示“—”。
+- **`UI.methodCards(items)`** → `.method-grid` / `.method-card`：口径、方法、配置说明。正文最多两列，窄容器自动单列；卡片按自身内容高度呈现，不为了最长的一张撑出大块空白。指标数值仍使用指标网格，不能为了节省高度把长说明排成四列。
 - **`UI.steps(items)`** → `.next-step-grid` / `.next-step`：编号的下一步动作。
 - **`UI.limitations(items)`** → `.report-limitations`：结论边界与不能推出的内容（虚线框）。
-- **`UI.table({columns, rowsHtml, empty})`** → `.table-wrap.report-wrap` 内的表格：表头吸顶，数字列等宽；单元格结构需自行转义。窄屏需要卡片化的对照表额外加 `comparison-result-table` 类并由脚本补 `data-label`。
+- **`UI.formatTimestamp(value, missing)`**：统一将已知时刻转换为新加坡时间（UTC+08:00），输出完整日期、时分秒、毫秒和明确时区；固定 +08:00，不跟随浏览器或系统时区。带旧时区的记录转换实际时刻，不能只替换后缀；无时区的旧值明确标记，不推测本地时区。
+- **`UI.formatDurationMs(value)`**：耗时统一保留毫秒，明确区分 0 与未记录。
+- **`UI.timeRecords(record, {request, live, key, title})`**：复用高级折叠与方法卡展示任务 / 请求时间轴；紧凑摘要、展开后查看全部时间，`key` 保持轮询后的展开状态；只显示已记录事件，禁止从开始加耗时伪造结束时间。多次真实发送时，明确标注最终尝试并逐次展示时间、耗时和状态；一次发送不重复展示。
+- 时间记录使用 `.time-records`（时间折叠区），直接放在详情中不叠加外边距。表格中的 `.request-time-records`（请求时间折叠区）标题保持单行，展开内容保留可读最小宽度，允许表格容器横向滚动，不能把日期挤成竖字。大段原文与多次尝试证据优先放详情弹窗。
+- **`UI.table({columns, rowsHtml, empty})`** → `.table-wrap.report-wrap` 内的表格：表头吸顶，数字列等宽；单元格结构需自行转义。窄屏需要卡片化的对照表额外加 `comparison-result-table` 类并由脚本补 `data-label`。这类摘要表在窄屏随页面完整展开，不保留桌面表格的固定高度与内部纵向滚动；大量逐条记录仍使用可滚动表格与分页。
 - 其他既有组件：结论大卡 `.report-decision-hero`（`hold` / `review` / `observe` 顶部色条）、事实卡 `.fact-grid` / `.fact-card`、评分卡 `.quality-score-card`、结论横幅 `.conclusion-banner`、单任务核心卡 `.success-card`（配 `.success-ring`）、趋势图 `.chart-wrap`。
 
 ### 6.7 表单
@@ -275,13 +284,16 @@
 
 常用连接的创建、编辑和管理复用 `.config.fp-drawer` / `.drawer-backdrop.fp-backdrop` 的模块抽屉层级，可叠在测试抽屉上。打开时禁止下层表单交互，关闭时恢复原输入和焦点；已保存密钥只允许主动点击眼睛取回，取回值不随普通编辑再次提交。
 
+网关创建遵循“连接与模型 → 请求内容 → 压力计划／实验组 → 可选记录”的顺序。快速模板只更改明确标注的压力参数，不覆盖独立选择；不同压力模式分别保留草稿。刷新远端选项保留仍有效的选择，不能默选第一项或把手动值静默替换为缺省值；列表不可用时提供明确的恢复入口。隐藏字段不参与当前表单校验。
+
 ## 7. 页面配方示例
 
 ```js
 // 详情页：新模块 renderXxxDetail(run)
 host.innerHTML = UI.pageShell([
   UI.pageHeader({ kicker: '缓存评测 · 单次运行', title: run.name, description: '同一清单重复请求，观察缓存命中与首字耗时。',
-    meta: [statusLabel(run.status), `${run.total} 条请求`], statusLabel: '可复测', statusNote: '证据有限', statusTone: 'warning' }),
+    meta: [statusLabel(run.status), `${run.total} 条请求`], statusLabel: '运行中', statusNote: '停止后等待已发送请求结束', statusTone: 'accent',
+    actionsHtml: UI.button('停发并收尾', { action: 'stopCache', args: [run.id], iconName: 'stop' }) }),
   UI.tabs({ label: '缓存评测详情', items: [['report', '结论'], ['raw', '逐条结果']], active: tab, action: 'setCacheTab', ownerId: run.id }),
   UI.progressCard({ kicker: '执行进度', value: run.pct, summary: `${run.done} / ${run.total} 条` }),
   UI.section({ title: '关键指标', description: '只描述客户端观测窗口。', badgeHtml: UI.badge('有限证据'),
@@ -344,6 +356,7 @@ make e2e               # 真实页面冒烟（需要 Playwright）
 - 用浏览器打开 `docs/design-system/gallery.html`，切换浅色/深色，对照新组件。
 - 新页面截图验收：1440、980、390 像素宽度；浅色与深色；空状态、加载、运行中、完成、失败各一次。
 - 确认没有横向滚动，同级卡片左右边缘对齐，每页只有一个核心指标、一个主要操作。
+- 报告默认态、各折叠区展开态都要检查完整滚动内容；除同一表格行或同排网格单元外，相邻内容块不得贴边或重叠。间距回归应测量实际元素边界，不能仅凭无溢出判定布局合格。
 - 更新 `CHANGELOG.md`。
 
 ## 12. 演进设计系统

@@ -7,6 +7,8 @@ No networking or filesystem writes occur in this module.
 """
 from __future__ import annotations
 
+from time_record import task_timing
+
 import copy
 import hashlib
 import json
@@ -23,8 +25,14 @@ SOURCE_URL = "https://github.com/ToseaAI/llm-fingerprint-detector"
 SOURCE_COMMIT = "94dc44686a553595581b6d06405c17f070df9b8d"
 PAPER_URL = "https://arxiv.org/abs/2607.10252"
 METHOD_VERSION = "workbench-one-word/1"
+REASONING_METHOD_VERSION = "workbench-reasoning-one-word/1"
+SUPPORTED_METHOD_VERSIONS = frozenset({METHOD_VERSION, REASONING_METHOD_VERSION})
 NORMALIZER_VERSION = "workbench-normalizer/2"
 REFERENCE_MAX_AGE_DAYS = 30
+DEFAULT_CONCURRENCY = 20
+DEFAULT_RPM = 100
+MAX_CONCURRENCY = 20
+MAX_RPM = 600000
 USAGE_KEYS = ("prompt_tokens", "completion_tokens", "reasoning_tokens", "cached_tokens", "reported_cost")
 USAGE_LABELS = {"prompt_tokens": "输入词元", "completion_tokens": "输出词元", "reasoning_tokens": "推理词元", "cached_tokens": "缓存词元", "reported_cost": "费用"}
 SYSTEM_PROMPTS = {
@@ -74,6 +82,9 @@ ADAPTERS = [
     {"id": "deepseek", "label": "DeepSeek（深度求索）：关闭思考", "extra_body": {"thinking": {"type": "disabled"}}, "token_field": "max_tokens"},
     {"id": "zhipu", "label": "智谱接口：关闭思考", "extra_body": {"thinking": {"type": "disabled"}}, "token_field": "max_tokens"},
     {"id": "openai", "label": "OpenAI（开放人工智能）兼容接口：不使用推理", "extra_body": {"reasoning_effort": "none"}, "token_field": "max_completion_tokens"},
+    {"id": "openai_reasoning", "label": "OpenAI（开放人工智能）兼容接口：保留思考", "extra_body": {"reasoning_effort": "low"}, "token_field": "max_completion_tokens", "max_tokens": 4096, "temperature": None, "top_p": None, "method_version": REASONING_METHOD_VERSION},
+    {"id": "deepseek_reasoning", "label": "DeepSeek（深度求索）：保留思考", "extra_body": {"thinking": {"type": "enabled"}, "reasoning_effort": "low"}, "token_field": "max_tokens", "max_tokens": 4096, "temperature": None, "top_p": None, "method_version": REASONING_METHOD_VERSION},
+    {"id": "zhipu_reasoning", "label": "智谱 GLM（通用语言模型）：保留思考", "extra_body": {"thinking": {"type": "enabled"}, "reasoning_effort": "low"}, "token_field": "max_tokens", "max_tokens": 4096, "temperature": None, "top_p": None, "method_version": REASONING_METHOD_VERSION},
 ]
 
 
@@ -108,13 +119,14 @@ def cell_label(cell_id):
 
 def catalog():
     return {
-        "method_version": METHOD_VERSION, "source_url": SOURCE_URL, "source_commit": SOURCE_COMMIT,
+        "method_version": METHOD_VERSION, "supported_method_versions": sorted(SUPPORTED_METHOD_VERSIONS), "source_url": SOURCE_URL, "source_commit": SOURCE_COMMIT,
         "paper_url": PAPER_URL, "license": "MIT（宽松开源许可证）", "presets": copy.deepcopy(PRESETS),
-        "adapters": copy.deepcopy(ADAPTERS), "reference_max_age_days": REFERENCE_MAX_AGE_DAYS,
-        "limits": {"min_samples_per_cell": 10, "max_samples_per_cell": 100, "min_concurrency": 1, "max_concurrency": 8, "min_timeout_seconds": 5, "max_timeout_seconds": 120, "max_tokens": 16, "temperature": 1.0},
+        "adapters": [{"max_tokens": 16, "temperature": 1, "top_p": 1, "method_version": METHOD_VERSION, **copy.deepcopy(adapter)} for adapter in ADAPTERS], "reference_max_age_days": REFERENCE_MAX_AGE_DAYS,
+        "limits": {"min_samples_per_cell": 10, "max_samples_per_cell": 100, "min_concurrency": 1, "max_concurrency": MAX_CONCURRENCY, "default_concurrency": DEFAULT_CONCURRENCY, "min_rpm": 1, "max_rpm": MAX_RPM, "default_rpm": DEFAULT_RPM, "min_timeout_seconds": 5, "max_timeout_seconds": 120, "max_tokens": 16, "temperature": 1.0},
         "notes": [
             "每次仅发送一条固定系统提示和一条探针问题；不带历史、记忆或工具。",
-            "温度固定为 1，输出预算固定为 16；每次随机抽改写并打乱队列，不自动重试或改变推理设置。",
+            "直接回答协议固定温度 1、输出上限 16；保留思考协议不传温度与核采样参数，推理与最终正文合计上限 4096。不会自动切换协议、重试或增大上限。",
+            "保留思考协议有独立版本，只采集最终正文，可建立独立参考并查看探索性距离；不能与直接回答参考混比，也不套用其一致性判定阈值。",
             "0.25／0.35 为借鉴上游的启发式界线，未经本渠道校准；分布差异不能证明模型身份或供应商造假。",
             "分半自检异常只是复测线索；两半同分布仍可能包含稳定比例的混合后端。",
             "前缀计算缓存与完整响应重放不同；缓存用量仅用于延迟诊断，重复答案本身不能证明缓存。",
@@ -147,12 +159,13 @@ def make_protocol(config):
     if preset is None or adapter is None:
         raise ValueError("采集方案或推理协议不受支持")
     protocol = {
-        "version": METHOD_VERSION, "battery_hash": BATTERY_HASH, "normalizer_version": NORMALIZER_VERSION,
+        "version": adapter.get("method_version", METHOD_VERSION), "battery_hash": BATTERY_HASH, "normalizer_version": NORMALIZER_VERSION,
         "cells": CELL_PRIORITY_ORDER[:preset["cells"]],
         "samples_per_cell": _integer(config.get("samples_per_cell", preset["samples_per_cell"]), 10, 100, "每格样本数"),
-        "concurrency": _integer(config.get("concurrency", 4), 1, 8, "并发上限"),
+        "concurrency": _integer(config.get("concurrency", DEFAULT_CONCURRENCY), 1, MAX_CONCURRENCY, "并发上限"),
+        "rpm": _integer(config.get("rpm", DEFAULT_RPM), 1, MAX_RPM, "每分钟请求数"),
         "timeout_seconds": _integer(config.get("timeout_seconds", 30), 5, 120, "请求超时"),
-        "temperature": 1, "top_p": 1, "max_tokens": 16, "max_retries": 0, "stream": False,
+        "temperature": adapter.get("temperature", 1), "top_p": adapter.get("top_p", 1), "max_tokens": adapter.get("max_tokens", 16), "max_retries": 0, "stream": False,
         "adapter": adapter["id"], "extra_body": copy.deepcopy(adapter["extra_body"]), "token_field": adapter["token_field"],
         "system_prompts": copy.deepcopy(SYSTEM_PROMPTS), "shuffle_version": "python-mt19937/1",
     }
@@ -372,7 +385,9 @@ def build_artifact(samples, protocol, endpoint, *, collected_at, seed, complete=
     if duplicate_ids:
         warnings.append("存在重复响应标识；请排查响应重放或供应商标识策略，不能仅据此认定缓存。")
     if count and all(x.get("truncated") and not x.get("raw", "").strip() and x.get("reasoning_observed") for x in samples):
-        warnings.append("所有已返回回答均为空且在推理阶段耗尽输出预算；请选择关闭思考的接口适配后新建采集，不要将本次结果用于参考对照。")
+        warnings.append("所有已返回回答均为空且在推理阶段耗尽输出预算；请核对所选适配与固定输出上限，不要将本次结果用于参考对照。")
+    if protocol.get("version") == REASONING_METHOD_VERSION:
+        warnings.append("本次为保留思考的独立协议；仅最终正文进入分布，距离仅供探索，不沿用直接回答协议的一致性阈值。")
     if diagnostics["reasoning_observed"]:
         warnings.append("观测到推理内容或推理用量，与直接回答指纹不宜混比。")
     if diagnostics["token_budget_exceeded_count"]:
@@ -384,7 +399,7 @@ def build_artifact(samples, protocol, endpoint, *, collected_at, seed, complete=
         "format": "workbench-fingerprint", "format_version": 1, "protocol": copy.deepcopy(protocol),
         "endpoint": {k: endpoint.get(k) for k in ("url", "model")}, "collected_at": collected_at,
         "complete": bool(complete), "seed": seed, "cells": cells, "diagnostics": diagnostics,
-        "source": {"url": SOURCE_URL, "commit": SOURCE_COMMIT, "method_version": METHOD_VERSION},
+        "source": {"url": SOURCE_URL, "commit": SOURCE_COMMIT, "method_version": protocol["version"]},
     }
 
 
@@ -410,7 +425,7 @@ def _date(value):
 
 
 def _protocol_valid(protocol):
-    if not isinstance(protocol, dict) or protocol.get("version") != METHOD_VERSION:
+    if not isinstance(protocol, dict) or protocol.get("version") not in SUPPORTED_METHOD_VERSIONS:
         return False
     expected = {k: v for k, v in protocol.items() if k != "id"}
     try:
@@ -424,9 +439,17 @@ def _protocol_valid(protocol):
     if preset is None:
         return False
     try:
-        supported = make_protocol({"preset": preset["id"], **{k: protocol.get(k) for k in ("samples_per_cell", "concurrency", "timeout_seconds", "adapter")}})
+        supported = make_protocol({"preset": preset["id"], **{k: protocol.get(k) for k in ("samples_per_cell", "concurrency", "timeout_seconds", "adapter")},
+                                   **({"rpm": protocol["rpm"]} if "rpm" in protocol else {})})
     except ValueError:
         return False
+    if "rpm" not in protocol:
+        # Historical manifests used concurrency-only scheduling. Preserve their
+        # exact identity and execution semantics; never silently add a rate.
+        if supported["concurrency"] > 8 or protocol["version"] != METHOD_VERSION:
+            return False
+        del supported["rpm"]
+        supported["id"] = _digest({k: v for k, v in supported.items() if k != "id"})
     return protocol == supported
 
 
@@ -496,6 +519,8 @@ def compare_artifacts(candidate, reference, *, now=None):
         reasons.append("缺少可信采集日期，无法核实参考时效。")
     if not compatible:
         reasons.insert(0, "采集协议不兼容或无法核实；距离仅供探索，不形成一致性判定。")
+    if any(isinstance(p, dict) and p.get("version") == REASONING_METHOD_VERSION for p in (pa, pb)):
+        reasons.append("保留思考协议的判定阈值尚未校准；仅展示探索性距离，不形成一致性判定。")
     verdict = "incomparable" if reasons else None
     needed = max(4, math.ceil(len(expected) * .8))
     if len(entries) < needed:
@@ -579,7 +604,7 @@ def validate_import(data):
         raise ValueError("缺少采集协议")
     if not isinstance(protocol.get("version"), str) or not protocol["version"]:
         raise ValueError("采集协议版本必须为非空字符串")
-    if protocol.get("version") == METHOD_VERSION and not _protocol_valid(protocol):
+    if protocol.get("version") in SUPPORTED_METHOD_VERSIONS and not _protocol_valid(protocol):
         raise ValueError("工作台协议摘要不一致或字段被修改")
     if _protocol_valid(protocol):
         if set(cells) != set(protocol["cells"]):
@@ -615,6 +640,7 @@ def validate_import(data):
     return {"format": "workbench-fingerprint", "format_version": 1, "protocol": protocol,
             "endpoint": {"url": url, "model": str(endpoint.get("model") or "")[:200]},
             "collected_at": data["collected_at"], "complete": data["complete"], "seed": seed,
+            **({"timing": task_timing(**data["timing"])} if isinstance(data.get("timing"), dict) else {}),
             "cells": clean_cells, "diagnostics": diagnostics,
             "source": {"url": SOURCE_URL, "commit": str(source.get("commit") or "")[:64],
                        "method_version": str(source.get("method_version") or "")[:160],

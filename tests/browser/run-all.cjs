@@ -2,7 +2,7 @@
 const fs=require('node:fs'),path=require('node:path'),{spawn}=require('node:child_process');
 const {createBrowserRun,browserSuiteOutput}=require('./artifacts.cjs');
 const run=createBrowserRun();
-const scripts=['smoke','routing_create','routing_live','connections','repeat','layout','fingerprint','auth_focus','workflow','quality_v2','modal_layout'];
+const scripts=['smoke','timing','tpm','tpm_connections_create','routing_create','routing_live','connections','repeat','layout','report_spacing','fingerprint','fingerprint_create','auth_focus','workflow','quality_v2','quality_create','modal_layout'];
 const results=[];
 function writeResults(){fs.writeFileSync(path.join(run.runRoot,'run-result.json'),JSON.stringify({root:run.runRoot,suites:results},null,2));}
 async function runSuite(name){

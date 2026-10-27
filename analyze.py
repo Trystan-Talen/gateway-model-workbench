@@ -3,6 +3,7 @@
 """分析 JSONL 中客户端可观测的请求结果。"""
 import argparse
 import json
+import math
 from collections import Counter, defaultdict
 
 
@@ -29,15 +30,45 @@ def category(record):
 
 
 def cache_stats(records):
-    """按平台自身口径统计缓存命中率：usage.cached_tokens > 0 即命中。
+    """同时统计 Token（词元）命中率和请求命中率。
 
-    分母只算「真的返回了 usage 且带 cached_tokens 字段」的请求。没有 usage 的
-    请求必须排除，而不是当成未命中——否则会把「网关不回 usage」误读成缓存变差。
+    请求命中率的主口径为 cached_tokens > 0 的请求数 ÷ 总请求数；Token（词元）
+    命中率只在同时有 prompt_tokens 和 cached_tokens 时计算。没有 cached_tokens
+    的请求计入请求命中率分母，并单独保留在 no_usage 计数中。
     """
-    eligible = [r for r in records if r.get("cached_tokens") is not None]
-    hits = sum(1 for r in eligible if (r.get("cached_tokens") or 0) > 0)
+    def cached_number(record):
+        value = record.get("cached_tokens")
+        if value is None or isinstance(value, bool):
+            return None
+        try:
+            value = float(value)
+        except (TypeError, ValueError):
+            return None
+        return value if math.isfinite(value) else None
+
+    def prompt_number(record):
+        value = record.get("prompt_tokens")
+        if value is None or isinstance(value, bool):
+            return None
+        try:
+            value = float(value)
+        except (TypeError, ValueError):
+            return None
+        return value if math.isfinite(value) and value > 0 else None
+
+    eligible_values = [cached_number(r) for r in records]
+    eligible = [value for value in eligible_values if value is not None]
+    hits = sum(value > 0 for value in eligible)
+    token_pairs = [(cached, prompt_number(record)) for record, cached in zip(records, eligible_values)
+                   if cached is not None and cached >= 0 and prompt_number(record) is not None]
+    prompt_tokens = sum(prompt for _, prompt in token_pairs)
+    cached_tokens = sum(cached for cached, _ in token_pairs)
     return {"eligible": len(eligible), "hits": hits,
-            "total": len(records), "no_usage": len(records) - len(eligible)}
+            "total": len(records), "no_usage": len(records) - len(eligible),
+            "token_eligible": len(token_pairs), "prompt_tokens": prompt_tokens,
+            "cached_tokens": cached_tokens,
+            "token_rate_pct": cached_tokens * 100 / prompt_tokens if prompt_tokens else None,
+            "request_rate_pct": hits * 100 / len(records) if records else None}
 
 
 def summarize(records, title):
@@ -50,13 +81,16 @@ def summarize(records, title):
     print(f"TTFT p50/p95（首字耗时）：{percentile(ttft, .5) or '—'} ms / {percentile(ttft, .95) or '—'} ms")
     print(f"总耗时 p50/p95：{percentile(total, .5) or '—'} ms / {percentile(total, .95) or '—'} ms")
     cache = cache_stats(records)
-    if cache["eligible"]:
-        print(f"缓存命中率：{pct(cache['hits'], cache['eligible'])}"
-              f"（{cache['hits']}/{cache['eligible']}，口径：usage.cached_tokens>0）")
+    if cache["token_eligible"]:
+        print(f"缓存 Token（词元）命中率：{cache['token_rate_pct']:.2f}%"
+              f"（缓存 {cache['cached_tokens']:.0f} / 输入 {cache['prompt_tokens']:.0f} Token（词元））")
     else:
-        print("缓存命中率：不可得（本批没有请求返回 usage 统计）")
+        print("缓存 Token（词元）命中率：不可得（本批没有请求同时返回输入与缓存用量）")
+    if cache["total"]:
+        print(f"缓存命中请求率：{pct(cache['hits'], cache['total'])}"
+              f"（{cache['hits']}/{cache['total']}，口径：命中请求数 / 总请求数）")
     if cache["no_usage"]:
-        print(f"  其中 {cache['no_usage']}/{n} 条无 usage 数据，已从命中率分母中排除")
+        print(f"  其中 {cache['no_usage']}/{n} 条无 usage 数据，按请求命中率计为未命中")
     print("结果分布：")
     for name, count in Counter(category(r) for r in records).most_common():
         print(f"  {name:<18} {count:>7}  {pct(count, n)}")

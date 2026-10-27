@@ -14,7 +14,7 @@ from unittest.mock import patch
 import httpx
 
 import fingerprint_service as service
-from fingerprint_protocol import make_plan
+from fingerprint_protocol import make_plan, make_protocol, _digest
 
 
 class Limiter:
@@ -91,7 +91,7 @@ class FingerprintServiceTests(unittest.TestCase):
 
     def config(self, **overrides):
         result = {"name": "合成通道自检", "mode": "selfcheck", "preset": "quick", "samples_per_cell": 10,
-                  "concurrency": 2, "timeout_seconds": 5, "adapter": "standard", "risk_acknowledged": True,
+                  "concurrency": 2, "rpm": 600000, "timeout_seconds": 5, "adapter": "standard", "risk_acknowledged": True,
                   "endpoint": {"url": "https://synthetic.invalid/v1", "model": "synthetic-model", "api_key": "synthetic-test-secret"}}
         result.update(overrides)
         return result
@@ -110,6 +110,168 @@ class FingerprintServiceTests(unittest.TestCase):
 
     def collect(self, manager, **overrides):
         return self.complete(manager, manager.create(self.config(**overrides)))
+
+    def test_active_elapsed_uses_runtime_clock_then_freezes_at_end(self):
+        async def slow(request):
+            await asyncio.sleep(1)
+            return success(request)
+        limiter = Limiter(blocked=True)
+        manager = self.manager(slow, limiter=limiter)
+        run = manager.create(self.config())
+        self.assertIsNone(run["timing"]["elapsed_ms"])
+        with manager._condition:
+            limiter.blocked = False
+            manager._condition.notify_all()
+        self.wait(lambda: self.requests and manager.get(run["id"])["status"] == "running")
+        initial = manager.get(run["id"])["timing"]["elapsed_ms"]
+        self.assertGreater(initial, 0)
+        time.sleep(.01)
+        self.assertGreater(manager.get(run["id"])["timing"]["elapsed_ms"], initial)
+        self.assertIsNone(manager.get(run["id"])["timing"]["ended_at"])
+        manager.stop(run["id"])
+        final = self.complete(manager, run)["timing"]
+        time.sleep(.01)
+        self.assertEqual(manager.get(run["id"])["timing"], final)
+        self.assertGreaterEqual(final["elapsed_ms"], initial)
+        self.assertIsNotNone(final["ended_at"])
+
+    def test_task_and_sample_timing_are_preserved_without_changing_protocol(self):
+        manager = self.manager()
+        run = self.collect(manager)
+        timing = run["timing"]
+        self.assertRegex(timing["created_at"], r"^\d{4}-\d\d-\d\dT.*\.\d{3}\+08:00$")
+        self.assertLessEqual(timing["created_at"], timing["started_at"])
+        self.assertLessEqual(timing["dispatch_ended_at"], timing["ended_at"])
+        self.assertGreater(timing["elapsed_ms"], 0)
+        self.assertGreaterEqual(timing["queue_ms"], 0)
+        self.assertGreaterEqual(timing["drain_ms"], 0)
+        rows = manager.samples(run["id"])["samples"]
+        self.assertEqual(len(rows), 40)
+        for row in rows:
+            measured = row["timing"]
+            self.assertEqual(measured["source"], "recorded")
+            self.assertLessEqual(measured["enqueued_at"], measured["started_at"])
+            self.assertLessEqual(measured["started_at"], measured["ended_at"])
+            self.assertEqual(measured["total_ms"], row["latency_ms"])
+            self.assertIsNone(measured["first_token_at"])
+            self.assertIsNone(measured["ttft_ms"])
+            self.assertIsNone(measured["scheduled_at"])
+        exported = manager.export(run["id"])
+        self.assertEqual(exported["timing"], timing)
+        self.assertNotIn("timing", exported["protocol"])
+        imported = service.validate_import(exported)
+        self.assertEqual(imported["timing"], timing)
+        self.assertEqual(imported["protocol"], exported["protocol"])
+        manager.close()
+        restored = self.manager()
+        self.assertEqual(restored.get(run["id"])["timing"], timing)
+        self.assertEqual(restored.samples(run["id"])["samples"], rows)
+
+    def test_legacy_sample_mapping_keeps_unobserved_timestamps_unknown(self):
+        manager = self.manager(limiter=Limiter(blocked=True))
+        run = manager.create(self.config())
+        manager.stop(run["id"])
+        legacy = {"index": 0, "cell_id": "synthetic", "started_at": "2026-10-15T12:00:00+08:00",
+                  "finished_at": "2026-10-15T12:00:01+08:00", "latency_ms": 985.5}
+        manager._samples_path(run["id"]).write_text(json.dumps(legacy) + "\n")
+        timing = manager.samples(run["id"])["samples"][0]["timing"]
+        self.assertEqual(timing["source"], "legacy")
+        self.assertEqual(timing["started_at"], "2026-10-15T12:00:00.000+08:00")
+        self.assertEqual(timing["total_ms"], 985.5)
+        self.assertIsNone(timing["first_token_at"])
+        self.assertIsNone(timing["enqueued_at"])
+        self.assertIsNone(timing["queue_ms"])
+
+    def test_legacy_restart_records_detection_without_fabricating_completion(self):
+        manager = self.manager(limiter=Limiter(blocked=True))
+        run = manager.create(self.config())
+        identifier = run["id"]
+        metadata = copy.deepcopy(manager._runs[identifier])
+        manager.stop(identifier)
+        manager.close()
+        metadata.pop("timing")
+        metadata["status"] = "running"
+        metadata["started_at"] = metadata["created"]
+        metadata["finished_at"] = None
+        manager._save_run(metadata)
+        restored = self.manager()
+        recovered = restored.get(identifier)
+        self.assertEqual(recovered["status"], "interrupted")
+        self.assertIsNone(recovered["finished_at"])
+        self.assertIsNone(recovered["timing"]["ended_at"])
+        self.assertIsNone(recovered["timing"]["elapsed_ms"])
+        self.assertIsNotNone(recovered["timing"]["interruption_detected_at"])
+        self.assertIsNone(recovered["timing"]["stop_requested_at"])
+        self.assertEqual(recovered["artifact"]["timing"], recovered["timing"])
+        self.assertFalse(self.requests)
+
+    def test_new_defaults_and_connection_pool_agree(self):
+        manager = self.manager(limiter=Limiter(blocked=True))
+        config = self.config()
+        config.pop("rpm")
+        config.pop("concurrency")
+        run = manager.create(config)
+        self.assertEqual((run["protocol"]["concurrency"], run["protocol"]["rpm"]), (20, 100))
+        async def inspect_client():
+            async with service.FingerprintManager._new_client(manager, run["protocol"]) as client:
+                self.assertEqual(client._transport._pool._max_connections, 20)
+                self.assertEqual(client._transport._pool._max_keepalive_connections, 20)
+        asyncio.run(inspect_client())
+
+    def test_rate_pacer_spaces_workers_and_does_not_catch_up(self):
+        async def scenario():
+            now = 0
+            starts = []
+            async def advance(delay):
+                nonlocal now
+                now += delay
+            pacer = service._RequestPacer(100, clock=lambda: now, sleep=advance)
+            async def start():
+                self.assertTrue(await pacer.wait())
+                starts.append(now)
+            await asyncio.gather(*(start() for _ in range(5)))
+            self.assertEqual([round(x, 3) for x in starts], [0, .6, 1.2, 1.8, 2.4])
+            now += 5
+            await start()
+            await start()
+            self.assertAlmostEqual(starts[-1] - starts[-2], .6)
+            before = now
+            self.assertFalse(await pacer.wait(lambda: False))
+            self.assertEqual(now, before)
+        asyncio.run(scenario())
+
+    def test_stop_while_rate_waiting_sends_no_more_requests(self):
+        starts = []
+        def observed(request):
+            starts.append(time.monotonic())
+            return success(request)
+        manager = self.manager(observed)
+        run = manager.create(self.config(concurrency=20, rpm=100))
+        self.wait(lambda: len(starts) >= 2)
+        stop_at = time.monotonic()
+        manager.stop(run["id"])
+        final = self.complete(manager, run)
+        self.assertGreaterEqual(starts[1] - starts[0], .58)
+        self.assertEqual(len(starts), 2)
+        self.assertLess(time.monotonic() - stop_at, .5)
+        self.assertEqual(final["status"], "stopped")
+        self.assertEqual(final["progress"]["done"], 2)
+
+    def test_legacy_reference_and_frozen_repeat_keep_original_manifest(self):
+        manager = self.manager()
+        legacy = make_protocol(self.config())
+        legacy.pop("rpm")
+        legacy["id"] = _digest({k: v for k, v in legacy.items() if k != "id"})
+        baseline = self.complete(manager, manager.create(self.config(mode="reference", trusted_source=True, source_note="合成旧参考"), frozen_protocol=legacy))
+        config = self.config(mode="verify", reference_id=baseline["reference_id"])
+        config.pop("rpm")
+        candidate = self.complete(manager, manager.create(config))
+        self.assertEqual(candidate["protocol"], legacy)
+        self.assertTrue(candidate["comparison"]["protocol_compatible"])
+        repeated = self.complete(manager, manager.create(self.config(), frozen_protocol=legacy))
+        self.assertEqual(repeated["protocol"], legacy)
+        with self.assertRaisesRegex(ValueError, "冻结协议一致"):
+            manager.create({**config, "rpm": 100})
 
     def test_exact_single_turn_protocol_and_no_secrets_on_disk(self):
         manager = self.manager()
@@ -224,6 +386,154 @@ class FingerprintServiceTests(unittest.TestCase):
             self.assertEqual(body["max_completion_tokens"], 16)
             self.assertNotIn("max_tokens", body)
 
+    def test_native_reasoning_uses_explicit_budget_and_only_final_answer(self):
+        def provider(request):
+            body = json.loads(request.content)
+            if "temperature" in body or "top_p" in body or body.get("reasoning_effort") == "none":
+                return httpx.Response(400, json={"error": "synthetic unsupported sampling parameter"})
+            budget = body.get("max_completion_tokens", body.get("max_tokens"))
+            if budget < 128:
+                return success(request, choices=[{"message": {"content": None, "reasoning_content": "synthetic thought"}, "finish_reason": "length"}],
+                               usage={"completion_tokens": budget, "completion_tokens_details": {"reasoning_tokens": budget}})
+            return success(request, choices=[{"message": {"content": answer_for(body), "reasoning_content": "never an answer or saved raw thought"}, "finish_reason": "stop"}],
+                           usage={"prompt_tokens": 20, "completion_tokens": 129, "completion_tokens_details": {"reasoning_tokens": 128}})
+        for adapter in ("openai_reasoning", "deepseek_reasoning"):
+            with self.subTest(adapter=adapter):
+                manager = self.manager(provider)
+                self.requests.clear()
+                endpoint = {"url": "https://api.deepseek.com" if adapter == "deepseek_reasoning" else "https://synthetic.invalid/v1",
+                            "model": "synthetic-always-thinking", "api_key": "synthetic-test-secret"}
+                run = self.collect(manager, adapter=adapter, endpoint=endpoint)
+                self.assertEqual(run["status"], "finished")
+                self.assertEqual(run["progress"]["valid"], 40)
+                self.assertEqual(len(self.requests), 40)
+                for request in self.requests:
+                    body = json.loads(request.content)
+                    self.assertEqual(body[run["protocol"]["token_field"]], 4096)
+                    self.assertEqual(body["reasoning_effort"], "low")
+                    self.assertNotIn("temperature", body)
+                    self.assertNotIn("top_p", body)
+                    if adapter == "deepseek_reasoning":
+                        self.assertEqual(body["thinking"], {"type": "enabled"})
+                rows = manager.samples(run["id"])["samples"]
+                self.assertTrue(all(row["category"] == "valid" and row["reasoning_observed"] for row in rows))
+                self.assertNotIn("never an answer", manager._samples_path(run["id"]).read_text())
+                self.assertEqual(run["diagnostics"]["usage"]["reasoning_tokens"], 5120)
+                self.assertEqual(run["diagnostics"]["token_budget_exceeded_count"], 0)
+
+    def test_reasoning_budget_exhaustion_does_not_expand_or_retry(self):
+        def provider(request):
+            return success(request, choices=[{"message": {"content": "", "reasoning_content": "synthetic thought"}, "finish_reason": "length"}],
+                           usage={"completion_tokens": 4096, "completion_tokens_details": {"reasoning_tokens": 4096}})
+        manager = self.manager(provider)
+        run = self.collect(manager, adapter="openai_reasoning", concurrency=1, mode="reference", trusted_source=True, source_note="合成思考来源")
+        self.assertEqual(len(self.requests), 3)
+        self.assertEqual(run["status"], "error")
+        self.assertIn("4096", run["error"])
+        self.assertEqual(manager.list_references(), [])
+        self.assertEqual(run["diagnostics"]["usage"]["completion_tokens"], 3 * 4096)
+        self.assertTrue(all(json.loads(r.content)["max_completion_tokens"] == 4096 for r in self.requests))
+
+    def test_glm_official_incompatible_protocol_is_rejected_before_sending(self):
+        manager = self.manager()
+        for host in ("api.z.ai", "open.bigmodel.cn"):
+            for model in ("glm-5.3", "glm-5.3-flash", "glm-5.3-flashx"):
+                for adapter in ("standard", "zhipu", "openai_reasoning"):
+                    with self.subTest(host=host, model=model, adapter=adapter):
+                        endpoint = {"url": "https://" + host + "/api/paas/v4", "model": model, "api_key": "synthetic-test-secret"}
+                        with self.assertRaisesRegex(ValueError, "不能关闭思考.*4096"):
+                            manager.create(self.config(endpoint=endpoint, adapter=adapter))
+                        service.validate_endpoint_protocol(endpoint, make_protocol({"adapter": "zhipu_reasoning"}))
+        self.assertEqual(self.requests, [])
+        # Exact host and model matches only; an alias is not evidence of provider semantics.
+        for host, model in (("api.z.ai.evil.invalid", "glm-5.3-flash"), ("synthetic.invalid", "glm-5.3-flash"), ("api.z.ai", "glm-5.3-custom"), ("api.z.ai", "glm-5.2")):
+            service.validate_endpoint_protocol({"url": "https://" + host, "model": model}, make_protocol({"adapter": "zhipu"}))
+
+    def test_glm_flash_mock_reproduces_empty_body_then_uses_explicit_thinking_protocol(self):
+        def provider(request):
+            body = json.loads(request.content)
+            if body.get("thinking", {}).get("type") == "disabled":
+                return httpx.Response(400, json={"error": "synthetic GLM-5.3-Flash only supports enabled thinking"})
+            if body["max_tokens"] == 16:
+                return success(request, choices=[{"message": {"content": "", "reasoning_content": "synthetic thought"}, "finish_reason": "length"}],
+                               usage={"prompt_tokens": 20, "completion_tokens": 16})
+            self.assertEqual(body["max_tokens"], 4096)
+            self.assertEqual(body["thinking"], {"type": "enabled"})
+            self.assertEqual(body["reasoning_effort"], "low")
+            self.assertNotIn("max_completion_tokens", body)
+            self.assertNotIn("temperature", body)
+            self.assertNotIn("top_p", body)
+            return success(request, choices=[{"message": {"content": answer_for(body), "reasoning_content": "synthetic thought never saved"}, "finish_reason": "stop"}],
+                           usage={"prompt_tokens": 20, "completion_tokens": 129})
+
+        manager = self.manager(provider)
+        endpoint = {"url": "https://synthetic.invalid/v1", "model": "glm-5.3-flash", "api_key": "synthetic-test-secret"}
+        original = self.collect(manager, endpoint=endpoint, concurrency=1)
+        self.assertEqual(original["status"], "error")
+        self.assertEqual(original["progress"]["done"], 3)
+        self.assertEqual(original["progress"]["valid"], 0)
+        self.assertIn("不能关闭思考", original["error"])
+        self.assertIn("4096", original["error"])
+        self.assertEqual(len(self.requests), 3)
+        self.assertEqual(original["diagnostics"]["usage"]["completion_tokens"], 48)
+        disabled = self.collect(manager, endpoint=endpoint, concurrency=1, adapter="zhipu")
+        self.assertEqual(disabled["status"], "error")
+        self.assertEqual(len(self.requests), 4)  # No parameter fallback or retry after rejection.
+        self.requests.clear()
+        endpoint["url"] = "https://open.bigmodel.cn/api/paas/v4"
+        accepted = self.collect(manager, endpoint=endpoint, adapter="zhipu_reasoning")
+        self.assertEqual(accepted["status"], "finished")
+        self.assertEqual(accepted["progress"]["valid"], 40)
+        self.assertEqual(len(self.requests), 40)
+        self.assertIsNone(accepted["diagnostics"]["usage"]["reasoning_tokens"])
+        self.assertEqual(accepted["diagnostics"]["usage"]["completion_tokens"], 5160)
+        self.assertNotIn("synthetic thought", manager._samples_path(accepted["id"]).read_text())
+        with self.assertRaisesRegex(ValueError, "确认"):
+            manager.create(self.config(endpoint=endpoint, adapter="zhipu_reasoning", risk_acknowledged=False))
+
+    def test_reasoning_references_freeze_repeat_import_and_comparison(self):
+        manager = self.manager()
+        baseline = self.collect(manager, adapter="openai_reasoning", mode="reference", trusted_source=True, source_note="合成思考参考")
+        reference = manager.list_references()[0]
+        candidate = self.collect(manager, mode="verify", adapter="openai_reasoning", reference_id=reference["id"])
+        self.assertEqual(candidate["protocol"], baseline["protocol"])
+        self.assertTrue(candidate["comparison"]["protocol_compatible"])
+        self.assertEqual(candidate["comparison"]["verdict"], "incomparable")
+        repeated = self.complete(manager, manager.create(self.config(), frozen_protocol=baseline["protocol"]))
+        self.assertEqual(repeated["protocol"], baseline["protocol"])
+        with self.assertRaisesRegex(ValueError, "冻结协议一致"):
+            manager.create(self.config(mode="verify", reference_id=reference["id"], adapter="standard"))
+
+    def test_typed_reasoning_content_is_never_counted_as_answer(self):
+        def only_reasoning(request):
+            return success(request, choices=[{"message": {"content": [{"type": "reasoning", "text": answer_for(json.loads(request.content))}]}, "finish_reason": "stop"}])
+        manager = self.manager(only_reasoning)
+        run = self.collect(manager, adapter="openai_reasoning")
+        self.assertEqual(run["progress"]["valid"], 0)
+        self.assertTrue(run["diagnostics"]["reasoning_observed"])
+        self.assertTrue(all(row["raw"] == "" for row in manager.samples(run["id"])["samples"]))
+        message = {"content": [{"type": "reasoning", "text": "cat"}, {"type": "text", "text": "dog"}]}
+        self.assertEqual(service._content(message), "dog")
+
+    def test_reasoning_rejected_parameter_does_not_fallback(self):
+        manager = self.manager(lambda request: httpx.Response(400, json={"error": "synthetic unsupported effort"}))
+        run = self.collect(manager, adapter="openai_reasoning", concurrency=1)
+        self.assertEqual(run["status"], "error")
+        self.assertEqual(len(self.requests), 1)
+        self.assertEqual(json.loads(self.requests[0].content)["reasoning_effort"], "low")
+
+    def test_inline_thought_tags_cannot_be_normalized_into_one_word_answers(self):
+        # Without the content boundary guard, <think>cat</think> normalizes
+        # into a single Latin word and incorrectly passes an open-word probe.
+        for text in ("<think>cat</think>", "<THINK>cat</THINK>dog", "<analysis>cat</analysis>"):
+            with self.subTest(text=text):
+                row = {"cell_id": "random-animal:en", "error": None}
+                service.FingerprintManager._decode_response(row, {"choices": [{"message": {"content": text}, "finish_reason": "stop"}]})
+                self.assertEqual(row["category"], "invalid")
+                self.assertIsNone(row["normalized"])
+                self.assertTrue(row["reasoning_observed"])
+                self.assertIn("未作为最终答案", row["error"])
+
     def test_upstream_cookies_never_become_request_history(self):
         def set_cookie(request):
             response = success(request)
@@ -310,6 +620,10 @@ class FingerprintServiceTests(unittest.TestCase):
         stopped = manager.stop(run["id"])
         self.assertEqual(stopped["status"], "stopped")
         self.assertEqual(stopped["progress"]["done"], 0)
+        self.assertIsNotNone(stopped["timing"]["stop_requested_at"])
+        self.assertIsNotNone(stopped["timing"]["ended_at"])
+        self.assertIsNone(stopped["timing"]["started_at"])
+        self.assertIsNone(stopped["timing"]["elapsed_ms"])
         self.assertFalse(manager._runtimes)
         self.assertEqual(self.requests, [])
         self.assertFalse(manager.export(run["id"])["complete"])
@@ -330,6 +644,11 @@ class FingerprintServiceTests(unittest.TestCase):
         self.assertLess(final["progress"]["done"], 40)
         self.assertEqual(final["progress"]["done"], manager.samples(run["id"])["total"])
         self.assertFalse(final["artifact"]["complete"])
+        self.assertIsNotNone(final["timing"]["stop_requested_at"])
+        self.assertIsNotNone(final["timing"]["ended_at"])
+        for row in manager.samples(run["id"])["samples"]:
+            self.assertIsNotNone(row["timing"]["ended_at"])
+            self.assertGreaterEqual(row["timing"]["total_ms"], 0)
         self.assertFalse(manager._runtimes)
         self.assertFalse(limiter.active)
         self.assertEqual(manager.stop(run["id"])["status"], "stopped")
@@ -564,7 +883,7 @@ class FingerprintServiceTests(unittest.TestCase):
         manager = self.manager(limiter=Limiter(blocked=True))
         invalid = [self.config(risk_acknowledged=False), self.config(mode="unknown"), self.config(mode=[]), self.config(mode="verify", reference_id={}), self.config(mode="reference"),
                    self.config(mode="reference", trusted_source=True), self.config(extra_body={"tools": []}),
-                   self.config(concurrency=9), self.config(samples_per_cell=9), self.config(timeout_seconds=4),
+                   self.config(concurrency=21), self.config(samples_per_cell=9), self.config(timeout_seconds=4),
                    self.config(adapter="automatic"), self.config(mode="verify", reference_id="does-not-exist")]
         for url in ("file:///tmp/secrets", "https://user:key@synthetic.invalid", "https://synthetic.invalid?key=secret", "https://synthetic.invalid#secret", "https://synthetic.invalid:99999", "https://synthetic.invalid/\\bad"):
             cfg = self.config()

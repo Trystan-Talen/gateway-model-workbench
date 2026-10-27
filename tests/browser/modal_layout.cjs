@@ -7,7 +7,7 @@ const servers=require('./server.cjs').browserServers(artifacts);
 let browser;
 (async()=>{
  const {base}=await servers.start();browser=await chromium.launch({headless:true,executablePath:process.env.BROWSER_PATH||process.env.CHROME_PATH||undefined});
- const context=await browser.newContext(),page=await context.newPage(),errors=[],results=[];
+ const context=await browser.newContext({reducedMotion:'reduce'}),page=await context.newPage(),errors=[],results=[];
  page.on('pageerror',e=>errors.push(e.message));
  await context.route('**/*',r=>new URL(r.request().url()).origin===base?r.continue():r.abort());
  assert.equal((await context.request.get(base+'/quality-methodology')).status(),401);
@@ -16,10 +16,12 @@ let browser;
  await page.evaluate(async()=>{clearInterval(refreshTimer);currentQualitySuite=await api('/quality-suite')});
  for(const viewport of [{width:1440,height:900},{width:390,height:844},{width:844,height:390}]){
   await page.setViewportSize(viewport);
-  for(const id of ['qualitySuiteModal','qualityEvidenceModal','rawModal','accountModal','qualityMethodologyModal']){
+  for(const id of ['qualitySuiteModal','qualityEvidenceModal','rawModal','accountModal','qualityMethodologyModal','diagnosticsModal','storageModal']){
    await page.evaluate(async id=>{
     if(id==='qualitySuiteModal'){showQualitySuite();document.querySelectorAll('#qualitySuiteBody details').forEach(e=>e.open=true)}
     if(id==='qualityMethodologyModal')await showQualityMethodology();
+    if(id==='diagnosticsModal'){openModal(id);await loadDiagnostics()}
+    if(id==='storageModal'){openModal(id);await loadStorage()}
     if(id==='qualityEvidenceModal'){
      const c=currentQualitySuite.cases.find(c=>c.category==='long_context');
      window.currentQualityDetail={config:{capture_raw:true},resources:[{name:'本地布局样例',case_results:[{...c,case_id:c.id,response:'验证用长输出\n'.repeat(500),raw_input:{messages:[{content:c.prompt}]},raw_output:'本地模拟输出'.repeat(1000),checks:['布局测试'],failures:[],score:1,passed:true,completed:true}]}]};
@@ -50,6 +52,7 @@ let browser;
    await focusables.last().focus();await page.keyboard.press('Tab');
    assert.equal(await modal.evaluate(e=>e.contains(document.activeElement)),true,'focus escaped dialog');
    await body.evaluate(e=>e.scrollTop=0);
+   assert.equal((await header.boundingBox()).y,headerBefore.y,id+' keyboard navigation moved fixed header');
    await page.screenshot({path:path.join(output,`${id}-${viewport.width}x${viewport.height}.png`)});
    await page.keyboard.press('Escape');assert.equal(await modal.isVisible(),false);
    results.push(`${id}@${viewport.width}x${viewport.height}`);
@@ -68,6 +71,20 @@ let browser;
  assert.equal(await page.evaluate(()=>document.getElementById('qualitySuiteModal').contains(document.activeElement)),true);
  await page.keyboard.press('Escape');assert.equal(await page.locator('#config').evaluate(e=>e.classList.contains('mobile-open')),true);
  await page.keyboard.press('Escape');assert.equal(await page.locator('#config').evaluate(e=>e.classList.contains('mobile-open')),false);
+ // Render the living component gallery with the production assets, using an isolated route.
+ await page.route(base+'/docs/design-system/gallery.html',route=>route.fulfill({contentType:'text/html',body:require('node:fs').readFileSync(path.join(artifacts.projectRoot,'docs/design-system/gallery.html'),'utf8')}));
+ await page.goto(base+'/docs/design-system/gallery.html');
+ await page.locator('#demoModalFooter .btn.primary').waitFor();
+ for(const width of [1440,980,390]){
+  await page.setViewportSize({width,height:900});
+  for(const theme of ['light','dark']){
+   await page.evaluate(theme=>document.documentElement.setAttribute('data-theme',theme),theme);
+   const overflow=await page.evaluate(()=>({width:innerWidth,total:document.documentElement.scrollWidth,items:[...document.querySelectorAll('body *')].filter(el=>{const r=el.getBoundingClientRect();return r.width>0&&r.right>innerWidth+1}).slice(0,12).map(el=>el.id||el.className)}));
+   assert.ok(overflow.total<=width+1,'gallery horizontal overflow '+JSON.stringify(overflow));
+   await page.locator('#page').screenshot({path:path.join(output,`gallery-page-${width}-${theme}.png`)});
+   await page.locator('#modal-example').screenshot({path:path.join(output,`gallery-footer-${width}-${theme}.png`)});
+  }
+ }
  assert.deepEqual(errors,[]);
  console.log(JSON.stringify({passed:true,modalViewportChecks:results.length,nestedEscape:true,focusTrap:true,bodyScroll:true,headerFixed:true,methodology:true,pageErrors:errors,output},null,2));
 })().catch(e=>{console.error(e);process.exitCode=1}).finally(async()=>{try{if(browser)await browser.close()}finally{await servers.close()}});

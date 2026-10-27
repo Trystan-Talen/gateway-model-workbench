@@ -38,6 +38,7 @@ class ConcurrencyLimiter:
         self._lock = threading.RLock()
         self._limit = max(1, int(limit or 1))
         self._active = {}  # task_id -> 占位时刻
+        self._exclusive = None
 
     def limit(self):
         with self._lock:
@@ -51,6 +52,8 @@ class ConcurrencyLimiter:
     def acquire(self, task_id):
         """尝试为 task_id 占一个执行位。返回 True 表示可以立即执行。"""
         with self._lock:
+            if self._exclusive is not None and self._exclusive != task_id:
+                return False
             if task_id in self._active:
                 return True
             if len(self._active) >= self._limit:
@@ -58,8 +61,19 @@ class ConcurrencyLimiter:
             self._active[task_id] = time.time()
             return True
 
+    def acquire_exclusive(self, task_id):
+        """Reserve the host until drain completes, independent of the task limit."""
+        with self._lock:
+            if self._active.keys() - {task_id} or self._exclusive not in (None, task_id):
+                return False
+            self._exclusive = task_id
+            self._active[task_id] = time.time()
+            return True
+
     def release(self, task_id):
         with self._lock:
+            if self._exclusive == task_id:
+                self._exclusive = None
             return self._active.pop(task_id, None) is not None
 
     def active(self):
@@ -68,7 +82,8 @@ class ConcurrencyLimiter:
 
     def snapshot(self):
         with self._lock:
-            return {"limit": self._limit, "active": len(self._active), "active_ids": sorted(self._active)}
+            return {"limit": self._limit, "active": len(self._active), "active_ids": sorted(self._active),
+                    "exclusive_id": self._exclusive}
 
 
 # ---------------------------------------------------------------------------

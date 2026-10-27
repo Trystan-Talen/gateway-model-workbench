@@ -14,7 +14,8 @@ import re
 import uuid
 from quality_methodology import methodology_snapshot
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime
+from time_record import SINGAPORE_TIMEZONE, singapore_timestamp
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
@@ -650,7 +651,7 @@ def run_quality_probe(
         seed=seed,
         resources=normalized_resources,
         summary=summary,
-        created_at=datetime.now(timezone.utc).isoformat(),
+        created_at=singapore_timestamp(datetime.now(SINGAPORE_TIMEZONE)),
         output_path=output_path,
     )
 

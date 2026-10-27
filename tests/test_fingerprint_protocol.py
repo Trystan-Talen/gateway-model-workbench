@@ -221,9 +221,77 @@ class NormalizationTests(unittest.TestCase):
 
 
 class FrozenProtocolTests(unittest.TestCase):
+    def test_reasoning_adapters_freeze_a_separate_bounded_protocol(self):
+        direct = protocol()
+        for adapter, token_field in (("openai_reasoning", "max_completion_tokens"), ("deepseek_reasoning", "max_tokens"), ("zhipu_reasoning", "max_tokens")):
+            with self.subTest(adapter=adapter):
+                value = protocol(adapter=adapter)
+                self.assertEqual(value["version"], fp.REASONING_METHOD_VERSION)
+                self.assertEqual(value["max_tokens"], 4096)
+                self.assertIsNone(value["temperature"])
+                self.assertIsNone(value["top_p"])
+                self.assertEqual(value["token_field"], token_field)
+                self.assertEqual(value["extra_body"]["reasoning_effort"], "low")
+                self.assertEqual(value["max_retries"], 0)
+                self.assertTrue(fp._protocol_valid(value))
+                self.assertNotEqual(value["id"], direct["id"])
+                imported = fp.validate_import(artifact(value))
+                self.assertEqual(imported["protocol"], value)
+                self.assertEqual(imported["source"]["method_version"], fp.REASONING_METHOD_VERSION)
+                mutated = artifact(value)
+                mutated["protocol"]["max_tokens"] = 16384
+                mutated["protocol"]["id"] = fp._digest({k: v for k, v in mutated["protocol"].items() if k != "id"})
+                with self.assertRaisesRegex(ValueError, "协议摘要"):
+                    fp.validate_import(mutated)
+        self.assertEqual(direct["max_tokens"], 16)
+        self.assertEqual(direct["temperature"], 1)
+        self.assertEqual(direct["version"], fp.METHOD_VERSION)
+
+    def test_reasoning_comparison_remains_exploratory_even_when_usage_is_missing(self):
+        value = artifact(protocol(adapter="openai_reasoning"))
+        compared = fp.compare_artifacts(value, copy.deepcopy(value), now=NOW)
+        self.assertTrue(compared["protocol_compatible"])
+        self.assertEqual(compared["mean_jsd"], 0)
+        self.assertEqual(compared["verdict"], "incomparable")
+        self.assertTrue(any("阈值尚未校准" in reason for reason in compared["reasons"]))
+        mixed = fp.compare_artifacts(value, artifact(), now=NOW)
+        self.assertFalse(mixed["protocol_compatible"])
+        self.assertEqual(mixed["verdict"], "incomparable")
+
+    def test_catalog_discloses_each_adapter_budget_without_mutating_manifest(self):
+        before = protocol()
+        adapters = {entry["id"]: entry for entry in fp.catalog()["adapters"]}
+        self.assertEqual(adapters["standard"]["max_tokens"], 16)
+        self.assertEqual(adapters["openai_reasoning"]["max_tokens"], 4096)
+        self.assertEqual(adapters["zhipu_reasoning"]["max_tokens"], 4096)
+        self.assertEqual(adapters["zhipu_reasoning"]["extra_body"], {"thinking": {"type": "enabled"}, "reasoning_effort": "low"})
+        adapters["openai_reasoning"]["extra_body"]["reasoning_effort"] = "none"
+        self.assertEqual(protocol(adapter="openai_reasoning")["extra_body"]["reasoning_effort"], "low")
+        self.assertEqual(protocol(), before)
+
+    def test_new_collection_defaults_include_frozen_rate(self):
+        value = fp.make_protocol({})
+        self.assertEqual((value["concurrency"], value["rpm"]), (20, 100))
+        self.assertTrue(fp._protocol_valid(value))
+        self.assertEqual(fp.catalog()["limits"]["default_rpm"], 100)
+        for invalid in (0, -1, True, 600001, float("nan")):
+            with self.subTest(rpm=invalid), self.assertRaises(ValueError):
+                fp.make_protocol({"rpm": invalid})
+
+    def test_legacy_manifest_preserves_hash_and_no_rate_semantics(self):
+        legacy = protocol()
+        legacy.pop("rpm")
+        legacy["id"] = fp._digest({k: v for k, v in legacy.items() if k != "id"})
+        self.assertTrue(fp._protocol_valid(legacy))
+        self.assertNotEqual(legacy["id"], protocol()["id"])
+        evidence = artifact(legacy)
+        imported = fp.validate_import(evidence)
+        self.assertEqual(imported["protocol"], legacy)
+        self.assertNotIn("rpm", imported["protocol"])
+
     def test_semantic_configuration_changes_protocol_hash(self):
         base = protocol()
-        variants = ({"samples_per_cell": 30}, {"concurrency": 2}, {"timeout_seconds": 60}, {"adapter": "openrouter"}, {"preset": "strict"})
+        variants = ({"samples_per_cell": 30}, {"concurrency": 2}, {"rpm": 200}, {"timeout_seconds": 60}, {"adapter": "openrouter"}, {"preset": "strict"})
         for change in variants:
             with self.subTest(change=change):
                 self.assertNotEqual(base["id"], protocol(**change)["id"])

@@ -3,6 +3,7 @@ from collections import Counter, defaultdict
 import math
 
 import quality_discrimination
+from run_timing import request_evidence, restored_timing
 
 CATEGORY_LABELS = {
  'numerical_reasoning':'数值与应用计算','logical_reasoning':'逻辑与约束推理',
@@ -417,6 +418,38 @@ def render_quality_markdown(snapshot):
                   '- 方法版本：'+str(methodology.get('version'))+'；资料核对日期：'+cell(methodology.get('reviewed_at'))]
         for source in methodology.get('sources',[]):
             lines.append(f"- {cell(source['name'])}：{source['url']}；采用：{cell(source['adopted'])}；边界：{cell(source['not_covered'])}")
+    timing = restored_timing(snapshot)
+    def recorded(value):
+        return '未记录' if value is None else cell(value)
+
+    lines += ['', '## 时间证据', '',
+              '绝对时间统一为新加坡时间 UTC+08:00（协调世界时加八小时），保留毫秒；新记录的耗时使用单调时钟。历史带时区时间按同一时刻转换，缺失或无时区时间显示“未记录”，不按耗时反推。', '',
+              '| 任务节点 | 时间或耗时 |', '| --- | --- |']
+    for key, label in (('created_at', '创建'), ('started_at', '实际开始'),
+                       ('stop_requested_at', '请求停止'), ('dispatch_ended_at', '停止发新请求'),
+                       ('ended_at', '结束'), ('interruption_detected_at', '发现意外中断')):
+        lines.append(f'| {label} | {recorded(timing[key])} |')
+    for key, label in (('queue_ms', '任务等待（毫秒）'), ('elapsed_ms', '运行耗时（毫秒）'),
+                       ('drain_ms', '收尾耗时（毫秒）')):
+        lines.append(f'| {label} | {recorded(timing[key])} |')
+    lines += ['', '### 逐题请求时间', '',
+              '| 资源 | 题号 | 执行顺序 | 实际开始 | 结束 | 请求耗时（毫秒） |',
+              '| --- | --- | ---: | --- | --- | ---: |']
+    rows = []
+    for resource in snapshot.get('resources') or []:
+        for case in resource.get('case_results') or []:
+            sequence = case.get('execution_sequence')
+            sequence = sequence if isinstance(sequence, int) and not isinstance(sequence, bool) and sequence > 0 else None
+            rows.append((sequence, resource.get('name'), case))
+    # 新版按实录执行顺序核查；旧记录没有顺序时保留资源与题目原顺序，不编号补造。
+    rows.sort(key=lambda row: (row[0] is None, row[0] or 0))
+    for sequence, resource_name, case in rows:
+        evidence = request_evidence(case)
+        lines.append(f'| {cell(resource_name)} | {cell(case.get("case_id"))} | {recorded(sequence)} | '
+                     f'{recorded(evidence["started_at"])} | {recorded(evidence["ended_at"])} | '
+                     f'{recorded(evidence["total_ms"])} |')
+    if not rows:
+        lines += ['', '未记录逐题请求时间证据。']
     lines += ['', '## 限制与复核']
     lines += ['- '+cell(x) for x in report.get('limitations', [])]
     return '\n'.join(lines)+'\n'

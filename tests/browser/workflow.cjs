@@ -40,7 +40,7 @@ async function eventually(fn,message){const until=Date.now()+20000;while(Date.no
   if(count===1){
    await page.waitForTimeout(350);const same=await call('/quality-test/'+id);assert.equal(same.completed_cases,1,'progress must not grow with time');
    await page.locator('#modulePlaceholder .report-tab').nth(1).click();
-   await page.locator('#modulePlaceholder .raw-link').first().click();
+   await page.locator('#modulePlaceholder [data-click-action="showQualityCase"]').first().click();
    await page.evaluate(()=>refresh());assert.equal(await page.locator('#qualityEvidenceModal').isVisible(),true);
    assert.match(await page.locator('#qualityEvidenceModal').innerText(),/PONG/);await page.evaluate(()=>closeQualityEvidence());
    await page.locator('#modulePlaceholder .report-tab').first().click();
@@ -54,7 +54,7 @@ async function eventually(fn,message){const until=Date.now()+20000;while(Date.no
  await page.screenshot({path:path.join(output,'quality-finished.png')});
  await page.locator('#modulePlaceholder .report-tab').nth(2).click();
  assert.equal(await page.locator('#modulePlaceholder tbody tr').count(),5);
- await page.locator('#modulePlaceholder .raw-link').first().click();
+ await page.locator('#modulePlaceholder [data-click-action="showQualityCase"]').first().click();
  assert.match(await page.locator('#qualityEvidenceModal').innerText(),/PONG/);await page.evaluate(()=>closeQualityEvidence());
  const {quality_test_id:bad}=await call('/quality-tests',{suite_path:server.suite,name:'错误请求回归',resources:[{...resource,model:'quality-fail'}]});
  let failed;
@@ -104,7 +104,7 @@ async function eventually(fn,message){const until=Date.now()+20000;while(Date.no
  assert.equal((await call('/tasks')).tasks.length,0,'comparison children must stay out of standalone list after restart');
  q=await call('/quality-test/'+id);assert.equal(q.progress,1);assert.equal(q.resources[0].case_results[0].response,'PONG');
  await page.evaluate(async id=>{setModule('quality');setRecordFilter('compare');await selectQuality(id)},id);
- await page.locator('#modulePlaceholder .report-tab').nth(1).click();await page.locator('#modulePlaceholder .raw-link').first().click();
+ await page.locator('#modulePlaceholder .report-tab').nth(1).click();await page.locator('#modulePlaceholder [data-click-action="showQualityCase"]').first().click();
  assert.match(await page.locator('#qualityEvidenceModal').innerText(),/PONG/);await page.evaluate(()=>closeQualityEvidence());
  await page.setViewportSize({width:390,height:844});
  await page.screenshot({path:path.join(output,'quality-mobile.png')});

@@ -55,6 +55,11 @@ const defer = () => { let resolve; const promise=new Promise(done=>{resolve=done
   const count=calls.length;
   UI.openEdit(item.id);
   check('opening edit does not reveal saved credentials',()=>{assert.equal(calls.length,count);assert.equal(nodes.get('connectionKey').value,'');assert.equal(nodes.get('connectionKey').type,'password');assert.ok(UI.isOpen());assert.equal(nodes.get('config').inert,true);});
+  UI.closeCreate();s.items=[{...item,api_key_saved:false}];UI.openEdit(item.id);
+  check('editing a connection without its saved key requires replacement credentials',()=>{assert.equal(nodes.get('connectionKey').required,true);assert.match(nodes.get('connectionCreateBody').innerHTML,/密钥已不可用，请重新填写/);assert.ok(!nodes.get('connectionCreateBody').innerHTML.includes('留空保留原密钥'));});
+  const missingKeyCalls=calls.length;await UI.save();
+  check('missing replacement credentials are rejected before posting',()=>{assert.equal(calls.length,missingKeyCalls);assert.equal(document.activeElement.id,'connectionKey');assert.equal(UI.isOpen(),true);});
+  UI.closeCreate();s.items=[item];document.activeElement=nodes.get('opener');UI.openEdit(item.id);
   apiHandler=async(path)=>path.endsWith('/reveal')?{api_key:'synthetic-saved-key'}:path==='/connections'?{connections:[item]}:{connection:item};
   await UI.revealKey();
   check('explicit eye action reveals saved key',()=>{assert.equal(nodes.get('connectionKey').value,'synthetic-saved-key');assert.equal(nodes.get('connectionKey').type,'text');assert.equal(s.retrieved,true);assert.equal(calls.at(-1).path,'/connections/synthetic-1/reveal');});
@@ -130,5 +135,6 @@ const defer = () => { let resolve; const promise=new Promise(done=>{resolve=done
   check('failed post-delete refresh reports the completed deletion accurately',()=>{const messages=notifications.slice(notificationsBeforeDelete);assert.ok(messages.includes('常用连接已删除'));assert.ok(messages.some(message=>message.startsWith('常用连接已删除，但列表刷新失败：')));assert.ok(!messages.includes('常用连接删除失败。'));});
   const stale=defer();apiHandler=async()=>stale.promise;const loading=UI.refresh();UI.reset();stale.resolve({connections:[item],storage_available:true});await assert.rejects(loading,/会话已失效/);checks++;
   check('logout reset clears public metadata and invalidates pending requests',()=>{assert.equal(UI.list().length,0);assert.equal(UI.isOpen(),false);assert.equal(s.promise,null);});
+  check('connection update time uses fixed Singapore time instead of browser locale',()=>{assert.match(detailHtml({...item,updated_at:'2026-10-15T16:00:00.001Z'}),/2026-10-16 00:00:00.001 新加坡时间（UTC\+08:00）/);});
   console.log(JSON.stringify({status:'passed',checks}));
 })().catch(error=>{console.error(error);process.exitCode=1;});

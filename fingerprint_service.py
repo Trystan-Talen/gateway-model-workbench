@@ -13,9 +13,12 @@ import heapq
 import json
 import math
 import os
+import re
 import secrets
 import threading
 import time
+
+from time_record import request_timing, task_timing, singapore_timestamp, normalize_timing_tree
 import uuid
 from collections import deque
 from datetime import datetime, timezone
@@ -29,6 +32,7 @@ from fingerprint_protocol import (
     compare_artifacts,
     make_plan,
     make_protocol,
+    REASONING_METHOD_VERSION,
     _protocol_valid,
     normalize_answer,
     validate_import,
@@ -39,6 +43,9 @@ ACTIVE = frozenset({"waiting", "running", "stopping"})
 MAX_RESPONSE_BYTES = 1024 * 1024
 MAX_RAW_CHARS = 4096
 MAX_CONSECUTIVE_REASONING_TRUNCATIONS = 3
+GLM_ALWAYS_THINKING_MODELS = frozenset({"glm-5.3", "glm-5.3-flash", "glm-5.3-flashx"})
+ZHIPU_OFFICIAL_HOSTS = frozenset({"api.z.ai", "open.bigmodel.cn"})
+INLINE_REASONING = re.compile(r"</?(?:think|thinking|analysis|reasoning)(?:\s[^>]*)?>", re.I)
 MAX_IMPORT_BYTES = 2 * 1024 * 1024
 MODEL_DISCOVERY_TIMEOUT_SECONDS = 15
 USAGE_KEYS = ("prompt_tokens", "completion_tokens", "reasoning_tokens", "cached_tokens", "reported_cost")
@@ -47,14 +54,62 @@ RUN_FIELDS = (
     "endpoint", "protocol", "progress", "error", "reference_id", "comparison", "diagnostics",
 )
 CONFIG_FIELDS = frozenset({
-    "name", "mode", "endpoint", "preset", "samples_per_cell", "concurrency",
+    "name", "mode", "endpoint", "preset", "samples_per_cell", "concurrency", "rpm",
     "timeout_seconds", "adapter", "reference_id", "trusted_source", "source_note", "risk_acknowledged",
 })
 FATAL_HTTP = frozenset({400, 401, 403, 404, 405, 413, 422})
 
 
+def validate_endpoint_protocol(endpoint, protocol):
+    """Reject documented incompatibilities without sending a paid request."""
+    hostname = urlsplit(endpoint["url"]).hostname
+    if hostname == "api.deepseek.com" and protocol["adapter"] not in {"deepseek", "deepseek_reasoning"}:
+        raise ValueError("DeepSeek（深度求索）官方接口默认启用思考，请明确选择其‘关闭思考’或‘保留思考’适配；变更协议后需重新采集参考")
+    if (hostname in ZHIPU_OFFICIAL_HOSTS and endpoint["model"].lower() in GLM_ALWAYS_THINKING_MODELS
+            and protocol["adapter"] != "zhipu_reasoning"):
+        raise ValueError("此 GLM（通用语言模型）官方模型不能关闭思考；请明确选择‘智谱：保留思考’，确认单次 4096 词元上限及全计划费用风险后新建采集。旧参考参数不能自动替换")
+
+
+class _RequestPacer:
+    """Space starts across workers without banking idle time into a burst."""
+
+    def __init__(self, rpm, *, clock=time.monotonic, sleep=asyncio.sleep):
+        self.interval = 60 / rpm if rpm else 0
+        self.clock = clock
+        self.sleep = sleep
+        self.lock = asyncio.Lock()
+        self.next_start = 0
+
+    async def wait(self, ready=lambda: True):
+        if not self.interval:
+            return ready()
+        async with self.lock:
+            if not ready():
+                return False
+            delay = self.next_start - self.clock()
+            if delay > 0:
+                await self.sleep(delay)
+            if not ready():
+                return False
+            self.next_start = self.clock() + self.interval
+            return True
+
+
 def _now():
-    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    return singapore_timestamp(time.time())
+
+
+def _normalize_fingerprint_times(value):
+    """Convert only known evidence dates; sampling protocol and source text stay frozen."""
+    result = normalize_timing_tree(value)
+    for key in ("created", "started_at", "finished_at", "collected_at", "compared_at"):
+        if isinstance(result.get(key), str):
+            result[key] = singapore_timestamp(result[key])
+    if isinstance(result.get("artifact"), dict):
+        result["artifact"] = _normalize_fingerprint_times(result["artifact"])
+    if isinstance(result.get("comparison"), dict):
+        result["comparison"] = _normalize_fingerprint_times(result["comparison"])
+    return result
 
 
 def _json_bytes(value):
@@ -282,13 +337,24 @@ def _content(message):
     if isinstance(content, list):
         return "".join(part if isinstance(part, str) else part.get("text", "")
                        for part in content
-                       if isinstance(part, str) or (isinstance(part, dict) and isinstance(part.get("text"), str)))
+                       if isinstance(part, str) or (isinstance(part, dict) and
+                           part.get("type") in (None, "text", "output_text") and isinstance(part.get("text"), str)))
     return ""
+
+
+def _reasoning_observed(message, usage):
+    parts = message.get("content")
+    return bool(message.get("reasoning_content") or message.get("reasoning") or message.get("reasoning_details") or
+                (usage.get("reasoning_tokens") or 0) > 0 or
+                (isinstance(parts, list) and any(isinstance(part, dict) and part.get("type") in
+                 {"reasoning", "thinking", "reasoning_text", "reasoning_summary_text"} for part in parts)))
 
 
 class _Runtime:
     def __init__(self, key):
         self.key = key
+        self.created_mono = time.monotonic()
+        self.started_mono = self.dispatch_ended_mono = None
         self.stop = threading.Event()
         self.loop = None
         self.tasks = set()
@@ -333,6 +399,27 @@ class FingerprintManager:
             raise ValueError("参考编号无效")
         return self.references_dir / f"{reference_id}.json"
 
+    def _update_timing(self, run, **fields):
+        with self.lock:
+            previous = run.get("timing")
+            if not isinstance(previous, dict):
+                previous = task_timing(source="legacy", created_at=run.get("created"),
+                                       started_at=run.get("started_at"), ended_at=run.get("finished_at"))
+            run["timing"] = task_timing(**{**previous, **fields})
+
+    def _end_dispatch(self, run, runtime):
+        with self.lock:
+            if not (run.get("timing") or {}).get("dispatch_ended_at"):
+                self._update_timing(run, dispatch_ended_at=_now())
+                if runtime:
+                    runtime.dispatch_ended_mono = time.monotonic()
+
+    def _end_timing(self, run, runtime):
+        now = time.monotonic()
+        self._update_timing(run, ended_at=run["finished_at"], source="recorded" if run.get("started_at") else "partial",
+            elapsed_ms=(now - runtime.started_mono) * 1000 if runtime and runtime.started_mono is not None else None,
+            drain_ms=(now - runtime.dispatch_ended_mono) * 1000 if runtime and runtime.dispatch_ended_mono is not None else None)
+
     def _save_run(self, run):
         _atomic_json(self._run_path(run["id"]), run)
 
@@ -361,6 +448,7 @@ class FingerprintManager:
                         raise ValueError("invalid reference")
                     _stored_date(reference["created"])
                     reference["artifact"] = validate_import(reference["artifact"])
+                    reference = _normalize_fingerprint_times(reference)
                     self._references[reference["id"]] = reference
                     os.chmod(path, 0o600)
                 except (ValueError, TypeError, KeyError, OSError, OverflowError, RecursionError):
@@ -380,12 +468,17 @@ class FingerprintManager:
                     _stored_date(run["created"])
                     _stored_date(run.get("started_at"), optional=True)
                     _stored_date(run.get("finished_at"), optional=True)
+                    run = _normalize_fingerprint_times(run)
+                    self._update_timing(run)
                     if run.get("artifact") is not None:
                         run["artifact"] = validate_import(run["artifact"])
+                        run["artifact"].setdefault("timing", copy.deepcopy(run["timing"]))
                         run["diagnostics"] = copy.deepcopy(run["artifact"].get("diagnostics", {}))
                     if run["status"] in ACTIVE:
                         run["status"] = "interrupted"
-                        run["finished_at"] = _now()
+                        run["finished_at"] = None
+                        self._update_timing(run, ended_at=None, elapsed_ms=None, drain_ms=None,
+                                            interruption_detected_at=_now(), source="partial")
                         run["error"] = "服务进程已重启，采集已中断；不会自动补发请求"
                         self._runs[run["id"]] = run
                         self._finalize_artifact(run, complete=False)
@@ -418,17 +511,35 @@ class FingerprintManager:
         endpoint, key = _endpoint(config.get("endpoint"))
         if key and any(key in value for value in (endpoint["url"], endpoint["model"], name, source_note)):
             raise ValueError("密钥只能填写在独立密钥字段中")
+        if frozen_protocol is None and mode == "verify":
+            reference_id = config.get("reference_id")
+            if not _identifier(reference_id):
+                raise ValueError("请选择存在的参考指纹")
+            with self.lock:
+                reference = self._references.get(reference_id)
+                reference_protocol = copy.deepcopy(reference.get("artifact", {}).get("protocol")) if reference else None
+            if not _protocol_valid(reference_protocol):
+                raise ValueError("参考的冻结协议已不受支持，请重新采集参考")
+            # A reference comparison must actually use the displayed frozen
+            # settings, including the absence of rate limiting on old records.
+            for field in ("samples_per_cell", "concurrency", "rpm", "timeout_seconds", "adapter"):
+                if field in config and config[field] != reference_protocol.get(field):
+                    raise ValueError("对照采集参数必须与参考的冻结协议一致")
+            if "preset" in config:
+                candidate = make_protocol({"preset": config["preset"]})
+                if candidate["cells"] != reference_protocol["cells"]:
+                    raise ValueError("对照采集范围必须与参考的冻结协议一致")
+            frozen_protocol = reference_protocol
         if frozen_protocol is None:
             protocol = make_protocol({field: config[field] for field in
-                                      ("preset", "samples_per_cell", "concurrency", "timeout_seconds", "adapter")
+                                      ("preset", "samples_per_cell", "concurrency", "rpm", "timeout_seconds", "adapter")
                                       if field in config})
         else:
             if not _protocol_valid(frozen_protocol):
                 raise ValueError("原采集的冻结协议已不受支持，不能自动替换当前方案复测")
             protocol = copy.deepcopy(frozen_protocol)
         # Validate before freezing/queueing; never silently amend an existing protocol.
-        if urlsplit(endpoint["url"]).hostname == "api.deepseek.com" and protocol["adapter"] != "deepseek":
-            raise ValueError("DeepSeek（深度求索）官方接口默认启用思考，请选择‘DeepSeek（深度求索）：关闭思考’适配；对照任务需使用相同适配重新采集参考")
+        validate_endpoint_protocol(endpoint, protocol)
         seed = secrets.randbits(63)
         plan = make_plan(protocol, seed)
         if not plan:
@@ -457,6 +568,8 @@ class FingerprintManager:
             }
             if connection_binding:
                 run["connection_binding"] = copy.deepcopy(connection_binding)
+            run["timing"] = task_timing(created_at=run["created"])
+            runtime = _Runtime(key)
             sample_path = self._samples_path(run_id)
             try:
                 fd = os.open(sample_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
@@ -466,7 +579,7 @@ class FingerprintManager:
                 sample_path.unlink(missing_ok=True)
                 raise ValueError("无法保存采集配置，请检查存储空间及目录权限") from None
             self._runs[run_id] = run
-            self._runtimes[run_id] = _Runtime(key)
+            self._runtimes[run_id] = runtime
             self._queue.append(run_id)
             snapshot = self._snapshot(run)
             if self._thread is None or not self._thread.is_alive():
@@ -477,6 +590,11 @@ class FingerprintManager:
 
     def _summary(self, run):
         result = {key: copy.deepcopy(run.get(key)) for key in RUN_FIELDS}
+        result["timing"] = copy.deepcopy(run.get("timing"))
+        runtime = self._runtimes.get(run["id"])
+        if run["status"] in ACTIVE and runtime and runtime.started_mono is not None:
+            result["timing"] = task_timing(**{**(result["timing"] or {}),
+                "elapsed_ms": (time.monotonic() - runtime.started_mono) * 1000})
         if run.get("storage_warning"):
             result["storage_warning"] = run["storage_warning"]
         return result
@@ -518,6 +636,9 @@ class FingerprintManager:
             if run["status"] in TERMINAL:
                 return self._snapshot(run)
             runtime = self._runtimes.get(run_id)
+            if not (run.get("timing") or {}).get("stop_requested_at"):
+                self._update_timing(run, stop_requested_at=_now())
+            self._end_dispatch(run, runtime)
             if runtime:
                 runtime.stop.set()
             if run["status"] == "waiting":
@@ -527,6 +648,7 @@ class FingerprintManager:
                     pass
                 run["status"] = "stopped"
                 run["finished_at"] = _now()
+                self._end_timing(run, runtime)
                 self._finalize_artifact(run, complete=False)
                 self._runtimes.pop(run_id, None)
                 if runtime:
@@ -573,7 +695,12 @@ class FingerprintManager:
                     except (ValueError, TypeError):
                         damaged = True
                         continue
-                    collect(sample)
+                    if isinstance(sample.get("timing"), dict):
+                        sample["timing"] = request_timing(**sample["timing"])
+                    else:
+                        sample["timing"] = request_timing(source="legacy", started_at=sample.get("started_at"),
+                            ended_at=sample.get("finished_at"), total_ms=sample.get("latency_ms"))
+                    collect(_normalize_fingerprint_times(sample))
         except (OSError, UnicodeError):
             damaged = True
         if damaged:
@@ -640,7 +767,7 @@ class FingerprintManager:
 
     def _save_reference(self, artifact, *, name, source_note, trusted_source, imported, reference_id=None):
         reference_id = reference_id or uuid.uuid4().hex
-        artifact = copy.deepcopy(artifact)
+        artifact = _normalize_fingerprint_times(artifact)
         artifact.setdefault("source", {}).update({"trusted_source": trusted_source, "source_note": source_note})
         reference = {"id": reference_id, "name": name, "source_note": source_note,
                      "trusted_source": trusted_source, "imported": imported,
@@ -730,6 +857,9 @@ class FingerprintManager:
                 self._queue.popleft()
                 run["status"] = "running"
                 run["started_at"] = _now()
+                runtime.started_mono = time.monotonic()
+                self._update_timing(run, started_at=run["started_at"],
+                                    queue_ms=(runtime.started_mono - runtime.created_mono) * 1000)
             try:
                 with self.lock:
                     self._save_run(run)
@@ -747,7 +877,9 @@ class FingerprintManager:
                             run["status"] = "stopped"
                         else:
                             run["status"] = "finished"
+                        self._end_dispatch(run, runtime)
                         run["finished_at"] = _now()
+                        self._end_timing(run, runtime)
                         self._finalize_artifact(run, complete=run["status"] == "finished")
                         if run["status"] == "finished" and run["mode"] == "reference":
                             # Stable id makes a recovered reference unambiguous if metadata persistence fails.
@@ -787,16 +919,22 @@ class FingerprintManager:
     async def _execute(self, run, runtime):
         runtime.loop = asyncio.get_running_loop()
         queue = asyncio.Queue()
+        pacer = _RequestPacer(run["protocol"].get("rpm"))
         for probe in make_plan(run["protocol"], run["seed"]):
-            queue.put_nowait(probe)
+            queue.put_nowait((probe, _now(), time.monotonic()))
         async with self._new_client(run["protocol"]) as client:
             async def worker():
                 while not runtime.stop.is_set() and not runtime.fatal_error:
+                    if not await pacer.wait(lambda: not queue.empty() and not runtime.stop.is_set() and not runtime.fatal_error):
+                        return
+                    if runtime.stop.is_set() or runtime.fatal_error:
+                        return
                     try:
-                        probe = queue.get_nowait()
+                        probe, enqueued_at, enqueued_mono = queue.get_nowait()
                     except asyncio.QueueEmpty:
                         return
-                    sample = await self._collect(client, run, runtime, probe)
+                    sample = await self._collect(client, run, runtime, probe, enqueued_at=enqueued_at,
+                                                 enqueued_mono=enqueued_mono, last_admission=queue.empty())
                     try:
                         self._append_sample(run, runtime, sample)
                     except Exception:
@@ -807,11 +945,19 @@ class FingerprintManager:
                                            and not sample["raw"].strip() and sample["reasoning_observed"])
                     runtime.reasoning_truncation_streak = runtime.reasoning_truncation_streak + 1 if reasoning_exhausted else 0
                     if runtime.reasoning_truncation_streak >= MAX_CONSECUTIVE_REASONING_TRUNCATIONS:
+                        advice = ("固定 4096 词元上限仍不足以获得正文，请核对模型兼容性；本次不会继续扩大上限。"
+                                  if run["protocol"]["version"] == REASONING_METHOD_VERSION else
+                                  "此 GLM（通用语言模型）名称对应官方强制思考模型，不能关闭思考；请核对接口后选择‘智谱：保留思考’，确认 4096 词元上限及费用后新建采集。"
+                                  if run["endpoint"]["model"].lower() in GLM_ALWAYS_THINKING_MODELS else
+                                  "请确认接口支持关闭思考，选择对应适配后新建任务；无法关闭时可明确选择保留思考协议。")
                         runtime.fatal_error = ("连续 3 次回答为空且在推理阶段耗尽输出预算，已停止后续请求；"
-                                               "请确认接口支持关闭思考，选择对应适配后新建任务。本次未重试、未放宽令牌上限")
+                                               + advice + "本次未重试、未放宽词元上限")
                     if sample["status_code"] in FATAL_HTTP:
                         runtime.fatal_error = f"通道返回 HTTP（超文本传输协议状态）{sample['status_code']}，已停止；请修正鉴权、地址或固定采样参数后新建任务"
                     if runtime.fatal_error:
+                        if not (run.get("timing") or {}).get("stop_requested_at"):
+                            self._update_timing(run, stop_requested_at=_now())
+                        self._end_dispatch(run, runtime)
                         current = asyncio.current_task()
                         for task in tuple(runtime.tasks):
                             if task is not current and not task.done():
@@ -826,7 +972,7 @@ class FingerprintManager:
             if any(isinstance(outcome, Exception) for outcome in outcomes):
                 runtime.fatal_error = runtime.fatal_error or "采集工作器意外退出，已停止后续请求"
 
-    async def _collect(self, client, run, runtime, probe):
+    async def _collect(self, client, run, runtime, probe, *, enqueued_at=None, enqueued_mono=None, last_admission=False):
         started = time.monotonic()
         sample = {"index": probe["index"], "cell_id": probe["cell_id"],
                   "paraphrase_index": probe["paraphrase_index"],
@@ -836,9 +982,13 @@ class FingerprintManager:
                   "raw": "", "extra_text": False, "finish_reason": None, "truncated": False,
                   "returned_model": None, "response_id": None, "usage": dict.fromkeys(USAGE_KEYS), "error": None,
                   "reasoning_observed": False}
+        sample["timing"] = request_timing(enqueued_at=enqueued_at, started_at=sample["started_at"],
+            queue_ms=(started - enqueued_mono) * 1000 if enqueued_mono is not None else None)
+        if last_admission:
+            self._end_dispatch(run, runtime)
         protocol = run["protocol"]
         request_body = {"model": run["endpoint"]["model"], "stream": False,
-                        "temperature": protocol["temperature"], "top_p": protocol["top_p"],
+                        **{field: protocol[field] for field in ("temperature", "top_p") if protocol[field] is not None},
                         protocol["token_field"]: protocol["max_tokens"],
                         "messages": [{"role": "system", "content": probe["system_prompt"]},
                                      {"role": "user", "content": probe["user_prompt"]}],
@@ -863,7 +1013,7 @@ class FingerprintManager:
                             break
                         chunks.extend(chunk)
                     if sample["error"] is None:
-                        self._decode_response(sample, json.loads(bytes(chunks)))
+                        self._decode_response(sample, json.loads(bytes(chunks)), protocol=protocol)
             finally:
                 await response.aclose()
         try:
@@ -882,6 +1032,9 @@ class FingerprintManager:
         finally:
             sample["finished_at"] = _now()
             sample["latency_ms"] = round((time.monotonic() - started) * 1000, 3)
+            # Non-streaming collection cannot observe first-token generation time.
+            sample["timing"] = request_timing(**{**sample["timing"], "ended_at": sample["finished_at"],
+                                                   "total_ms": sample["latency_ms"], "source": "recorded"})
         if runtime.key and runtime.key in sample["raw"]:
             sample.update({"category": "invalid", "normalized": None, "extra_text": True})
         sample = _redact(sample, runtime.key)
@@ -889,7 +1042,7 @@ class FingerprintManager:
         return sample
 
     @staticmethod
-    def _decode_response(sample, payload):
+    def _decode_response(sample, payload, *, protocol=None):
         if not isinstance(payload, dict):
             raise ValueError("response must be an object")
         sample["usage"] = _usage(payload)
@@ -907,8 +1060,8 @@ class FingerprintManager:
         refusal = message.get("refusal")
         sample["finish_reason"] = choice.get("finish_reason") if isinstance(choice.get("finish_reason"), str) else None
         sample["truncated"] = sample["finish_reason"] in {"length", "max_tokens", "max_output_tokens"} or len(content) > MAX_RAW_CHARS
-        sample["reasoning_observed"] = bool(message.get("reasoning_content") or message.get("reasoning") or
-                                             (sample["usage"]["reasoning_tokens"] or 0) > 0)
+        inline_reasoning = bool(INLINE_REASONING.search(content))
+        sample["reasoning_observed"] = _reasoning_observed(message, sample["usage"]) or inline_reasoning
         sample["raw"] = content[:MAX_RAW_CHARS]
         if isinstance(refusal, str) and refusal.strip():
             sample["raw"] = (content or refusal)[:MAX_RAW_CHARS]
@@ -918,10 +1071,19 @@ class FingerprintManager:
         sample.update({field: normalized.get(field) for field in ("normalized", "category", "extra_text")})
         if message.get("tool_calls") or message.get("function_call"):
             sample.update({"category": "invalid", "normalized": None, "extra_text": True})
+        if inline_reasoning:
+            # An unstructured thought transcript is not an answer. Do not
+            # guess where its final answer begins or normalize away its tags.
+            sample.update({"category": "invalid", "normalized": None, "extra_text": True,
+                           "error": "正文混入思考标记，未作为最终答案采样；请确认接口分开回传正文与推理"})
         if sample["truncated"]:
             sample.update({"category": "invalid", "normalized": None})
             if not content.strip() and sample["reasoning_observed"]:
-                sample["error"] = "正文为空：输出预算在推理阶段耗尽；请关闭思考后新建采集"
+                sample["error"] = ("正文为空：输出预算在推理阶段耗尽；请核对所选协议和固定上限，本次未重试、未扩大预算"
+                                   if (protocol or {}).get("version") == REASONING_METHOD_VERSION else
+                                   "正文为空：输出预算在推理阶段耗尽；此 GLM（通用语言模型）官方模型不能关闭思考，需确认费用后新建智谱保留思考采集"
+                                   if str(payload.get("model", "")).lower() in GLM_ALWAYS_THINKING_MODELS else
+                                   "正文为空：输出预算在推理阶段耗尽；可关闭思考，或确认费用后用保留思考协议新建采集")
 
     def _append_sample(self, run, runtime, sample):
         with self.lock:
@@ -950,6 +1112,7 @@ class FingerprintManager:
                                                   "source_note": run.get("source_note", "")})
         if damaged:
             artifact.setdefault("diagnostics", {}).setdefault("warnings", []).append(run["storage_warning"])
+        artifact["timing"] = copy.deepcopy(run["timing"])
         run["artifact"] = artifact
         run["diagnostics"] = copy.deepcopy(artifact.get("diagnostics", {}))
 

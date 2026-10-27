@@ -10,7 +10,7 @@ async function until(fn,label,ms=90000){const end=Date.now()+ms;while(Date.now()
  let server=await servers.start();
  const browser=await chromium.launch({headless:true,executablePath:process.env.CHROME_PATH||undefined});
  try{
-  const context=await browser.newContext({viewport:{width:1440,height:1000}});
+  const context=await browser.newContext({viewport:{width:1440,height:1000},reducedMotion:'reduce'});
   await context.route('**/*',r=>new URL(r.request().url()).hostname==='127.0.0.1'?r.continue():r.abort());
   const page=await context.newPage();page.on('pageerror',e=>errors.push(e.message));
   page.on('console',m=>{if(m.type()==='error'&&/\[render\]|\[refresh\]/.test(m.text()))errors.push(m.text())});
@@ -26,6 +26,9 @@ async function until(fn,label,ms=90000){const end=Date.now()+ms;while(Date.now()
    await page.waitForFunction(()=>document.getElementById('qualitySuiteSummary')?.innerText.includes('次请求'));
    assert.match(await page.locator('#qualitySuiteSummary').innerText(),compare?/240 次请求/:/120 次请求/);
    if(!compare){
+    await page.locator('#submit').click();
+    assert.equal(await page.locator('#quality-url-0').evaluate(el=>el===document.activeElement),true,'missing connection focuses the exact field');
+    assert.match(await page.locator('#formStatus').innerText(),/完整的接口地址/);
     await page.getByRole('button',{name:'查看全部题目、答案与规则'}).click();
     assert.equal(await page.locator('#qualitySuiteBody details details').count(),120);
     await page.locator('#qualitySuiteBody .quality-suite-cases > details > summary').first().click();
@@ -35,13 +38,28 @@ async function until(fn,label,ms=90000){const end=Date.now()+ms;while(Date.now()
     await page.keyboard.press('Escape');
    }
    await page.locator('#qualityName').fill(compare?'本地模拟 · 双资源退化对照':'本地模拟 · 单资源120题验收');
+   assert.match(await page.locator('#qualitySuiteSummary').innerText(),/单题串行/);
+   assert.equal(await page.locator('#qualityCapture').isVisible(),false,'raw evidence is an optional disclosure');
+   await page.locator('#comparisonFields summary').filter({hasText:/^原始记录$/}).click();
    await page.locator('#qualityCapture').check();
    const rows=page.locator('.quality-resource');assert.equal(await rows.count(),compare?2:1);
    for(let i=0;i<await rows.count();i++){
     const row=rows.nth(i);await row.locator('.quality-url').fill(server.upstream+'/v1');await row.locator('.quality-key').fill('synthetic-key-only');
     await row.locator('.quality-model-refresh').click();
     await until(async()=>!(await row.locator('.quality-model').isDisabled()),'models not loaded');
+    assert.equal(await row.locator('.quality-model').inputValue(),'','new resource does not silently choose the first returned model');
     await row.locator('.quality-model').selectOption(i===1?'quality-regressed':'quality-oracle');
+    await row.locator('.quality-model-refresh').click();
+    await until(async()=>!(await row.locator('.quality-model').isDisabled()),'model refresh not finished');
+    assert.equal(await row.locator('.quality-model').inputValue(),i===1?'quality-regressed':'quality-oracle','refresh preserves the selected model');
+    if(!compare){
+     await row.locator('[data-click-action="setQualityModelMode"]').click();
+     await page.locator('#quality-model-manual-0').fill('quality-oracle');
+     await row.locator('[data-click-action="setQualityModelMode"]').click();
+     assert.equal(await row.locator('.quality-model').inputValue(),'quality-oracle','returning to the model list retains its selection');
+     await row.locator('[data-click-action="setQualityModelMode"]').click();
+     assert.equal(await page.locator('#quality-model-manual-0').inputValue(),'quality-oracle','manual model draft survives a round trip to the list');
+    }
    }
    if(compare){await page.screenshot({path:path.join(output,'comparison-create.png')})}
    const responsePromise=page.waitForResponse(r=>r.url().endsWith('/quality-tests')&&r.request().method()==='POST');
@@ -62,7 +80,32 @@ async function until(fn,label,ms=90000){const end=Date.now()+ms;while(Date.now()
   await page.waitForFunction(id=>window.currentQualityDetail?.id===id,singleId);
   assert.equal(await page.locator('#modulePlaceholder .report-tab.active').innerText(),'结论','single-resource records open on the conclusion tab');
   assert.equal(await page.locator('.quality-score-card').count(),1);
+  const sectionTitles=await page.locator('#modulePlaceholder .report-shell > .report-section > .report-section-title-row h2').allTextContents();
+  assert.equal(sectionTitles[0],'结论与建议','decision and next action precede long evidence tables');
+  const facts=page.getByText('查看完整计数与统计口径',{exact:true});await facts.click();await facts.focus();
+  await page.evaluate(()=>refresh());
+  assert.equal(await facts.evaluate(el=>el.parentElement.open),true,'polling retains evidence disclosure');
+  assert.equal(await facts.evaluate(el=>el===document.activeElement),true,'polling retains keyboard focus');
+  await facts.click();
+  await page.locator('.main').evaluate(el=>el.scrollTop=0);
   await page.screenshot({path:path.join(output,'single-report.png')});
+  for(const width of [1440,980,390])for(const theme of ['light','dark']){
+   await page.setViewportSize({width,height:1000});await page.evaluate(theme=>document.documentElement.dataset.theme=theme,theme);
+   await page.locator('.main').evaluate(el=>el.scrollTop=0);
+   assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth>innerWidth+1),false,'report width '+width);
+   await page.screenshot({path:path.join(output,`quality-report-${width}-${theme}.png`)});
+   for(const [name,prefix] of [['basis','quality-basis-'],['facts','quality-facts-'],['method','quality-method-']]){
+    const disclosure=page.locator(`[id="${prefix+singleId}"]`);
+    await disclosure.locator(':scope > summary').click();
+    await disclosure.scrollIntoViewIfNeeded();
+    assert.equal(await disclosure.evaluate(node=>node.open),true,name+' evidence is expanded');
+    await disclosure.screenshot({path:path.join(output,`quality-expanded-${name}-${width}-${theme}.png`),animations:'disabled'});
+    await disclosure.evaluate(node=>node.scrollIntoView({block:'end'}));
+    await page.screenshot({path:path.join(output,`quality-expanded-${name}-bottom-${width}-${theme}.png`),animations:'disabled'});
+    await disclosure.locator(':scope > summary').click();
+   }
+  }
+  await page.setViewportSize({width:1440,height:1000});await page.evaluate(()=>document.documentElement.dataset.theme='light');
   const downloadEvent=page.waitForEvent('download');await page.getByRole('button',{name:'下载报告与证据'}).click();
   const download=await downloadEvent;await download.saveAs(path.join(output,'downloaded-single-report.json'));
   const downloaded=JSON.parse(fs.readFileSync(path.join(output,'downloaded-single-report.json')));
@@ -78,12 +121,13 @@ async function until(fn,label,ms=90000){const end=Date.now()+ms;while(Date.now()
   assert.match(readable,/未导入官方数据集/);assert.match(readable,/约束/);assert.match(readable,/单资源能力诊断/);assert.match(readable,/适用场景/);assert.match(readable,/题集内容指纹/);
   // Check actual wheel scroll, horizontal scroll, and refresh preservation.
   await page.locator('#modulePlaceholder .report-tab').nth(1).click();
-  const table=page.locator('#modulePlaceholder .table-wrap').last();await table.scrollIntoViewIfNeeded();await table.hover();
+  await page.locator('.main').evaluate(el=>el.scrollTop=0);await page.screenshot({path:path.join(output,'quality-cases-1440-light.png')});
+  const table=page.locator('#modulePlaceholder .table-wrap').last();assert.equal(await table.locator('th').count(),5,'request evidence groups related fields into five columns');await table.scrollIntoViewIfNeeded();await table.hover();
   await page.mouse.wheel(0,420);await page.waitForTimeout(200);
   const before=await table.evaluate(el=>({top:el.scrollTop,left:el.scrollLeft,h:el.clientHeight,all:el.scrollHeight}));
   if(before.top<=0){console.log('SCROLL_DIAGNOSTIC',await table.evaluate(el=>{const b=el.getBoundingClientRect();return {table:[b.x,b.y,b.width,b.height],point:document.elementFromPoint(b.x+b.width/2,b.y+b.height/2)?.outerHTML.slice(0,600),style:getComputedStyle(el).overflow,main:document.querySelector('.main').scrollTop,body:document.body.className}}));await page.screenshot({path:path.join(output,'scroll-failure.png')})};assert.ok(before.top>0&&before.all>before.h,JSON.stringify(before));
   await page.evaluate(()=>refresh());assert.ok(Math.abs((await table.evaluate(e=>e.scrollTop))-before.top)<3,'refresh resets scroll');
-  await page.locator('#modulePlaceholder .raw-link').last().click();
+  await page.locator('#modulePlaceholder [data-click-action="showQualityCase"]').last().click();
   assert.equal(await page.locator('#qualityEvidenceModal').isVisible(),true);
   assert.match(await page.locator('#qualityEvidenceModal').innerText(),/参考答案|判分依据/);
   assert.match(await page.locator('#qualityEvidenceModal').innerText(),/实际输出/);
@@ -123,6 +167,8 @@ async function until(fn,label,ms=90000){const end=Date.now()+ms;while(Date.now()
   const {quality_test_id:stoppedId}=await call('/quality-tests',{name:'本地模拟 · 停止与滚动',resources:[{name:'慢速模拟',url:server.upstream+'/v1',api_key:'synthetic-key-only',model:'quality-slow'}]});
   let stopped;await until(async()=>{stopped=await call('/quality-test/'+stoppedId);return stopped.completed_cases>=18},'slow task');
   await page.evaluate(async id=>{await refresh();await selectQuality(id)},stoppedId);
+  assert.equal(await page.locator('#modulePlaceholder .report-head [data-click-action="stopQuality"]').count(),1,'running stop action is in the header');
+  assert.equal(await page.locator('#modulePlaceholder [data-click-action="deleteQuality"]').count(),0,'running tasks do not offer deletion');
   await page.locator('#modulePlaceholder .report-tab').nth(1).click();
   const activeTable=page.locator('#modulePlaceholder .table-wrap').last();
   await activeTable.evaluate(el=>{el.scrollTop=200});const top=await activeTable.evaluate(el=>el.scrollTop);assert.ok(top>0);
@@ -144,7 +190,7 @@ async function until(fn,label,ms=90000){const end=Date.now()+ms;while(Date.now()
   const mobileTable=page.locator('#modulePlaceholder .table-wrap').last();
   const dimensions=await mobileTable.evaluate(e=>{e.scrollLeft=100;return {left:e.scrollLeft,w:e.clientWidth,all:e.scrollWidth}});
   assert.ok(dimensions.left>0,JSON.stringify(dimensions));
-  await page.locator('#modulePlaceholder .raw-link').last().click();
+  await page.locator('#modulePlaceholder [data-click-action="showQualityCase"]').last().click();
   await page.screenshot({path:path.join(output,'evidence-mobile.png')});
   assert.deepEqual(errors,[]);
   console.log(JSON.stringify({passed:true,singleQuestions:120,pairedRequests:240,regressions:11,stopAt:finalCount,download:true,scroll:true,restart:true,pageErrors:errors,output},null,2));

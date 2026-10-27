@@ -1,7 +1,7 @@
 PYTHON ?= .venv/bin/python
 COVERAGE_DIR := artifacts/coverage
 
-.PHONY: install run test check e2e coverage benchmark
+.PHONY: install run test check e2e e2e-tpm-launcher coverage benchmark benchmark-tpm clean-local
 install:
 	python3.11 -m venv .venv
 	$(PYTHON) -m pip install -r requirements-dev.lock
@@ -16,6 +16,8 @@ test: check
 	npm test
 e2e:
 	PYTHON=$(PYTHON) npm run e2e
+e2e-tpm-launcher:
+	TPM_ACTUAL_LAUNCHER=1 node tests/browser/tpm.cjs
 coverage:
 	mkdir -p $(COVERAGE_DIR)
 	$(PYTHON) -m coverage run --rcfile=pyproject.toml --data-file=$(COVERAGE_DIR)/.coverage tools/run_tests.py
@@ -23,3 +25,7 @@ coverage:
 	$(PYTHON) tools/check_coverage.py
 benchmark:
 	$(PYTHON) tools/benchmark.py
+benchmark-tpm:
+	$(PYTHON) tools/benchmark_tpm.py --browser
+clean-local:
+	rm -rf artifacts backups/runtime

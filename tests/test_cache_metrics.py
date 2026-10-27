@@ -8,9 +8,9 @@
 2. ``route_test_ui.Task``：逐条累加命中/未命中/无 usage 三个计数，并写进 JSONL；
 3. ``analyze.cache_stats``：离线复算同一个命中率。
 
-贯穿三条的判定只有一句：``usage.cached_tokens > 0`` 计一次命中；没有 usage 的请求
-进 ``no_usage`` 桶，**不进分母**。把「网关不回 usage」算成未命中，会把兼容性差异
-误读成缓存退化——这正是本模块最需要防住的错误。
+贯穿三条的判定只有一句：``usage.cached_tokens > 0`` 计一次命中；请求命中率分母是
+总请求数，没有 usage 的请求按未命中计入分母，同时进 ``no_usage`` 桶，避免把「命中
+可统计率」误当成用户要求的总请求命中率。
 """
 import json
 import os
@@ -55,7 +55,7 @@ def result(status_code=200, completed=True, cached_tokens=None, item_id=1):
 
 
 class AnalyzeCacheStatsTests(unittest.TestCase):
-    """离线复算：命中率的分母只算「真的带 cached_tokens」的记录。"""
+    """离线复算：请求命中率分母是全部请求，Token 比例另行要求完整用量。"""
 
     def test_hits_over_eligible_only(self):
         records = [result(cached_tokens=100), result(cached_tokens=0), result(cached_tokens=5)]
@@ -65,30 +65,40 @@ class AnalyzeCacheStatsTests(unittest.TestCase):
         self.assertEqual(stats["total"], 3)
         self.assertEqual(stats["no_usage"], 0)
 
-    def test_records_without_usage_are_excluded_not_counted_as_miss(self):
-        """没有 usage 的记录进 no_usage 桶，绝不能拉低命中率。"""
+    def test_records_without_usage_count_as_miss_for_total_request_rate(self):
+        """没有 usage 的记录仍在总请求分母中，并单独保留 no_usage 计数。"""
         records = [result(cached_tokens=10), result(cached_tokens=None), result(cached_tokens=None)]
         stats = analyze.cache_stats(records)
         self.assertEqual(stats["eligible"], 1)
         self.assertEqual(stats["hits"], 1)
         self.assertEqual(stats["no_usage"], 2)
+        self.assertEqual(stats["request_rate_pct"], 100.0 / 3)
         self.assertEqual(stats["total"], 3)
-        # 命中率按 1/1 算，而不是被稀释成 1/3。
-        self.assertEqual(analyze.pct(stats["hits"], stats["eligible"]), "100.00%")
+        self.assertEqual(analyze.pct(stats["hits"], stats["total"]), "33.33%")
 
     def test_no_usable_records_yields_empty_stats(self):
         stats = analyze.cache_stats([result(), result()])
         self.assertEqual(stats["eligible"], 0)
         self.assertEqual(stats["no_usage"], 2)
-        self.assertEqual(analyze.pct(stats["hits"], stats["eligible"]), "—")
+        self.assertEqual(stats["request_rate_pct"], 0.0)
+        self.assertEqual(analyze.pct(stats["hits"], stats["total"]), "0.00%")
 
     def test_zero_and_hundred_percent_endpoints(self):
         """0% 与 100% 都是合法结论，不能因为「没有变化」就显示成缺数据。"""
         miss = analyze.cache_stats([result(cached_tokens=0), result(cached_tokens=0)])
-        self.assertEqual(analyze.pct(miss["hits"], miss["eligible"]), "0.00%")
+        self.assertEqual(analyze.pct(miss["hits"], miss["total"]), "0.00%")
 
         hit = analyze.cache_stats([result(cached_tokens=9), result(cached_tokens=9)])
-        self.assertEqual(analyze.pct(hit["hits"], hit["eligible"]), "100.00%")
+        self.assertEqual(analyze.pct(hit["hits"], hit["total"]), "100.00%")
+
+    def test_invalid_cached_token_values_are_unknown(self):
+        invalid_text = result(cached_tokens=0); invalid_text["cached_tokens"] = "not-a-number"
+        invalid_nan = result(cached_tokens=0); invalid_nan["cached_tokens"] = float("nan")
+        numeric_text = result(cached_tokens=0); numeric_text["cached_tokens"] = "4"
+        stats = analyze.cache_stats([invalid_text, invalid_nan, numeric_text])
+        self.assertEqual(stats["eligible"], 1)
+        self.assertEqual(stats["hits"], 1)
+        self.assertEqual(stats["no_usage"], 2)
 
 
 class TaskCacheAccumulatorTests(unittest.TestCase):
@@ -124,14 +134,28 @@ class TaskCacheAccumulatorTests(unittest.TestCase):
         self.assertEqual(cache["hits"], 1)
         self.assertEqual(cache["no_usage"], 0)
         self.assertEqual(cache["rate_pct"], 50.0)
+        self.assertEqual(cache["request_total"], 2)
         self.assertEqual(cache["basis"], "usage.cached_tokens>0")
 
+    def test_snap_exposes_token_rate_separately_from_request_rate(self):
+        task, _ = self._task()
+        hit = result(cached_tokens=64, item_id=1); hit["prompt_tokens"] = 128
+        miss = result(cached_tokens=0, item_id=2); miss["prompt_tokens"] = 128
+        task.record(hit); task.record(miss)
+        cache = task.snap()["cache"]
+        self.assertEqual(cache["rate_pct"], 50.0)
+        self.assertEqual(cache["token_rate_pct"], 25.0)
+        self.assertEqual(cache["prompt_tokens"], 256.0)
+        self.assertEqual(cache["cached_tokens"], 64.0)
+        self.assertEqual(cache["token_basis"], "usage.cached_tokens/usage.prompt_tokens")
+
     def test_snap_rate_is_none_without_usable_samples(self):
-        """没有任何带 usage 的样本时给 None，不能谎报 0%。"""
+        """按总请求数计算时，缺失缓存字段的请求属于未命中。"""
         task, _ = self._task()
         task.record(result(cached_tokens=None, item_id=1))
         cache = task.snap()["cache"]
-        self.assertIsNone(cache["rate_pct"])
+        self.assertEqual(cache["rate_pct"], 0.0)
+        self.assertEqual(cache["request_total"], 1)
         self.assertEqual(cache["no_usage"], 1)
 
     def test_cache_fields_are_written_to_jsonl(self):
@@ -158,6 +182,31 @@ class TaskCacheAccumulatorTests(unittest.TestCase):
         self.assertNotIn("raw_input", row)
         self.assertNotIn("raw_output", row)
 
+    def test_failed_request_keeps_trace_id_and_structured_error_by_default(self):
+        """失败请求不应依赖开启原文采集才可逐条核查。"""
+        task, path = self._task()
+        failed = result(status_code=502, completed=False, item_id=9)
+        failed.update(error_type="HTTP_5XX", error_detail="upstream unavailable",
+                      reason="upstream unavailable")
+        task.record(failed)
+        task.close_output()
+        with open(path, encoding="utf-8") as handle:
+            row = json.loads(handle.readline())
+        self.assertEqual(row["request_id"], f"{task.id}:9")
+        self.assertEqual(row["error_type"], "HTTP_5XX")
+        self.assertEqual(row["error_detail"], "upstream unavailable")
+        recent = task.snap()["recent"][0]
+        self.assertEqual(recent["request_id"], row["request_id"])
+        self.assertEqual(recent["error_type"], "HTTP_5XX")
+
+    def test_gateway_detail_renders_cache_metric_and_trace_fields(self):
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with open(os.path.join(root, "static", "app.js"), encoding="utf-8") as handle:
+            source = handle.read()
+        self.assertIn("缓存命中率（请求）", source)
+        self.assertIn("gatewayErrorText", source)
+        self.assertIn("request_id", source)
+
     def test_offline_recompute_matches_online_accumulator(self):
         """在线累加与离线复算必须是同一个结论——两处口径漂移会让报告自相矛盾。"""
         task, path = self._task()
@@ -173,16 +222,35 @@ class TaskCacheAccumulatorTests(unittest.TestCase):
         self.assertEqual(online["hits"], offline["hits"])
         self.assertEqual(online["no_usage"], offline["no_usage"])
 
+    def test_offline_token_rate_matches_online_accumulator(self):
+        task, path = self._task()
+        for index, cached in enumerate((50, 0, 25)):
+            row = result(cached_tokens=cached, item_id=index); row["prompt_tokens"] = 100
+            task.record(row)
+        online = task.snap()["cache"]
+        task.close_output()
+        with open(path, encoding="utf-8") as handle:
+            rows = [json.loads(line) for line in handle if line.strip()]
+        offline = analyze.cache_stats(rows)
+        self.assertEqual(online["token_eligible"], offline["token_eligible"])
+        self.assertEqual(online["prompt_tokens"], offline["prompt_tokens"])
+        self.assertEqual(online["cached_tokens"], offline["cached_tokens"])
+        self.assertEqual(online["token_rate_pct"], offline["token_rate_pct"])
+
 
 class CacheUiScriptTests(unittest.TestCase):
     """前端脚本必须真的把 cache 数据渲染出来，而不是只存在于接口里。"""
 
     def test_page_script_mentions_cache_metric(self):
-        with open(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                               "route_test_ui.py"), encoding="utf-8") as handle:
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with open(os.path.join(root, "route_test_ui.py"), encoding="utf-8") as handle:
+            backend = handle.read()
+        with open(os.path.join(root, "static", "app.js"), encoding="utf-8") as handle:
             source = handle.read()
-        self.assertIn('"cache"', source)
-        self.assertIn("usage.cached_tokens>0", source)
+        self.assertIn('"cache"', backend)
+        self.assertIn("usage.cached_tokens>0", backend)
+        self.assertIn("token_rate_pct", backend)
+        self.assertIn("上游已返回缓存字段", source)
 
 
 if __name__ == "__main__":

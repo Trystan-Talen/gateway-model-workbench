@@ -267,6 +267,7 @@ class RepeatTests(_RepeatFixture):
         source = self.add_source("fingerprint")
         preview = ui.prepare_repeat(self.body("fingerprint"))
         self.assertEqual(preview["preflight"]["planned_requests"], 40)
+        self.assertEqual(preview["preflight"]["planned_rpm"], source["protocol"]["rpm"])
         self.assertTrue(preview["preflight"]["requires_confirmation"])
         with self.assertRaisesRegex(ui.RepeatError, "确认"):
             ui.create_repeat(self.body("fingerprint"))
@@ -276,6 +277,37 @@ class RepeatTests(_RepeatFixture):
         self.assertEqual(copied["reference_id"], "original-reference")
         self.assertEqual(options["frozen_protocol"], source["protocol"])
         self.assertEqual(copied["endpoint"]["api_key"], "synthetic-current-key")
+
+    def test_reasoning_fingerprint_repeat_discloses_frozen_output_budget_and_requires_consent(self):
+        for adapter in ("openai_reasoning", "deepseek_reasoning", "zhipu_reasoning"):
+            with self.subTest(adapter=adapter):
+                source = self.add_source("fingerprint")
+                source["protocol"] = fingerprint_protocol.make_protocol({"preset": "quick", "samples_per_cell": 10, "adapter": adapter})
+                original = copy.deepcopy(source)
+                preview = ui.prepare_repeat(self.body("fingerprint"))["preflight"]
+                self.assertEqual(preview["max_output_tokens"], 4096)
+                self.assertEqual(preview["max_total_output_tokens"], 40 * 4096)
+                detail = preview["findings"][0]["detail"]
+                for text in ("4,096", "163,840", "含思考", "探索性"):
+                    self.assertIn(text, detail)
+                with self.assertRaisesRegex(ui.RepeatError, "确认"):
+                    ui.create_repeat(self.body("fingerprint"))
+                ui.create_repeat(self.body("fingerprint", risk_acknowledged=True))
+                self.assertEqual(self.managers["fingerprint"].created[-1][1]["frozen_protocol"], source["protocol"])
+                self.assertEqual(source, original)
+
+    def test_glm_official_repeat_rejects_old_incompatible_protocol_before_cost_confirmation(self):
+        for host in ("open.bigmodel.cn", "api.z.ai"):
+            for adapter in ("standard", "zhipu"):
+                with self.subTest(host=host, adapter=adapter):
+                    source = self.add_source("fingerprint")
+                    source["endpoint"] = {"url": "https://" + host + "/api/paas/v4", "model": "glm-5.3-flash"}
+                    source["protocol"] = fingerprint_protocol.make_protocol({"adapter": adapter})
+                    before = copy.deepcopy(source)
+                    with self.assertRaisesRegex(ui.RepeatError, "不能关闭思考.*4096.*新建"):
+                        ui.prepare_repeat(self.body("fingerprint"))
+                    self.assertFalse(self.managers["fingerprint"].created)
+                    self.assertEqual(source, before)
 
     def test_fingerprint_profile_binding_uses_original_unexpanded_url(self):
         source = self.add_source("fingerprint")

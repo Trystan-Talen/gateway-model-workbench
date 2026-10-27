@@ -10,7 +10,7 @@ const {projectRoot:root,output,env}=require('./artifacts.cjs').browserArtifacts(
 const assets = process.env.UI_ASSET_ROOT || path.join(root,'static');
 const python = process.env.PYTHON || 'python3';
 const html = process.env.UI_HTML ? fs.readFileSync(process.env.UI_HTML,'utf8') : execFileSync(python,['-c','import route_test_ui; print(route_test_ui.INDEX_HTML)'],{cwd:root,encoding:'utf8',env});
-const fixture = JSON.parse(execFileSync(python,['-c','import json; from fingerprint_protocol import catalog,make_protocol; print(json.dumps({"catalog":catalog(),"protocol":make_protocol({"preset":"quick","samples_per_cell":10,"concurrency":2})}))'],{cwd:root,encoding:'utf8',env}));
+const fixture = JSON.parse(execFileSync(python,['-c','import json; from fingerprint_protocol import catalog,make_protocol; print(json.dumps({"catalog":catalog(),"protocol":make_protocol({"preset":"quick","samples_per_cell":10,"concurrency":2}),"reasoning_protocol":make_protocol({"preset":"quick","samples_per_cell":10,"concurrency":2,"adapter":"openai_reasoning"})}))'],{cwd:root,encoding:'utf8',env}));
 const origin = 'http://127.0.0.1:18769';
 const errors = [], unexpected = [], assertions = [], allSubmissions = [];
 const clone = x => JSON.parse(JSON.stringify(x));
@@ -32,6 +32,16 @@ async function geometry(page,width,label) {
     assert.equal(await page.locator('.app').evaluate(n=>n.inert),true,label+': inert background');
   }
 }
+async function capture(page,width,state) {
+  if(['overview','diagnostics','protocol','samples'].includes(state))await page.locator('#fpTabPanel').evaluate(node=>node.scrollIntoView({block:'start'}));
+  for (const theme of ['light','dark']) {
+    await page.evaluate(theme=>{setTheme(theme);document.getElementById('toast').classList.remove('show')},theme);
+    await page.evaluate(()=>new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve))));
+    await page.waitForTimeout(250);
+    await geometry(page,width,state);
+    await page.screenshot({path:path.join(output,`fingerprint-${state}-${width}-${theme}.png`)});
+  }
+}
 async function fillEndpoint(page,name='合成通道自检') {
   await page.locator('#fpName').fill(name);
   await page.locator('#fpUrl').fill('https://synthetic.invalid/v1');
@@ -45,10 +55,12 @@ async function fillEndpoint(page,name='合成通道自检') {
   if(process.env.CHROME_PATH||fs.existsSync(chrome)) options.executablePath=process.env.CHROME_PATH||chrome;
   const browser=await chromium.launch(options);
   try {
-    for(const width of [390,768,1440]) {
+    for(const width of [390,980,1440]) {
       const context=await browser.newContext({viewport:{width,height:width===390?844:1000},reducedMotion:'reduce'});
       const page=await context.newPage();
       let runs=[], refs=[reference('ref-good','可信参考 <img src=x onerror=alert(1)>'),reference('ref-old','过期参考',{collected_at:'2020-01-01T00:00:00Z'}),reference('ref-external','外部协议参考',{protocol:{version:'external',external_protocol:true},imported:true})];
+      const legacyProtocol=clone(fixture.protocol);delete legacyProtocol.rpm;legacyProtocol.id='synthetic-legacy-no-rate';refs.push(reference('ref-legacy','旧版参考',{protocol:legacyProtocol}));
+      refs.push(reference('ref-reasoning','思考协议参考',{protocol:fixture.reasoning_protocol}));
       let samplesFail=false, catalogFail=false, compareCount=0, imported=0;
       const sampleRows=Array.from({length:73},(_,i)=>({index:i,cell_id:fixture.protocol.cells[i%4],paraphrase_index:i%3,started_at:now(),finished_at:now(),latency_ms:12,status_code:200,category:i===1?'invalid':'valid',normalized:'blue',raw:i===1?'<img src=x onerror=alert(1)>':'blue',extra_text:false,finish_reason:'stop',truncated:false,returned_model:'synthetic-model',usage:{prompt_tokens:10,completion_tokens:1,reported_cost:null},error:null}));
       page.on('pageerror',e=>errors.push({width,message:e.message}));
@@ -68,7 +80,7 @@ async function fillEndpoint(page,name='合成通道自检') {
         else if(endpoint==='/fingerprint/catalog'){if(catalogFail)return route.fulfill({status:503,json:{error:'合成协议读取失败'}});data=fixture.catalog}
         else if(endpoint==='/fingerprint/references'&&method==='GET')data={references:refs};
         else if(endpoint==='/fingerprints'&&method==='POST'){
-          const body=req.postDataJSON();allSubmissions.push({width,body:clone(body)});
+          const body=req.postDataJSON();if(body.mode==='selfcheck'){assert.equal(body.concurrency,20);assert.equal(body.rpm,100)}allSubmissions.push({width,body:clone(body)});
           const id='run-'+(runs.length+1), run={id,name:body.name,mode:body.mode,status:'running',created:now(),started_at:now(),finished_at:null,endpoint:{url:body.endpoint.url,model:body.endpoint.model},protocol:fixture.protocol,progress:{done:0,total:40,valid:0,errors:0},error:null,reference_id:body.reference_id||null,comparison:null,diagnostics:null,source_note:body.source_note||'',artifact:null};runs.unshift(run);data={run};
         }
         else if(/^\/fingerprints\/[^/]+\/stop$/.test(endpoint)){
@@ -103,23 +115,70 @@ async function fillEndpoint(page,name='合成通道自检') {
       await geometry(page,width,'empty '+width);
       await page.locator('#recordCreateButton').click();
       await page.locator('#fpName').waitFor();
+      assert.equal(await page.locator('#fpConcurrency').inputValue(),'20','new collection concurrency defaults to 20');
+      assert.equal(await page.locator('#fpRpm').inputValue(),'100','new collection RPM defaults to 100');
+      assert.equal(await page.locator('#fpAdvanced').evaluate(el=>el.open),false,'advanced protocol fields start folded');
+      for(const theme of ['light','dark']) {
+        await page.evaluate(value=>document.documentElement.dataset.theme=value,theme);
+        await geometry(page,width,'new drawer '+width+' '+theme);
+        await page.screenshot({path:path.join(output,`fingerprint-new-${width}-${theme}.png`)});
+      }
+      await page.evaluate(()=>document.documentElement.dataset.theme='light');
       await fillEndpoint(page);
+      await page.locator('#fpSamples').fill('37');
       await page.locator('#fpPreset').selectOption('quick');
-      assert.match(await page.locator('#fpRequestCount').innerText(),/60/);
+      assert.equal(await page.locator('#fpSamples').inputValue(),'37','collection scope never overwrites the chosen sample count');
+      assert.match(await page.locator('#fpRequestCount').innerText(),/148/);
       await page.locator('#fpSamples').fill('10');
       assert.match(await page.locator('#fpRequestCount').innerText(),/40/);
       await page.locator('#fpRiskAck').check();
+      await page.locator('#fpAdapter').selectOption('openai_reasoning');
+      assert.equal(await page.locator('#fpRiskAck').isChecked(),false,'reasoning selection clears fee approval');
+      assert.match(await page.locator('#fpBudgetNote').innerText(),/4,096.*163,840/,'reasoning per-request and plan caps are shown');
+      assert.match(await page.locator('#fpAdapterHint').innerText(),/仅供探索性对照/);
+      assert.equal(allSubmissions.filter(s=>s.width===width).length,0,'changing reasoning adapter sends no requests');
+      await capture(page,width,'reasoning-create');
+      await page.locator('#fpAdapter').selectOption('standard');
+      assert.match(await page.locator('#fpBudgetNote').innerText(),/上限 16.*640/,'returning to direct protocol restores exact cap');
+      await page.locator('#fpUrl').fill('https://open.bigmodel.cn/api/paas/v4');
+      await page.locator('#fpModel').fill('glm-5.3-flash');
+      assert.equal(await page.locator('#fpAdapter').inputValue(),'standard','GLM model does not auto-increase output budget');
+      assert.match(await page.locator('#fpAdapterHint').innerText(),/不能关闭思考/);
+      await page.locator('#fpRiskAck').check();
+      await page.locator('#fpAdapter').selectOption('zhipu_reasoning');
+      assert.equal(await page.locator('#fpRiskAck').isChecked(),false,'GLM reasoning requires renewed fee confirmation');
+      assert.match(await page.locator('#fpBudgetNote').innerText(),/4,096.*163,840/);
+      assert.match(await page.locator('#fpAdapterHint').innerText(),/低强度思考/);
+      await capture(page,width,'glm-reasoning-create');
+      assert.equal(allSubmissions.filter(s=>s.width===width).length,0,'GLM adapter inspection sends no paid requests');
+      await page.locator('#fpUrl').fill('https://synthetic.invalid/v1');
+      await page.locator('#fpAdapter').selectOption('standard');
+      await page.locator('#fpRiskAck').check();
       await page.locator('#fpModel').fill('changed-model');
       assert.equal(await page.locator('#fpRiskAck').isChecked(),false,'target edit resets cost acknowledgment');
-      await page.locator('input[name="fpMode"][value="reference"]').check();
+      await page.locator('#fpMode').selectOption('reference');
       assert.equal(await page.locator('#fpUrl').inputValue(),'https://synthetic.invalid/v1','mode switch preserves URL');
       assert.equal(await page.locator('#fpKey').inputValue(),'synthetic-secret-never-send','mode switch preserves draft secret');
       assert.equal(await page.locator('#fpSourceSection').isVisible(),true);
-      await page.locator('input[name="fpMode"][value="verify"]').check();
+      await page.locator('#fpMode').selectOption('verify');
+      assert.equal(await page.locator('#fpReference option[value="ref-reasoning"]').isDisabled(),false,'reasoning references can be reused explicitly');
+      await page.locator('#fpReference').selectOption('ref-reasoning');
+      assert.equal(await page.locator('#fpAdapter').inputValue(),'openai_reasoning');
+      assert.match(await page.locator('#fpBudgetNote').innerText(),/4,096.*163,840/,'reference freezes reasoning budget');
+      assert.equal(await page.locator('#fpAdapter').isDisabled(),true,'reasoning reference cannot be mixed with direct protocol');
       await page.locator('#fpReference').selectOption('ref-good');
-      for(const id of ['fpPreset','fpSamples','fpConcurrency','fpTimeout','fpAdapter'])assert.equal(await page.locator('#'+id).isDisabled(),true,id+' locked');
+      for(const id of ['fpPreset','fpSamples','fpConcurrency','fpRpm','fpTimeout','fpAdapter'])assert.equal(await page.locator('#'+id).isDisabled(),true,id+' locked');
       assert.equal(await page.locator('#fpPreset').inputValue(),'quick','numeric catalog cell count locks correct preset');
       assert.equal(await page.locator('#fpConcurrency').inputValue(),'2');
+      assert.equal(await page.locator('#fpRpm').inputValue(),'100');
+      await page.locator('#fpReference').selectOption('ref-legacy');
+      assert.equal(await page.locator('#fpRpm').inputValue(),'','legacy reference does not invent a rate');
+      assert.match(await page.locator('#fpProtocolLock').innerText(),/未设置每分钟请求数/);
+      await page.locator('#fpMode').selectOption('selfcheck');
+      assert.equal(await page.locator('#fpConcurrency').inputValue(),'20','leaving reference restores the new collection draft');
+      assert.equal(await page.locator('#fpRpm').inputValue(),'100','leaving legacy reference restores RPM');
+      await page.locator('#fpMode').selectOption('verify');
+      await page.locator('#fpReference').selectOption('ref-good');
       assert.equal(await page.locator('#fpReference option[value="ref-old"]').isDisabled(),true,'expired reference disabled');
       assert.equal(await page.locator('#fpReference option[value="ref-external"]').isDisabled(),true,'external reference disabled');
       await geometry(page,width,'verify drawer '+width);
@@ -134,13 +193,17 @@ async function fillEndpoint(page,name='合成通道自检') {
       await page.getByRole('heading',{name:'合成通道自检',exact:true}).waitFor();
       assert.equal(await page.locator('#fpKey').count(),0);
       assert.equal(await page.evaluate(()=>Object.values(localStorage).some(x=>x.includes('synthetic-secret-never-send'))),false,'secret not saved');
+      assert.equal(await page.locator('.report-head [data-fp-action="stop"]').count(),1,'stop action is visible in the header');
+      await capture(page,width,'running');
       await page.locator('[data-fp-action="stop"]').click();
       await page.getByRole('heading',{name:'已形成指纹证据'}).waitFor();
-      await geometry(page,width,'overview '+width);
+      await geometry(page,width,'overview '+width);await capture(page,width,'overview');
       await page.getByRole('tab',{name:'通道诊断',exact:true}).click();
       assert.match(await page.locator('.fp-cost').innerText(),/未知/,'missing cost stays unknown');
+      await capture(page,width,'diagnostics');
       await page.getByRole('tab',{name:'协议与来源',exact:true}).click();
       assert.match(await page.locator('#fpTabPanel').innerText(),/冻结协议快照/);
+      await capture(page,width,'protocol');
       samplesFail=true;
       await page.getByRole('tab',{name:'原始样本',exact:true}).click();
       await page.getByText('样本读取失败：合成样本读取失败').waitFor();
@@ -150,11 +213,13 @@ async function fillEndpoint(page,name='合成通道自检') {
       await page.waitForFunction(()=>document.querySelector('.fp-pagination')?.textContent.includes('51–73'));
       await page.getByRole('button',{name:'上一页',exact:true}).click();
       await page.waitForFunction(()=>document.querySelector('.fp-pagination')?.textContent.includes('1–50'));
-      await page.locator('.fp-sample').nth(1).locator('summary').click();
-      assert.equal(await page.locator('#modulePlaceholder img').count(),0,'sample text escaped');
-      await geometry(page,width,'samples '+width);
+      await geometry(page,width,'samples '+width);await capture(page,width,'samples');
+      await page.locator('[data-click-action="showFingerprintSample"]').nth(1).click();
+      assert.equal(await page.locator('#fpModalBody img').count(),0,'sample text escaped');
+      await capture(page,width,'evidence');
+      await page.locator('#fpModalFooter [data-fp-action="close-modal"]').click();
       await page.locator('[data-fp-action="compare"]').click();
-      await page.locator('#fpCompareReference').selectOption('ref-good');
+      await page.locator('#fpCompareReference').selectOption('ref-good');await capture(page,width,'compare');
       await page.locator('[data-fp-action="submit-compare"]').click();
       await page.getByRole('heading',{name:'行为分布相近',exact:true}).waitFor();
       assert.equal(compareCount,1);
@@ -167,16 +232,30 @@ async function fillEndpoint(page,name='合成通道自检') {
       await page.locator('[data-fp-view="references"]').click();
       await page.getByRole('heading',{name:'参考库',exact:true}).waitFor();
       assert.equal(await page.locator('#modulePlaceholder img').count(),0,'reference name escaped');
-      await geometry(page,width,'library '+width);
+      await geometry(page,width,'library '+width);await capture(page,width,'library');
+      assert.equal(await page.locator('#modulePlaceholder [data-fp-action="create-reference"]').count(),0,'record panel is the only new-reference entry');
+      assert.equal(await page.locator('.fp-reference-card [data-fp-action="delete-reference"]').count(),0,'destructive reference actions stay inside details');
       await page.locator('[data-fp-action="import"]').click();
       await page.locator('#fpImportFile').setInputFiles({name:'synthetic-reference.json',mimeType:'application/json',buffer:Buffer.from(JSON.stringify(artifact()))});
-      await page.locator('#fpImportName').fill('导入合成参考');
+      await page.locator('#fpImportName').fill('导入合成参考');await capture(page,width,'import');
       await page.locator('[data-fp-action="submit-import"]').click();
       await page.getByRole('heading',{name:'导入合成参考',exact:true}).waitFor();
       assert.equal(imported,1);
-      await page.locator('[data-fp-action="delete-reference"][data-fp-id="ref-import-1"]').click();
+      await page.locator('.fp-reference-card [data-fp-action="reference-detail"][data-fp-id="ref-import-1"]').click();await capture(page,width,'reference');
+      await page.locator('[data-fp-action="delete-reference"][data-fp-id="ref-import-1"]').click();await capture(page,width,'delete');
       await page.locator('[data-fp-action="confirm-delete"]').click();
       await page.getByRole('heading',{name:'导入合成参考',exact:true}).waitFor({state:'detached'});
+      await page.locator('#recordCreateButton').click();await page.locator('#fpName').waitFor();
+      await page.locator('#fpMode').selectOption('verify');
+      await page.locator('#fpReference').selectOption('ref-legacy');
+      await fillEndpoint(page,'合成旧参考对照');
+      await page.locator('#fpRiskAck').check();
+      await page.locator('#fpSubmit').click();
+      await page.getByRole('heading',{name:'合成旧参考对照',exact:true}).waitFor();
+      const legacySubmission=allSubmissions.at(-1).body;
+      assert.equal(legacySubmission.reference_id,'ref-legacy');
+      assert.equal(legacySubmission.concurrency,2);
+      assert.equal(Object.hasOwn(legacySubmission,'rpm'),false,'legacy comparison submits no invented RPM');
       await page.locator('#recordCreateButton').click();await page.locator('#fpName').waitFor();await fillEndpoint(page,'会话清理');
       await page.evaluate(()=>{authenticated=false;FingerprintUI.onAuthLost()});
       assert.equal(await page.locator('#fpKey').count(),0,'auth loss clears key');

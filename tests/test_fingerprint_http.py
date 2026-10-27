@@ -78,7 +78,7 @@ class FingerprintHttpTests(unittest.TestCase):
 
     def config(self, **changes):
         return {'mode': 'selfcheck', 'name': '合成接口验收', 'preset': 'quick', 'samples_per_cell': 10,
-                'concurrency': 2, 'timeout_seconds': 5, 'adapter': 'standard', 'risk_acknowledged': True,
+                'concurrency': 2, 'rpm': 600000, 'timeout_seconds': 5, 'adapter': 'standard', 'risk_acknowledged': True,
                 'endpoint': {'url': 'https://synthetic.invalid/v1', 'model': 'synthetic-model', 'api_key': 'SYNTHETIC-TEST-KEY'}, **changes}
 
     def finished(self, identifier):

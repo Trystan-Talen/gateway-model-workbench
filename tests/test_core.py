@@ -203,9 +203,16 @@ class CoreTests(unittest.TestCase):
         for mode, extra in (('smoke', {}), ('soak', {}), ('ramp', {'ramps': '100,200,400'})):
             with self.subTest(mode=mode):
                 cfg = ui.validate_config({**base, 'mode': mode, **extra})
-                self.assertEqual((cfg['rpm'], cfg['concurrency']), (100, 100))
+                self.assertEqual((cfg['rpm'], cfg['concurrency']), (100, 20))
         cfg = ui.validate_config({**base, 'rpm': 321, 'concurrency': 7})
         self.assertEqual((cfg['rpm'], cfg['concurrency']), (321, 7))
+
+    def test_cache_profile_is_accepted_by_workbench_config(self):
+        cfg = ui.validate_config({
+            'url': 'http://x.test', 'api_key': 'synthetic-key', 'model': 'synthetic-model',
+            'profile': 'cache',
+        })
+        self.assertEqual(cfg['profile'], 'cache')
 
     def test_task_classifies_protocol_separately(self):
         cfg = ui.validate_config({'url':'http://x.test','api_key':'secret','model':'m','mode':'smoke'})

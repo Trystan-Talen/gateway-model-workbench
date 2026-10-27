@@ -65,10 +65,15 @@ class SubmitGateTests(unittest.TestCase):
                     return script[start:offset]
         raise AssertionError(f"unbalanced braces after {marker!r}")
 
-    def _run(self, create_kind):
+    def _run(self, create_kind, *, acknowledged=True, confirm=True, invalid_url=False, expected_error=None):
         script = self._script()
         parts = [
-            # 真实实现：读取质量/路由表单 + 提交处理。
+            # 真实实现：字段定位、配置校验、确认闸门、表单读取及提交处理。
+            "function focusCreateField(input){" + self._body(script, "function focusCreateField(input){") + "}",
+            "function currentQualityModel(row){" + self._body(script, "function currentQualityModel(row){") + "}",
+            "function validateQualityForm(){" + self._body(script, "function validateQualityForm(){") + "}",
+            "function validateGatewayForm(){" + self._body(script, "function validateGatewayForm(){") + "}",
+            "async function ensurePreflightAck(){" + self._body(script, "async function ensurePreflightAck(){") + "}",
             "function connectionBindingNode(context,target=''){" + self._body(script, "function connectionBindingNode(context,target=''){") + "}",
             "function boundConnectionId(context,target=''){" + self._body(script, "function boundConnectionId(context,target=''){") + "}",
             "function readQuality(){" + self._body(script, "function readQuality(){") + "}",
@@ -83,39 +88,49 @@ class SubmitGateTests(unittest.TestCase):
             {"name": "资源 B", "url": "https://api.example-provider.com/v1",
              "api_key": "sk-synthetic", "model": "probe-model"},
         ]
+        if invalid_url:
+            resources[0]["url"] = "not-an-interface-address"
         harness = (
-            "const createKind=%s;\n"
+            "const createKind=%s,acknowledged=%s,confirmation=%s,invalidUrl=%s,expectedError=%s;\n"
             "const __calls=[];const __nodes={};const __errors=[];\n"
             "function __el(id){return __nodes[id]||(__nodes[id]={id,textContent:'',className:'',"
-            "value:'',hidden:false,disabled:false,type:'',checked:false,innerHTML:'',styles:{},dataset:{},"
+            "value:'',hidden:false,disabled:false,type:'',checked:false,innerHTML:'',styles:{},dataset:{},min:1,max:600000,"
+            "checkValidity(){return this.type!=='number'||(this.value!==''&&Number.isFinite(Number(this.value))&&Number(this.value)>=this.min&&Number(this.value)<=this.max)},"
+            "focus(){document.activeElement=this},scrollIntoView(){},reportValidity(){return this.checkValidity()},"
             "querySelector:()=>({value:''}),querySelectorAll:()=>[],"
             "closest:()=>({classList:{add(){},remove(){}}}),"
             "setAttribute(){},appendChild(){}});}\n"
             "function $(id){return __el(id)}\n"
             "const QUALITY_ROWS=%s.map((r,index)=>{const kv={'.quality-name':r.name,'.quality-url':r.url,"
             "'.quality-key':r.api_key,'.quality-model':r.model};"
-            "return {dataset:{qualityIndex:String(index)},querySelector:(sel)=>({value:kv[sel]??''})}});\n"
+            "const fields=Object.fromEntries(Object.entries(kv).map(([sel,value])=>{const el=__el('quality-'+index+sel);el.value=value;return [sel,el]}));"
+            "fields['.quality-model-refresh']=__el('quality-refresh-'+index);"
+            "return {dataset:{qualityIndex:String(index)},querySelector:sel=>fields[sel]}});\n"
             "const ROUTING_ROWS=Object.fromEntries(['baseline','candidate'].map((side,i)=>{"
             "const kv={'.routing-side-name':side,'.routing-side-url':'http://127.0.0.1:'+(9001+i)+'/v1',"
             "'.routing-side-key':'synthetic-'+side};"
             "return [side,{dataset:{routingSide:side},querySelector:(sel)=>({value:kv[sel]??''})}]}));\n"
-            "const document={querySelectorAll:(sel)=>sel==='#qualityResourceFields .quality-resource'?QUALITY_ROWS:[],"
+            "const GROUP_ROWS=['baseline','comparison'].map((role,index)=>{const values={'.group-role':role,'.group-concurrency':'20','.group-rpm':'100','.group-iterations':'50'};"
+            "const fields=Object.fromEntries(Object.entries(values).map(([selector,value])=>{const el=__el('group-'+index+selector);el.value=value;return [selector,el]}));return {querySelector:selector=>fields[selector]}});\n"
+            "const document={querySelectorAll:(sel)=>sel==='#qualityResourceFields .quality-resource'?QUALITY_ROWS:sel==='#groupFields .group-row'?GROUP_ROWS:[],"
             "querySelector:sel=>sel.includes('data-routing-side')?ROUTING_ROWS[sel.includes('candidate')?'candidate':'baseline']:null,addEventListener(){}};\n"
-            "const esc=s=>String(s??'');const toast=message=>{if($('formStatus').className==='form-status error')__errors.push(message)};const nativeConfirm=()=>true;\n"
+            "const esc=s=>String(s??'');const toast=message=>{if($('formStatus').className==='form-status error')__errors.push(message)};const confirm=()=>confirmation;\n"
             "const isQualityCreate=()=>createKind.startsWith('quality-');\n"
             "const isRoutingCreate=()=>createKind==='routing-compare';\n"
             "const isCompareCreate=()=>createKind.endsWith('-compare');\n"
             "const isGatewayCreate=()=>createKind.startsWith('gateway-');\n"
             "let preflightData={requires_confirmation:true,target:{host:'api.example-provider.com',reason:'公网域名'}};\n"
             "let preflightAckRequested=true;\n"
-            "$('riskAck').checked=true;\n"
+            "$('riskAck').checked=acknowledged;\n"
             "for(const [id,value] of Object.entries({routingTier:'1000',routingName:'路由对照',"
             "routingModel:'shared-routing-model',routingConcurrency:'4',routingRpm:'120',"
             "routingConnectTimeout:'9',routingReadTimeout:'45'}))$(id).value=value;\n"
             "$('routingModelManualWrap').hidden=true;\n"
+            "$('url').value=invalidUrl?'not-an-interface-address':'https://api.example-provider.com/v1';\n"
+            "const modelFetchState='success',mode='smoke';\n"
+            "for(const [id,value] of Object.entries({concurrency:20,rpm:100,iterations:50,duration:60,connect_timeout:10,read_timeout:60})){const el=$(id);el.type='number';el.value=String(value)}\n"
             "const currentModel=()=> 'unrelated-gateway-model';\n"
             "const refreshPreflight=async()=>{};\n"
-            "const ensurePreflightAck=async()=>true;\n"
             "const validateRoutingForm=()=>true;\n"
             "const readComparison=()=>({name:'对照',shared_config:{},groups:[]});\n"
             "const readConfig=()=>({});const saveConfig=()=>{};const resetKeyButton=()=>{};\n"
@@ -126,8 +141,9 @@ class SubmitGateTests(unittest.TestCase):
             "return {quality_test_id:'x',task_id:'y',comparison_id:'z',routing_comparison_id:'r'}};\n"
             + "\n".join(parts) + "\n"
             "$('submit').onclick();\n"
-            "setTimeout(()=>{if(__errors.length)throw new Error(__errors.join('; '));console.log(JSON.stringify(__calls))},60);\n"
-        ) % (json.dumps(create_kind), json.dumps(resources))
+            "setTimeout(()=>{if(expectedError){if(!__errors.some(error=>error.includes(expectedError)))throw new Error('missing validation failure: '+__errors.join('; '))}else if(__errors.length)throw new Error(__errors.join('; '));console.log(JSON.stringify(__calls))},60);\n"
+        ) % (json.dumps(create_kind), json.dumps(acknowledged), json.dumps(confirm),
+             json.dumps(invalid_url), json.dumps(expected_error), json.dumps(resources))
         with tempfile.NamedTemporaryFile('w', suffix='.js', delete=False, encoding='utf-8') as handle:
             handle.write(harness)
             path = handle.name
@@ -166,6 +182,24 @@ class SubmitGateTests(unittest.TestCase):
         calls = self._run('gateway-single')
         self.assertEqual('/tasks', calls[0]['url'])
         self.assertIs(True, calls[0]['body'].get('risk_acknowledged'))
+
+    @unittest.skipUnless(shutil.which('node'), 'Node.js is required')
+    def test_declined_confirmation_sends_no_charged_request(self):
+        for kind in ('quality-single', 'quality-compare', 'gateway-single', 'routing-compare'):
+            with self.subTest(kind=kind):
+                self.assertEqual([], self._run(kind, acknowledged=False, confirm=False))
+
+    @unittest.skipUnless(shutil.which('node'), 'Node.js is required')
+    def test_dialog_confirmation_is_attached_to_request(self):
+        calls = self._run('quality-compare', acknowledged=False, confirm=True)
+        self.assertEqual('/quality-tests', calls[0]['url'])
+        self.assertIs(True, calls[0]['body'].get('risk_acknowledged'))
+
+    @unittest.skipUnless(shutil.which('node'), 'Node.js is required')
+    def test_real_field_validators_block_invalid_connection(self):
+        for kind in ('quality-single', 'quality-compare', 'gateway-single', 'gateway-compare'):
+            with self.subTest(kind=kind):
+                self.assertEqual([], self._run(kind, invalid_url=True, expected_error='完整的接口地址'))
 
     @unittest.skipUnless(shutil.which('node'), 'Node.js is required')
     def test_routing_compare_carries_acknowledgement_and_both_sides(self):

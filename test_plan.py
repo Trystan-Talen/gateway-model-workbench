@@ -26,7 +26,7 @@ BUILTIN = (
         "summary": "固定条数，确认链路、鉴权和响应格式正常。",
         "when": "换网关、换模型、改配置之后的第一步。",
         "not_for": "不能用来判断容量：条数太少，且没有压力档位。",
-        "config": {"mode": "smoke", "concurrency": 100, "rpm": 100, "iterations": 30,
+        "config": {"mode": "smoke", "concurrency": 20, "rpm": 100, "iterations": 30,
                    "connect_timeout": 10, "read_timeout": 60, "profile": "smoke"},
     },
     {
@@ -36,7 +36,7 @@ BUILTIN = (
         "summary": "在冒烟的基础上把条数放大到 300，用于暴露偶发失败。",
         "when": "冒烟通过后、正式压测之前，确认不是运气好。",
         "not_for": "并发没变，仍然不能反映并发下的表现。",
-        "config": {"mode": "smoke", "concurrency": 100, "rpm": 100, "iterations": 300,
+        "config": {"mode": "smoke", "concurrency": 20, "rpm": 100, "iterations": 300,
                    "connect_timeout": 10, "read_timeout": 60, "profile": "smoke"},
     },
     {
@@ -46,7 +46,7 @@ BUILTIN = (
         "summary": "调度速率按阶梯抬升，观察成功率、实际完成吞吐和 p95 在哪一档开始恶化。",
         "when": "需要给容量一个量级判断，并指出拐点大致落在哪一档。",
         "not_for": "台阶之间不是稳态，拐点位置是区间而不是精确值。",
-        "config": {"mode": "ramp", "concurrency": 100, "rpm": 100, "ramps": "100,200,300,400,500", "duration": 180,
+        "config": {"mode": "ramp", "concurrency": 20, "rpm": 100, "ramps": "100,200,300,400,500", "duration": 180,
                    "connect_timeout": 10, "read_timeout": 90, "profile": "smoke"},
     },
     {
@@ -56,7 +56,7 @@ BUILTIN = (
         "summary": "四个阶梯、更长的每档时长，延长每档的观察窗口。",
         "when": "第一次对某个环境做压测，且不确定它能不能扛。",
         "not_for": "耗时更长；如果只是回归验证，用它属于浪费。",
-        "config": {"mode": "ramp", "concurrency": 100, "rpm": 100, "ramps": "100,200,400,600", "duration": 300,
+        "config": {"mode": "ramp", "concurrency": 20, "rpm": 100, "ramps": "100,200,400,600", "duration": 300,
                    "connect_timeout": 10, "read_timeout": 120, "profile": "smoke"},
     },
     {
@@ -66,7 +66,7 @@ BUILTIN = (
         "summary": "在固定并发和速率下持续跑，观察长尾延迟、失败率与内存类问题是否随时间漂移。",
         "when": "怀疑泄漏、连接池耗尽、长时间运行才出现的退化。",
         "not_for": "单次泡测不能替代多轮重复；漂移需要重复运行才能确认。",
-        "config": {"mode": "soak", "concurrency": 100, "rpm": 100, "duration": 1800,
+        "config": {"mode": "soak", "concurrency": 20, "rpm": 100, "duration": 1800,
                    "connect_timeout": 10, "read_timeout": 120, "profile": "smoke"},
     },
     {
@@ -76,7 +76,7 @@ BUILTIN = (
         "summary": "泡测的精简版，用于在 CI 或本地做一次趋势检查。",
         "when": "只想看有没有明显漂移，不想等半小时。",
         "not_for": "10 分钟不足以暴露慢速泄漏。",
-        "config": {"mode": "soak", "concurrency": 100, "rpm": 100, "duration": 600,
+        "config": {"mode": "soak", "concurrency": 20, "rpm": 100, "duration": 600,
                    "connect_timeout": 10, "read_timeout": 120, "profile": "smoke"},
     },
 )

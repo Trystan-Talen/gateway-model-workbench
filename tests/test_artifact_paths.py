@@ -20,7 +20,8 @@ class ArtifactPathTests(unittest.TestCase):
     def test_coverage_configuration_preserves_sources_and_thresholds(self):
         coverage = Coverage(config_file=str(PROJECT_DIR / "pyproject.toml"))
         self.assertEqual(coverage.get_option("run:source"),
-                         ["task_status", "preflight", "quality_report", "routing_compare"])
+                         ["task_status", "preflight", "quality_report", "routing_compare",
+                          "tpm_config", "tpm_usage", "tpm_corpus", "tpm_engine", "tpm_metrics", "tpm_report", "tpm_service", "tpm_snapshot", "tpm_records"])
         self.assertEqual(coverage.get_option("report:fail_under"), 75)
         for option in ("run:data_file", "json:output", "html:directory", "xml:output", "lcov:output"):
             with self.subTest(option=option):

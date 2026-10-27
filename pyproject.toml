@@ -8,7 +8,7 @@ dependencies = ["httpx[http2]==0.28.1", "keyring==25.6.0"]
 dev = ["coverage==7.10.7"]
 
 [tool.coverage.run]
-source = ["task_status", "preflight", "quality_report", "routing_compare"]
+source = ["task_status", "preflight", "quality_report", "routing_compare", "tpm_config", "tpm_usage", "tpm_corpus", "tpm_engine", "tpm_metrics", "tpm_report", "tpm_service", "tpm_snapshot", "tpm_records"]
 data_file = "artifacts/coverage/.coverage"
 
 [tool.coverage.report]

@@ -86,22 +86,22 @@ async function fits(page,width){
    assert.equal(prepares.filter(x=>x.source_kind==='task').length,1);assert.equal(creates.filter(x=>x.source_kind==='task').length,1);assert.equal(creates[0].keys,undefined);
    assert.equal(records.tasks[0].config.concurrency,source.tasks[0].config.concurrency,'original pressure is retained');
    await select('comparison');await repeatButton('comparison').click();await page.locator('#repeatRiskAck').waitFor();
-   await page.locator('#repeatBody [data-click-action="submitRepeat"]').click();assert.match(await page.locator('#repeatStatus').innerText(),/请先确认/);
-   await page.locator('#repeatRiskAck').check();await page.locator('#repeatBody [data-click-action="submitRepeat"]').click();await created('comparison',1);
+   await page.locator('#repeatFooter [data-click-action="submitRepeat"]').click();assert.match(await page.locator('#repeatStatus').innerText(),/请先确认/);
+   await page.locator('#repeatRiskAck').check();await page.locator('#repeatFooter [data-click-action="submitRepeat"]').click();await created('comparison',1);
    assert.equal(creates.find(x=>x.source_kind==='comparison').risk_acknowledged,true);
    await select('quality');await repeatButton('quality').click();await created('quality',1);assert.equal(creates.find(x=>x.source_kind==='quality').keys,undefined);
    await select('routing');await repeatButton('routing').click();await page.locator('#repeatKey0').waitFor();
    assert.equal(await page.locator('#repeatBody input[type="password"]').count(),2);await page.locator('#repeatKey0').fill('synthetic-fixed-key');await page.locator('#repeatKey1').fill('synthetic-smart-key');
    await page.locator('#repeatBody [data-click-action="togglePasswordVisibility"]').first().click();assert.equal(await page.locator('#repeatKey0').getAttribute('type'),'text');
-   for(const theme of ['light','dark']){await page.evaluate(theme=>setTheme(theme),theme);await page.waitForTimeout(200);await fits(page,width);await page.screenshot({path:path.join(output,`repeat-${width}-${theme}.png`)})}
-   await page.locator('#repeatBody [data-click-action="submitRepeat"]').click();await page.waitForFunction(()=>document.getElementById('repeatStatus').textContent.includes('合成创建失败'));
+   for(const theme of ['light','dark']){await page.evaluate(theme=>{setTheme(theme);document.getElementById('toast').classList.remove('show')},theme);await page.waitForTimeout(200);await fits(page,width);const footer=await page.locator('#repeatFooter').boundingBox(),body=await page.locator('#repeatBody').boundingBox();assert.ok(footer&&body&&body.y+body.height<=footer.y+1,'footer stays outside scrolling body');assert.ok(footer.y+footer.height<=1000,'submit stays within viewport');await page.screenshot({path:path.join(output,`repeat-${width}-${theme}.png`)})}
+   await page.locator('#repeatFooter [data-click-action="submitRepeat"]').click();await page.waitForFunction(()=>document.getElementById('repeatStatus').textContent.includes('合成创建失败'));
    assert.equal(await page.locator('#repeatKey0').inputValue(),'synthetic-fixed-key','failure keeps input for retry');
-   await page.locator('#repeatBody [data-click-action="submitRepeat"]').click();await created('routing',1);assert.equal(await page.locator('#repeatKey0').count(),0,'success clears keys');
+   await page.locator('#repeatFooter [data-click-action="submitRepeat"]').click();await created('routing',1);assert.equal(await page.locator('#repeatKey0').count(),0,'success clears keys');
    assert.deepEqual(creates.filter(x=>x.source_kind==='routing').at(-1).keys,{baseline:'synthetic-fixed-key',candidate:'synthetic-smart-key'});
-   await select('fingerprint');await repeatButton('fingerprint').click();await page.locator('#repeatKey0').fill('synthetic-fingerprint-key');await page.locator('#repeatRiskAck').check();await page.locator('#repeatBody [data-click-action="submitRepeat"]').click();
+   await select('fingerprint');await repeatButton('fingerprint').click();await page.locator('#repeatKey0').fill('synthetic-fingerprint-key');await page.locator('#repeatRiskAck').check();await page.locator('#repeatFooter [data-click-action="submitRepeat"]').click();
    await page.waitForFunction(()=>!RepeatUI.isOpen()&&FingerprintUI.getSelectedId().startsWith('repeat-fingerprint-'));assert.equal(creates.find(x=>x.source_kind==='fingerprint').risk_acknowledged,true);
    // Closing a submitted form keeps the duplicate guard and leaves later navigation alone.
-   forceTaskModal=true;delayed=true;await select('task');await repeatButton('task').click();await page.locator('#repeatKey0').fill('synthetic-background-key');await page.locator('#repeatBody [data-click-action="submitRepeat"]').click();
+   forceTaskModal=true;delayed=true;await select('task');await repeatButton('task').click();await page.locator('#repeatKey0').fill('synthetic-background-key');await page.locator('#repeatFooter [data-click-action="submitRepeat"]').click();
    for(let i=0;i<1000&&!releaseCreate;i++)await new Promise(resolve=>setTimeout(resolve,10));assert.ok(releaseCreate);
    await page.keyboard.press('Escape');assert.equal(await page.locator('#repeatKey0').count(),0);const prepareCount=prepares.length;
    await page.evaluate(()=>RepeatUI.start('task','single-fixture'));assert.equal(prepares.length,prepareCount,'submitted source stays locked');

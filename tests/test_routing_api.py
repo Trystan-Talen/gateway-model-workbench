@@ -135,6 +135,18 @@ class DeleteTests(unittest.TestCase):
 
 
 class ApiPayloadTests(unittest.TestCase):
+    def test_new_routing_defaults_match_gateway_and_explicit_pressure_is_preserved(self):
+        target = {"url": "http://127.0.0.1:9/v1", "api_key": "synthetic-key", "model": "m"}
+        cfg = routing_compare.validate_config({"tier": 1000, "baseline": target, "candidate": target})
+        self.assertEqual(cfg["rpm"], 100)
+        for side in ("baseline", "candidate"):
+            self.assertEqual((cfg[side]["concurrency"], cfg[side]["rpm"]), (20, 100))
+        custom = {**target, "concurrency": 7, "rpm": 321}
+        cfg = routing_compare.validate_config({"tier": 1000, "baseline": custom, "candidate": custom})
+        self.assertEqual(cfg["rpm"], 321)
+        for side in ("baseline", "candidate"):
+            self.assertEqual((cfg[side]["concurrency"], cfg[side]["rpm"]), (7, 321))
+
     def test_metric_labels_cover_cache_as_a_first_class_metric(self):
         keys = {item["key"] for item in routing_ab.METRIC_LABELS}
         self.assertIn("cache", keys)

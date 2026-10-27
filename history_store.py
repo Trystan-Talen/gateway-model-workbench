@@ -8,7 +8,7 @@ import uuid
 from pathlib import Path
 
 _LOCK = threading.RLock()
-KINDS = ('tasks', 'comparisons', 'quality_tests', 'routing_comparisons')
+KINDS = ('tasks', 'comparisons', 'quality_tests', 'routing_comparisons', 'tpm_runs')
 # 已提交内容的摘要，按数据库路径缓存：运行中每秒写一次索引时，只比较摘要、只写变化的记录，
 # 不再把全部快照正文从数据库读回来逐条对比。只在事务提交成功后更新。
 _COMMITTED = {}
@@ -23,7 +23,7 @@ def _digest(encoded):
 
 
 def summary(snapshot):
-    keys = ('id', 'name', 'status', 'created', 'started_at', 'finished_at', 'done', 'total', 'progress', 'model', 'target_url', 'case_count', 'completed_cases', 'planned_cases', 'success_pct', 'out_path')
+    keys = ('id', 'name', 'status', 'created', 'timing', 'started_at', 'finished_at', 'done', 'total', 'progress', 'model', 'target_url', 'case_count', 'completed_cases', 'planned_cases', 'success_pct', 'out_path')
     return {key: snapshot[key] for key in keys if key in snapshot}
 
 

@@ -20,7 +20,7 @@ const sandbox={window:{ConnectionUI:{list(){return []},openCreate(seed){calls.pu
  toast(message){calls.push({kind:'toast',message})},schedulePreflight(){calls.push({kind:'preflight'})},resetKeyButton(){},setSavedModelOption(value){element('modelSelect').value=value;calls.push({kind:'saved-model',value})},setModelHint(message){calls.push({kind:'model-hint',message})},invalidateModelFetch(){calls.push({kind:'model-invalidate'})},resetRoutingModels(message){calls.push({kind:'routing-model-invalidate',message})},checkSavedCredential(){calls.push({kind:'legacy-gateway'})},checkQualityCredential(){calls.push({kind:'legacy-quality'})},checkRoutingCredential(){calls.push({kind:'legacy-routing'})},saveRoutingSide(side){calls.push({kind:'routing-save',side})},updateKeyInputHint(){},setRoutingCredentialState(side,url,saved){calls.push({kind:'routing-hint',side,url,saved})},hideRoutingKey(side){const key=element(`routing-${side}-key`);if(key.dataset.routingRevealed==='true')key.value='';delete key.dataset.routingRevealed;key.type='password'},currentModel(){return 'synthetic-model'}};
 vm.runInNewContext(fs.readFileSync(path.resolve(__dirname,'../static/ui-kit.js'),'utf8'),sandbox);
 const singleLine=name=>source.match(new RegExp('^function '+name+'\\([^\\n]+','m'))[0];
-vm.runInNewContext(`const $=id=>document.getElementById(id),UI=window.UI,mode='smoke',esc=UI.esc;let credentialStatusSeq=0,qualityCredentialSeq=0,qualityModelSeq=0;const routingConnectionTimers={};\n${block}\n${singleLine('readConfig')}\n${singleLine('readQuality')}\n${singleLine('readRoutingSide')}\nwindow.test={selectSavedConnection,boundConnectionId,boundConnectionProfile,savedConnectionPickerHtml,savedConnectionInputChanged,renderSavedConnectionPickers,readConfig,readQuality,readRoutingSide,saveCurrentConnection,refreshSavedConnectionPickers,loaded(){return savedConnectionsLoaded},setProfiles(profiles,loaded=true){savedConnectionProfiles=profiles;savedConnectionsLoaded=loaded}};`,sandbox);
+vm.runInNewContext(`const $=id=>document.getElementById(id),UI=window.UI,mode='smoke',esc=UI.esc;let credentialStatusSeq=0,qualityCredentialSeq=0,qualityModelSeq=0;const routingConnectionTimers={};\n${block}\n${singleLine('readConfig')}\n${singleLine('currentQualityModel')}\n${singleLine('readQuality')}\n${singleLine('readRoutingSide')}\nwindow.test={selectSavedConnection,boundConnectionId,boundConnectionProfile,savedConnectionPickerHtml,savedConnectionInputChanged,renderSavedConnectionPickers,readConfig,readQuality,readRoutingSide,saveCurrentConnection,refreshSavedConnectionPickers,loaded(){return savedConnectionsLoaded},setProfiles(profiles,loaded=true){savedConnectionProfiles=profiles;savedConnectionsLoaded=loaded}};`,sandbox);
 const t=sandbox.window.test,URL='https://synthetic.invalid/v1';
 const profiles=[{id:'profile-a',name:'资源 A <unsafe>',url:URL,api_key_saved:true},{id:'profile-b',name:'资源 B',url:URL,api_key_saved:true}];
 t.setProfiles(profiles);
@@ -28,6 +28,37 @@ const markup=t.savedConnectionPickerHtml('gateway');
 assert.ok(markup.includes('data-change-action="selectSavedConnection"'));
 assert.ok(markup.includes('资源 A &lt;unsafe&gt;'));
 assert.ok(markup.includes('value="profile-a"')&&markup.includes('value="profile-b"'));
+assert.equal(t.readConfig().concurrency,20,'empty new gateway config defaults to 20 concurrent requests');
+assert.equal(t.readConfig().rpm,100,'empty new gateway config defaults to 100 planned requests per minute');
+element('concurrency').value='37';element('rpm').value='123';
+assert.equal(t.readConfig().concurrency,'37','explicit concurrency is preserved');
+assert.equal(t.readConfig().rpm,'123','explicit rate is preserved');
+element('concurrency').value='';element('rpm').value='';
+for(const [context,target] of [['gateway',''],['quality','0'],['routing','baseline']]){
+ const url=context==='gateway'?element('url'):element(context==='quality'?'quality-url-0':'routing-baseline-url');
+ const key=context==='gateway'?element('api_key'):element(context==='quality'?'quality-key-0':'routing-baseline-key');
+ url.value='https://manual.synthetic.invalid/v1';key.value='synthetic-manual-draft';
+ t.selectSavedConnection(context,target,{value:'profile-a'});
+ t.selectSavedConnection(context,target,{value:'profile-b'});
+ t.selectSavedConnection(context,target,{value:''});
+ assert.equal(url.value,'https://manual.synthetic.invalid/v1','returning from saved connections restores the original manual address');
+ assert.equal(key.value,'synthetic-manual-draft','manual credential draft is kept only in the current form');
+ assert.equal(key.type,'password','restored credential remains masked');
+ assert.equal(t.boundConnectionId(context,target),'','restored manual input has no saved binding');
+}
+for(const [context,target] of [['gateway',''],['quality','0'],['routing','baseline']]){
+ const details=element(`connection-details-${context}-${target||'main'}`);
+ t.selectSavedConnection(context,target,{value:'profile-a'});
+ assert.equal(details.open,false,'ready named connection collapses duplicate credentials');
+ details.open=true;t.renderSavedConnectionPickers();
+ assert.equal(details.open,true,'metadata refresh preserves a manually expanded disclosure');
+ t.selectSavedConnection(context,target,{value:'profile-b'});
+ assert.equal(details.open,false,'choosing another saved connection resets the disclosure');
+ t.selectSavedConnection(context,target,{value:''});
+ assert.equal(details.open,true,'manual connection keeps address and credentials visible');
+}
+
+const manualProbeCount=calls.filter(call=>call.kind==='legacy-gateway'||call.kind==='legacy-quality'||call.kind==='legacy-routing').length;
 for(const [context,target] of [['gateway',''],['quality','0'],['routing','baseline']]){
  t.selectSavedConnection(context,target,{value:'profile-a'});
  const key=context==='gateway'?element('api_key'):element(context==='quality'?'quality-key-0':'routing-baseline-key');
@@ -52,6 +83,7 @@ t.selectSavedConnection('gateway','',{value:'profile-a'});
 t.setProfiles([profiles[1]]);t.renderSavedConnectionPickers();
 assert.equal(t.readConfig().connection_id,'profile-a','deleted profile remains explicitly bound; no URL-based secret fallback');
 assert.equal(element('gatewayConnectionPicker').dataset.connectionInvalid,'true');
+assert.equal(element('connection-details-gateway-main').open,true,'invalid saved connection exposes fields for correction');
 assert.equal(sandbox.window.savedApiKey,false);
 assert.ok(t.savedConnectionPickerHtml('gateway').includes('已删除'));
 assert.equal(element('url').value,URL,'metadata refresh leaves edited test fields intact');
@@ -67,7 +99,7 @@ element('url').value='https://manual.invalid/v1';t.savedConnectionInputChanged({
 assert.equal(t.readConfig().connection_id,undefined);
 element('api_key').value='synthetic-only';t.saveCurrentConnection('gateway');
 assert.equal(calls.at(-1).kind,'create');assert.equal(calls.at(-1).seed.api_key,'synthetic-only');
-assert.equal(calls.filter(call=>call.kind==='legacy-gateway'||call.kind==='legacy-quality'||call.kind==='legacy-routing').length,0,'profile selection and refresh never probe URL-based credentials');
+assert.equal(calls.filter(call=>call.kind==='legacy-gateway'||call.kind==='legacy-quality'||call.kind==='legacy-routing').length,manualProbeCount,'profile selection and refresh never probe URL-based credentials');
 const credentialFunction=source.slice(source.indexOf('async function checkSavedCredential('),source.indexOf('function invalidateModelFetch('));
 vm.runInNewContext(credentialFunction+';window.test.checkSavedCredential=checkSavedCredential;',sandbox);
 (async()=>{
@@ -82,6 +114,7 @@ vm.runInNewContext(credentialFunction+';window.test.checkSavedCredential=checkSa
  await t.checkSavedCredential();assert.equal(statusRequests,1,'selected profile never checks URL fallback');
  t.setProfiles([{...profiles[0],api_key_saved:false},profiles[1]]);t.renderSavedConnectionPickers();
  assert.equal(sandbox.window.savedApiKey,false,'profile credential availability is authoritative');
+ assert.equal(element('connection-details-gateway-main').open,true,'unavailable saved credential exposes the key input');
  assert.equal(statusRequests,1);
  const originalProfiles=profiles.map(profile=>({...profile,updated_at:1}));t.setProfiles(originalProfiles);
  for(const [context,target] of [['gateway',''],['quality','0'],['routing','baseline']])t.selectSavedConnection(context,target,{value:'profile-a'});

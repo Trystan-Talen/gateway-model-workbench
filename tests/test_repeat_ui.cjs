@@ -36,7 +36,7 @@ function harness() {
     querySelectorAll(selector) { return this.children.filter(node=>selector==='input'?node.id.startsWith('repeatKey')||node.id==='repeatRiskAck':selector.includes('submitRepeat')?node.dataset.clickAction==='submitRepeat':selector.includes('closeRepeat')?node.dataset.clickAction==='closeRepeat':false); }
     focus() { document.activeElement=this; }
   }
-  for(const id of ['repeatModal','repeatBody','repeatTitle'])nodes.set(id,new Node(id));
+  for(const id of ['repeatModal','repeatBody','repeatTitle','repeatFooter'])nodes.set(id,new Node(id));
   nodes.get('repeatModal').hidden=true;
   const document={activeElement:null,getElementById:id=>nodes.get(id)||null,querySelectorAll:()=>[],body:{insertAdjacentHTML(){}}};
   const sandbox={window:{},document,authenticated:true,console,
@@ -81,7 +81,7 @@ const result = id => ({ok:true,task_id:id});
   await c.UI.start('quality','source-q');
   check('missing credentials show masked fields, source targets, models and current risk acknowledgement',()=>{
     assert.equal(c.nodes.get('repeatKey0').type,'password');assert.equal(c.nodes.get('repeatKey1').type,'password');assert.equal(c.nodes.get('repeatRiskAck').checked,false);
-    assert.match(c.nodes.get('repeatBody').innerHTML,/&lt;unsafe-name&gt;/);assert.match(c.nodes.get('repeatBody').innerHTML,/&lt;unsafe-model&gt;/);assert.match(c.nodes.get('repeatBody').innerHTML,/常用连接已删除/);assert.equal(c.UI.isOpen(),true);
+    assert.match(c.nodes.get('repeatBody').innerHTML,/&lt;unsafe-name&gt;/);assert.match(c.nodes.get('repeatBody').innerHTML,/&lt;unsafe-model&gt;/);assert.match(c.nodes.get('repeatBody').innerHTML,/常用连接已删除/);assert.equal(c.UI.isOpen(),true);assert.match(c.nodes.get('repeatFooter').innerHTML,/创建并开始/);assert.doesNotMatch(c.nodes.get('repeatBody').innerHTML,/<table/);
   });
   await c.UI.submit();
   c.nodes.get('repeatKey0').value='synthetic-first';await c.UI.submit();
@@ -100,7 +100,7 @@ const result = id => ({ok:true,task_id:id});
   const d=harness();let attempt=0;
   d.setHandler(async url=>{if(url==='/repeats/prepare')return prepare('task','source-1',{connections:[{slot:'main',label:'网关',saved:false}]});if(++attempt===1)throw new Error('合成创建失败');return result('retry-success');});
   await d.UI.start('task','source-1');d.nodes.get('repeatKey0').value='synthetic-retry';await d.UI.submit();
-  check('failed creation preserves entered keys and reports failure without selecting a new record',()=>{assert.equal(d.nodes.get('repeatKey0').value,'synthetic-retry');assert.equal(d.UI.isOpen(),true);assert.match(d.nodes.get('repeatStatus').textContent,/合成创建失败/);assert.equal(d.created.length,0);assert.equal(d.s.operations.size,1);});
+  check('failed creation preserves entered keys and reports failure without selecting a new record',()=>{assert.equal(d.nodes.get('repeatKey0').value,'synthetic-retry');assert.equal(d.UI.isOpen(),true);assert.match(d.nodes.get('repeatStatus').textContent,/合成创建失败/);assert.equal(d.created.length,0);assert.equal(d.s.operations.size,1);assert.equal(d.nodes.get('repeatFooter').querySelectorAll('[data-click-action="closeRepeat"]')[0].label.textContent,'取消');assert.equal(d.nodes.get('repeatFooter').querySelectorAll('[data-click-action="submitRepeat"]')[0].label.textContent,'创建并开始');});
   await d.UI.submit();
   check('retry after failure uses the retained form and releases the lock on success',()=>{assert.equal(d.calls.filter(call=>call.url==='/repeats').length,2);assert.equal(d.calls.at(-1).body.keys.main,'synthetic-retry');assert.equal(d.created[0].id,'retry-success');assert.equal(d.s.operations.size,0);});
   const e=harness(),posting=defer();
